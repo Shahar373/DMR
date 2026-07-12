@@ -16,6 +16,7 @@ import json
 import os
 import re
 import select
+import signal
 import socket
 import sys
 import time
@@ -256,6 +257,21 @@ def _terminate(process) -> None:
             pass
 
 
+def _pdeathsig_term():  # pragma: no cover - Linux-only, exercised post-fork
+    """preexec_fn for the three supervised children: ask the kernel to send
+    them SIGTERM the instant this process dies for *any* reason (including an
+    OOM-kill that targets only the supervisor, which `finally`-block cleanup
+    can't run for). Without this, a child can outlive dsd_pty and keep
+    holding the SDR/ports, making the next `systemctl restart` fail the same
+    way the original crash did. Linux-only; failure here is non-fatal."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
 def _run():  # pragma: no cover - hardware runtime
     import pty
     import subprocess
@@ -272,13 +288,13 @@ def _run():  # pragma: no cover - hardware runtime
         rsp_command = build_rsp_tcp_command(env)
         sys.stderr.write("dsd_pty: exec (IQ server) %s\n" % " ".join(rsp_command))
         sys.stderr.flush()
-        rsp = subprocess.Popen(rsp_command)
+        rsp = subprocess.Popen(rsp_command, preexec_fn=_pdeathsig_term)
         processes.append(rsp)
 
         bridge_command = build_bridge_command(env)
         sys.stderr.write("dsd_pty: exec (FM bridge) %s\n" % " ".join(bridge_command))
         sys.stderr.flush()
-        bridge = subprocess.Popen(bridge_command)
+        bridge = subprocess.Popen(bridge_command, preexec_fn=_pdeathsig_term)
         processes.append(bridge)
 
         audio_host, audio_port = _split_endpoint(env.get("DSD_AUDIO_TCP", AUDIO_TCP_HOST), 7355)
@@ -292,7 +308,8 @@ def _run():  # pragma: no cover - hardware runtime
         sys.stderr.write("dsd_pty: exec %s\n" % " ".join(command))
         sys.stderr.flush()
         master, slave = pty.openpty()
-        dsd = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        dsd = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                               close_fds=True, preexec_fn=_pdeathsig_term)
         os.close(slave)
         processes.insert(0, dsd)
 

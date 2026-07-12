@@ -125,6 +125,17 @@ def test_render_dmr_env_hz_conversion(paths):
     assert "DSD_COLOR_CODE=3" in env
 
 
+def test_render_dmr_env_keeps_bridge_keys(paths):
+    """render_dmr_env דורס את כל dmr.env בכל מעבר מצב (_enter_dmr/_scan_enter_leg) —
+    מפתחות הגשר (rsp_tcp/rsp_fm.py) חייבים להישאר בקובץ בכל מעבר, אחרת dsd_pty
+    נופל בחזרה על ברירות-מחדל שאינן בהכרח מסונכרנות."""
+    app = paths
+    system = {"id": "s1", "name": "T", "control": 461.0375, "color_code": 3, "channelmap": []}
+    env = app.render_dmr_env(system)
+    for key in ("DSD_RTLTCP", "DSD_AUDIO_TCP", "DSD_RIGCTL", "DSD_IQ_RATE", "DSD_AUDIO_GAIN"):
+        assert f"{key}=" in env, f"missing {key} in rendered dmr.env"
+
+
 def test_render_channelmap(paths):
     app = paths
     txt = app.render_channelmap([{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}])

@@ -49,6 +49,16 @@ DMR_SERVICE = "dmr-dsdfme"
 # כל שורת אירוע ל-dict, ושולח כ-JSON ב-UDP לכאן — בדיוק כמו "acarsdec -j" ב-AIR-AM.
 DMR_UDP_HOST = "127.0.0.1"
 DMR_UDP_PORT = 5555                   # חייב להתאים ל-DMR_UDP ב-dmr.env / dsd_pty
+
+# גשר IQ→PCM (dsd_pty מריץ rsp_tcp + rsp_fm.py כתהליכי-בן; ר' CLAUDE.md §2).
+# אלה נתיבי loopback/פרמטרים קבועים של התשתית (לא פר-מערכת) — זהים לברירות-
+# המחדל במודולי dsd_pty/rsp_fm עצמם. render_dmr_env דורס את כל dmr.env בכל
+# מעבר מצב, אז חובה לכלול אותם כאן — אחרת הם נעלמים מהקובץ החי בכל מעבר.
+DMR_BRIDGE_RTLTCP = "127.0.0.1:1234"
+DMR_BRIDGE_AUDIO_TCP = "127.0.0.1:7355"
+DMR_BRIDGE_RIGCTL = "127.0.0.1:4532"
+DMR_BRIDGE_IQ_RATE = 240000
+DMR_BRIDGE_AUDIO_GAIN = 4.0
 DMR_BUF_MAX = 800                     # שיחות אחרונות בזיכרון (נטענות בעלייה, היום בלבד)
 DMR_LOG_PATH = Path("/var/lib/dmr/dmr.jsonl")
 DMR_LOG_KEEP = 8000                   # retention בדיסק (זנב נשמר; ייצוא לניתוח)
@@ -320,6 +330,11 @@ def render_dmr_env(system):
         f"DSD_UDP={DMR_UDP_HOST}:{DMR_UDP_PORT}",   # יעד פיד ה-JSON (dsd_pty → app.py)
         f"DSD_WAV_DIR={REC_DIR}",                    # per-call WAV לתיקיית ההקלטות
         "DSD_TRUNK=1",                               # מעקב טראנקינג (Cap+)
+        f"DSD_RTLTCP={DMR_BRIDGE_RTLTCP}",           # rsp_tcp — IQ גולמי מה-RSP1B
+        f"DSD_AUDIO_TCP={DMR_BRIDGE_AUDIO_TCP}",     # rsp_fm.py — PCM 48kHz ל-DSD-FME
+        f"DSD_RIGCTL={DMR_BRIDGE_RIGCTL}",           # rsp_fm.py — rigctl לכיוונון טראנקינג
+        f"DSD_IQ_RATE={DMR_BRIDGE_IQ_RATE}",         # קצב IQ מבוקש מ-rsp_tcp (Hz)
+        f"DSD_AUDIO_GAIN={DMR_BRIDGE_AUDIO_GAIN}",   # מכפיל רווח discriminator ב-rsp_fm.py
         "",
     ]
     return "\n".join(lines)

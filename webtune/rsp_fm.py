@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import signal
 import socket
 import struct
@@ -76,10 +77,37 @@ class NfmDemodulator:
         self.taps = design_lowpass(iq_rate, cutoff_hz, taps)
         self.overlap = np.zeros(len(self.taps) - 1, dtype=np.complex64)
         self.previous = np.complex64(1.0 + 0.0j)
+        # DC-blocker state (single-pole IIR, y[n] = x[n] - x[n-1] + r*y[n-1]).
+        # Must be carried across chunks like `overlap` above -- recomputing a
+        # block-wise mean per ~100ms chunk instead would insert a step at
+        # every chunk boundary, which is audible to DSD-FME as periodic noise.
+        self._dc_r = 0.999
+        self._dc_x_prev = 0.0
+        self._dc_y_prev = 0.0
 
     def reset(self) -> None:
         self.overlap.fill(0)
         self.previous = np.complex64(1.0 + 0.0j)
+        self._dc_x_prev = 0.0
+        self._dc_y_prev = 0.0
+
+    def _dc_block(self, fm: np.ndarray) -> np.ndarray:
+        """Remove DC/slow drift with a stateful one-pole filter (~8 Hz cutoff
+        at 48 kHz), carrying x[n-1]/y[n-1] across calls so chunk boundaries
+        don't produce a discontinuity."""
+        out = np.empty_like(fm)
+        x_prev = self._dc_x_prev
+        y_prev = self._dc_y_prev
+        r = self._dc_r
+        for i in range(fm.shape[0]):
+            x = fm[i]
+            y = x - x_prev + r * y_prev
+            out[i] = y
+            x_prev = x
+            y_prev = y
+        self._dc_x_prev = x_prev
+        self._dc_y_prev = y_prev
+        return out
 
     def process(self, raw: bytes) -> bytes:
         values = np.frombuffer(raw, dtype=np.uint8)
@@ -102,18 +130,23 @@ class NfmDemodulator:
         previous[1:] = baseband[:-1]
         self.previous = baseband[-1]
         fm = np.angle(baseband * np.conj(previous)).astype(np.float32)
-        fm -= np.mean(fm, dtype=np.float64)
+        fm = self._dc_block(fm)
         pcm = np.clip(fm * (32767.0 / np.pi) * self.audio_gain,
                       -32768, 32767).astype("<i2")
         return pcm.tobytes()
 
 
+DEFAULT_IQ_READ_TIMEOUT = 5.0
+
+
 class RtlTcpClient:
-    def __init__(self, host: str, port: int, frequency: int, sample_rate: int) -> None:
+    def __init__(self, host: str, port: int, frequency: int, sample_rate: int,
+                 read_timeout: float = DEFAULT_IQ_READ_TIMEOUT) -> None:
         self.host = host
         self.port = port
         self.frequency = int(frequency)
         self.sample_rate = int(sample_rate)
+        self.read_timeout = read_timeout
         self.sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -130,7 +163,11 @@ class RtlTcpClient:
                 header = self._recv_exact(sock, 12)
                 if header[:4] not in (b"RTL0", b"RSP0"):
                     raise RuntimeError(f"unexpected rtl_tcp header: {header[:4]!r}")
-                sock.settimeout(None)
+                # Keep a bounded read timeout (not None/blocking-forever): if
+                # rsp_tcp stays connected but stops sending samples (SDR/USB
+                # stall), recv() must eventually raise so the caller notices
+                # instead of hanging the bridge indefinitely.
+                sock.settimeout(self.read_timeout)
                 self.sock = sock
                 self.send_command(RTL_CMD_SET_SAMPLE_RATE, self.sample_rate)
                 self.send_command(RTL_CMD_SET_FREQ, self.frequency)
@@ -182,7 +219,12 @@ class RtlTcpClient:
     def recv(self, size: int) -> bytes:
         if self.sock is None:
             raise RuntimeError("rtl_tcp is not connected")
-        return self.sock.recv(size)
+        try:
+            return self.sock.recv(size)
+        except socket.timeout as error:
+            raise ConnectionError(
+                f"rsp_tcp sent no IQ samples for {self.read_timeout}s"
+            ) from error
 
     def close(self) -> None:
         if self.sock is not None:
@@ -254,6 +296,53 @@ class AudioServer:
             client, self.client = self.client, None
         if client is not None:
             client.close()
+
+
+class AudioSender:
+    """Decouples PCM delivery from the IQ-reading thread. `AudioServer.send`
+    can block for up to its client socket's timeout (2s) if DSD-FME stalls
+    reading; doing that inline in the IQ loop would back up samples from
+    rsp_tcp and delay retune-generation handling at the same time. This runs
+    its own thread pulling off a small bounded queue, dropping the oldest
+    chunk under sustained backpressure rather than blocking upstream."""
+
+    def __init__(self, audio: "AudioServer", maxsize: int = 50) -> None:
+        self.audio = audio
+        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=maxsize)
+        self.stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def submit(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        try:
+            self.queue.put_nowait(pcm)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(pcm)
+            except queue.Full:
+                pass
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                pcm = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self.audio.send(pcm)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
 class RigctlServer:
@@ -392,6 +481,7 @@ def run(config: BridgeConfig) -> int:
     tuner = RtlTcpClient(config.rtl_host, config.rtl_port,
                          config.frequency, config.iq_rate)
     audio = AudioServer(config.audio_host, config.audio_port)
+    sender = AudioSender(audio)
     rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, tuner)
     gain = GainControlServer(config.control_socket, tuner)
     demod = NfmDemodulator(iq_rate=config.iq_rate,
@@ -408,6 +498,7 @@ def run(config: BridgeConfig) -> int:
     try:
         tuner.connect()
         audio.start()
+        sender.start()
         rigctl.start()
         gain.start()
         bytes_per_chunk = DEFAULT_CHUNK_SAMPLES * 2
@@ -430,7 +521,7 @@ def run(config: BridgeConfig) -> int:
                 if discard_chunks:
                     discard_chunks -= 1
                 else:
-                    audio.send(pcm)
+                    sender.submit(pcm)
     except (OSError, RuntimeError, ConnectionError, ValueError) as error:
         if not stop_event.is_set():
             _log(f"fatal: {error}")
@@ -439,6 +530,7 @@ def run(config: BridgeConfig) -> int:
     finally:
         gain.close()
         rigctl.close()
+        sender.close()
         audio.close()
         tuner.close()
     return 0
