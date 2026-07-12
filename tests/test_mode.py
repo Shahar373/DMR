@@ -140,3 +140,5 @@ def test_render_channelmap(paths):
     app = paths
     txt = app.render_channelmap([{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}])
     assert "1,461037500" in txt and "2,461062500" in txt
+
+
