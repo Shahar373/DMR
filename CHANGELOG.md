@@ -5,6 +5,10 @@
 [SemVer](https://semver.org/lang/he/).
 
 ## [Unreleased]
+### Fixed
+- **`install.sh`:** `DSD_FME_BRANCH` הצביע ל-`main`, שלא קיים בכלל בריפו
+  `lwvmobile/dsd-fme` (הענף הפעיל האמיתי הוא `audio_work`) — `git clone` נכשל
+  מיד בשלב 5. נתפס בהרצה ראשונה על חומרה אמיתית (Pi5+RSP1B). תוקן.
 
 ## [0.3.0] - 2026-07-12
 ### Changed — פרסור DSD-FME מבוסס קליטה אמיתית (לא ניחוש)

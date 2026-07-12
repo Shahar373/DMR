@@ -15,7 +15,7 @@ export DEBIAN_FRONTEND=noninteractive
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${SUDO_USER:-}" ]]; then BUILD_DIR="/home/$SUDO_USER/dmr-build"; else BUILD_DIR="/root/dmr-build"; fi
 SDRPLAY_VER="3.15.2"        # אם יצא עדכון: עדכן כאן (ודא שהקובץ קיים באתר sdrplay)
-DSD_FME_BRANCH="main"       # lwvmobile/dsd-fme — ה-fork הפעיל של DSD-FME
+DSD_FME_BRANCH="audio_work" # lwvmobile/dsd-fme — ה-fork הפעיל (main *לא קיים* בריפו!)
 
 log()  { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33m[!] %s\033[0m\n' "$*"; }
