@@ -1,0 +1,6 @@
+# DMR: בעת חיבור מכשיר SDRplay (Vendor ID 1df7) - הפעל מחדש את שירות ה-API.
+# מאיץ התאוששות אחרי ניתוק/חיבור USB (לצד Restart=always של השירותים).
+# רק sdrplay.service! restart ישיר של dmr-dsdfme היה מוציא ממצב standby.
+# הצרכן הפעיל חוזר דרך PartOf=sdrplay.service ביחידה עצמה — לפי המצב בפועל.
+# DEVTYPE=usb_device => הכלל רץ פעם אחת למכשיר (לא לכל interface)
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1df7", RUN+="/usr/bin/systemctl --no-block restart sdrplay.service"

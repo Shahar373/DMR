@@ -1,0 +1,69 @@
+orig_type,raw_line
+bank_call,Bank One F20 Private or Data Call(s) -
+bank_call,Bank One F80 Private or Data Call(s) -  LSN 03: TGT 64250;
+bank_call,Bank One F80 Private or Data Call(s) -  LSN 03: TGT 64250; LSN 05: TGT 64250;
+bank_call,Bank Two FBE Private or Data Call(s) -
+bank_call,Bank Two FBF Private or Data Call(s) -
+bank_call,Bank Two FC7 Private or Data Call(s) -
+bank_call,Bank Two FD2 Private or Data Call(s) -
+channel_status,Capacity Plus Channel Status - FL: 1 TS: 1 RS: 0 - Rest LSN: 6 - Final Block
+channel_status,Capacity Plus Channel Status - FL: 2 TS: 1 RS: 0 - Rest LSN: 6 - Initial Block
+channel_status,Capacity Plus Channel Status - FL: 3 TS: 0 RS: 0 - Rest LSN: 6 - Single Block
+data_header,Slot 1 Data Header - Indiv - Confirmed Delivery - Response Requested - Source: 191 Target: 64250
+data_header,Slot 1 Data Header - Indiv - Response Packet - Source: 64250 Target: 191
+data_header,Slot 2 Data Header - Indiv - Unconfirmed Delivery - Source: 210 Target: 64250
+encryption,SLOT 1 Protected LC  FLCO=0x0C FID=0x00  SLOT 1 FLCO FEC ERR  (FEC ERR)
+ip_mapping,DST(24): 00064250; IP: 013.000.250.250; Port: 4001;
+ip_mapping,SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;
+lrrp_position,"Lat: 32.09265 Lon: 34.86761 (32.09265, 34.86761)"
+lrrp_position,"Lat: 32.09302 Lon: 34.86757 (32.09302, 34.86757) (CRC ERR)"
+lrrp_request,LRRP SRC: 199; Response to TGT: 64250;
+lsn_status,LSN 05:     1;  LSN 06:  Idle;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:     1;  LSN 06:  Rest;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:     1;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:    69;  LSN 06:  Idle;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:    69;  LSN 06:  Rest;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:   223;  LSN 06:     3;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:   223;  LSN 06:  Idle;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:   223;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Idle;  LSN 06:     7;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Idle;  LSN 06:   320;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:     3;  LSN 04:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:     7;  LSN 04:  Rest;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:    73;  LSN 04:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:    69;  LSN 04:  Rest;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:   223;  LSN 04:  Rest;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Idle;  LSN 04:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Idle;  LSN 04:  2232;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Idle;  LSN 04:  Rest;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Idle;  LSN 04: 64250;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Rest;  LSN 04:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Rest;  LSN 04:  2232;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03:  Rest;  LSN 04: 64250;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03: 64250;  LSN 04:  Idle;
+lsn_status,LSN 01:  Idle;  LSN 02:  Idle;  LSN 03: 64250;  LSN 04:  Rest;
+lsn_status,LSN 05:  Idle;  LSN 06:  Rest;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Idle;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Rest;  LSN 06:     3;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Rest;  LSN 06:  Idle;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05:  Rest;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05: 64250;  LSN 06:     7;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05: 64250;  LSN 06:   320;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05: 64250;  LSN 06:  Idle;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05: 64250;  LSN 06:  Rest;  LSN 07:  Idle;  LSN 08:  Idle;
+lsn_status,LSN 05: 64250;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;
+preamble_csbk,Preamble CSBK - Individual CSBK - Source: 64250 - Target: 2232 - Rest LSN: 5
+preamble_csbk,Preamble CSBK - Individual Data - Source: 191 - Target: 64250 - Rest LSN: 4
+quality,21:39:13 Sync: +DMR   slot1  [slot2] | CACH/Burst FEC ERR
+quality,21:39:21 Sync: +DMR   slot1  [slot2] | Color Code=02 | CSBK (CRC ERR)
+quality,21:39:40 Sync: +DMR   slot1  [slot2] | Color Code=02 | CSBK (FEC ERR)
+quality,21:39:15 Sync: +DMR  [slot1]  slot2  | CACH/Burst FEC ERR
+quality,21:39:14 Sync: +DMR  [slot1]  slot2  | Color Code=02 | CSBK (CRC ERR)
+quality,21:39:24 Sync: +DMR  [slot1]  slot2  | Color Code=02 | CSBK (FEC ERR)
+quality,SLCO CRC ERR
+site_info,SLCO Capacity Plus Site: 2 - Rest LSN: 5 - RS: 00
+voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Call  Rest LSN: 5
+voice_call,SLOT 1 TGT=3 SRC=0 Cap+ Group TXI Call  Rest LSN: 6
+voice_call,SLOT 1 TGT=3 SRC=2120 Group Call
+voice_call,SLOT 1 TGT=3 SRC=26 Group TXI Call
+voice_call,SLOT 1 TGT=199 SRC=4723398 Group TXI Call   (CRC ERR)

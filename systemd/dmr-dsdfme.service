@@ -1,0 +1,33 @@
+[Unit]
+Description=DMR - DSD-FME decoder (Capacity Plus trunking, SDRplay RSP1B)
+Documentation=https://github.com/lwvmobile/dsd-fme
+After=network-online.target sdrplay.service
+Wants=network-online.target
+# Requires => עצירת sdrplay עוצרת גם אותנו (תלות קשיחה ב-API).
+# PartOf => restart של sdrplay מפעיל אותנו מחדש אם אנחנו הצרכן הפעיל כרגע
+# (try-restart) — בלי זה dependency-stop משאיר את התחנה שקטה.
+Requires=sdrplay.service
+PartOf=sdrplay.service
+# בלי הגבלת קצב-הפעלה => מתאושש לנצח (ניתוק/חיבור USB, מרוץ אתחול)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# קובץ ההגדרות (אופציונלי, '-') — dmr-web כותב אותו לפי המערכת שנבחרה בממשק.
+# systemd מנתח KEY=VALUE *בבטחה* (לא מריץ shell) => קובץ הניתן-לכתיבה ע"י dmr
+# לא יכול להסליל הרצת קוד כ-root (בניגוד ל-source ב-bash).
+EnvironmentFile=-/etc/dmr/dmr.env
+# שער מוכנות: מחכה שה-SDRplay API באמת יענה לפני שהגשר/DSD-FME פותחים את ה-SDR
+ExecStartPre=/usr/local/bin/dmr-wait-sdrplay
+# dsd_pty.py הוא ה"מתאם": מריץ את rsp_tcp (גשר SDRplay→rtl_tcp) כתהליך-בן ואת
+# DSD-FME תחת PTY, מפרסר את הפלט ל-JSON ושולח ב-UDP ל-dmr-web. יחידה אחת =
+# צרכן-SDR אחד (כמו rtl_airband ב-AIR-AM) => מודל ה-standby/Conflicts נשמר.
+ExecStart=/usr/bin/python3 /opt/dmr/webtune/dsd_pty.py
+# גישת חומרה (SDR) => רץ כ-root
+User=root
+Restart=always
+RestartSec=10
+
+# אין [Install] בכוונה: השירות *לא* enabled (לא עולה באתחול). dmr-web (המתזמר)
+# קורא את state.json באתחול ומשחזר את המצב השמור (dmr/off/scan). אין "מצב ראשי":
+# off (standby) שורד reboot בדיוק כמו dmr.

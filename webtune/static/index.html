@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<!-- DMR - לוח בקרה (PWA יחיד, HTML+CSS+JS inline, RTL עברית). ראה CLAUDE.md §7. -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<title>DMR - תחנת האזנה</title>
+<style>
+:root{
+  color-scheme: light dark;
+  --bg:#0b0f14; --panel:#131a22; --panel-2:#1a232e; --hover:#212d3a;
+  --border:#26313d; --border-strong:#33414f;
+  --text:#e6edf3; --dim:#9db0c0; --faint:#6b7d8d;
+  --accent:#3b9dff; --accent-rgb:59,157,255;
+  --green:#3fb950; --amber:#d29922; --red:#f85149; --purple:#a371f7; --teal:#39c5cf;
+  /* טוקני אנליטיקה (Phase 2/3) — ולידציה מול validate_palette.js: שני הצבעים
+     עוברים lightness-band/chroma/CVD/contrast מול panel-2 בהיר וכהה כאחד, לכן
+     ערך יחיד לשני המצבים (כמו ב-references/palette.md §status). אל תערבב עם
+     --green/--red הכלליים (אלה ל-tags, אלה למדידה בלבד). */
+  --st-good:#0ca30c; --st-critical:#d03b3b;
+  --r-card:14px; --r-ctrl:10px; --r-sm:8px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px;
+  --sh-card:0 2px 8px rgba(0,0,0,.28); --topbar-h:52px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#eef2f6; --panel:#fff; --panel-2:#f5f8fb; --hover:#e9eef3;
+    --border:#d6dee6; --border-strong:#c2ccd6; --text:#141b22; --dim:#4a5b6b; --faint:#8496a5;
+    --sh-card:0 1px 4px rgba(20,30,45,.10); }
+}
+:root[data-theme="dark"]{ color-scheme: dark; --bg:#0b0f14; --panel:#131a22; --text:#e6edf3; }
+:root[data-theme="light"]{ color-scheme: light; --bg:#eef2f6; --panel:#fff; --text:#141b22; }
+*{ box-sizing:border-box; }
+html,body{ margin:0; background:var(--bg); color:var(--text);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Hebrew",Arial,sans-serif; }
+body{ padding-bottom:env(safe-area-inset-bottom); }
+a{ color:var(--accent); }
+.mono{ font-family:var(--mono); direction:ltr; }
+/* topbar */
+.topbar{ position:sticky; top:0; z-index:20; background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(8px); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:var(--sp-3); padding:0 var(--sp-4); height:var(--topbar-h); }
+.brand{ font-weight:700; letter-spacing:.5px; }
+.brand small{ color:var(--faint); font-weight:400; font-size:11px; margin-inline-start:6px; }
+.seg{ margin-inline-start:auto; display:flex; background:var(--panel); border:1px solid var(--border);
+  border-radius:var(--r-ctrl); overflow:hidden; }
+.seg button{ background:none; border:none; color:var(--dim); padding:7px 12px; font-size:15px; cursor:pointer; }
+.seg button.on{ background:var(--accent); color:#fff; }
+.content{ max-width:1100px; margin:0 auto; padding:var(--sp-4); }
+.hidden{ display:none !important; }
+/* cards */
+.card{ background:var(--panel); border:1px solid var(--border); border-radius:var(--r-card);
+  box-shadow:var(--sh-card); padding:var(--sp-4); margin-bottom:var(--sp-4); }
+.card h2{ margin:0 0 var(--sp-3); font-size:15px; font-weight:600; color:var(--dim); }
+.row{ display:flex; gap:var(--sp-3); flex-wrap:wrap; align-items:center; }
+.grid{ display:grid; gap:var(--sp-3); grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+label{ font-size:13px; color:var(--dim); display:block; margin-bottom:4px; }
+input,select{ width:100%; background:var(--panel-2); border:1px solid var(--border); color:var(--text);
+  border-radius:var(--r-sm); padding:9px 10px; font-size:15px; }
+input.mono{ font-family:var(--mono); }
+button.btn{ background:var(--accent); color:#fff; border:none; border-radius:var(--r-ctrl);
+  padding:10px 16px; font-size:15px; font-weight:600; cursor:pointer; }
+button.btn.ghost{ background:var(--panel-2); color:var(--text); border:1px solid var(--border); }
+button.btn.danger{ background:var(--red); }
+button.btn:disabled{ opacity:.5; cursor:default; }
+.pill{ display:inline-flex; align-items:center; gap:5px; font-size:12px; padding:3px 9px;
+  border-radius:999px; border:1px solid var(--border); color:var(--dim); }
+.pill.on{ background:rgba(63,185,80,.16); color:var(--green); border-color:transparent; }
+.pill.off{ background:var(--panel-2); }
+.pill.err{ background:rgba(248,81,73,.16); color:var(--red); border-color:transparent; }
+/* mode cards */
+.mode-cards{ display:grid; gap:var(--sp-3); grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); }
+.mode-card{ background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-card);
+  padding:var(--sp-4); }
+.mode-card.live{ border-color:var(--green); box-shadow:0 0 0 1px var(--green) inset; }
+.mode-card .mc-title{ font-size:16px; font-weight:700; margin-bottom:4px; }
+.mode-card .mc-desc{ font-size:13px; color:var(--faint); margin-bottom:var(--sp-3); min-height:34px; }
+/* call feed */
+.call{ display:grid; grid-template-columns:auto 1fr auto; gap:var(--sp-3); align-items:center;
+  background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-ctrl);
+  padding:10px var(--sp-3); margin-bottom:var(--sp-2); cursor:pointer; }
+.call:hover{ background:var(--hover); }
+.call .tsl{ font-family:var(--mono); font-size:12px; color:var(--faint); text-align:center; min-width:52px; }
+.call .tg{ font-weight:700; font-size:16px; }
+.call .rid{ font-size:13px; color:var(--dim); }
+.call .meta{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.tag{ font-size:11px; padding:2px 7px; border-radius:6px; background:var(--panel); border:1px solid var(--border); color:var(--dim); }
+.tag.group{ color:var(--accent); border-color:transparent; background:rgba(var(--accent-rgb),.14); }
+.tag.private{ color:var(--purple); background:rgba(163,113,247,.14); border-color:transparent; }
+.tag.data{ color:var(--dim); }
+.tag.control{ color:var(--faint); }
+.tag.position{ color:var(--teal); background:rgba(57,197,207,.14); border-color:transparent; }
+.tag.enc{ color:var(--red); background:rgba(248,81,73,.14); border-color:transparent; }
+.tag.slot{ font-family:var(--mono); }
+.audio{ width:210px; max-width:40vw; }
+.muted{ color:var(--faint); font-size:13px; }
+.roster-row{ display:flex; justify-content:space-between; gap:var(--sp-3); padding:8px 0;
+  border-bottom:1px solid var(--border); font-size:14px; }
+.roster-row:last-child{ border-bottom:none; }
+.kv{ display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--border); font-size:14px; }
+.kv:last-child{ border-bottom:none; }
+.kv b{ font-family:var(--mono); }
+.err-box{ background:rgba(248,81,73,.12); border:1px solid var(--red); color:var(--red);
+  border-radius:var(--r-sm); padding:10px var(--sp-3); font-size:14px; margin-bottom:var(--sp-3); }
+.count{ color:var(--faint); font-size:12px; }
+.cmap-row{ display:grid; grid-template-columns:70px 1fr auto; gap:var(--sp-2); margin-bottom:6px; }
+.scan-leg{ display:grid; grid-template-columns:1fr 90px auto auto auto; gap:var(--sp-2); align-items:center; margin-bottom:6px; }
+/* ---- אנליטיקה (Phase 2/3): מקרא, בר-מגניטודה, בר מוערם, heatmap, גרף, מפה ---- */
+.legend{ display:flex; gap:var(--sp-4); font-size:12px; color:var(--dim); margin-bottom:var(--sp-2); }
+.legend .sw{ width:10px; height:10px; border-radius:3px; display:inline-block; margin-inline-end:5px; vertical-align:-1px; }
+.stat-row{ display:flex; gap:var(--sp-4); flex-wrap:wrap; margin-bottom:var(--sp-3); }
+.stat-tile{ flex:1; min-width:120px; background:var(--panel-2); border:1px solid var(--border);
+  border-radius:var(--r-sm); padding:10px var(--sp-3); }
+.stat-tile .n{ font-size:22px; font-weight:700; font-family:var(--mono); }
+.stat-tile .l{ font-size:12px; color:var(--faint); }
+.abar-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:7px; font-size:13px; }
+.abar-label{ min-width:110px; max-width:150px; color:var(--dim); white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; }
+.abar-track{ flex:1; height:8px; background:var(--panel-2); border:1px solid var(--border);
+  border-radius:4px; overflow:hidden; }
+.abar-track.stacked{ display:flex; gap:2px; background:none; border:none; }
+.abar-fill{ height:100%; border-radius:4px; background:var(--accent); }
+.abar-val{ min-width:50px; text-align:end; font-family:var(--mono); color:var(--faint); font-size:12px; }
+.heat-wrap{ overflow-x:auto; }
+.heatgrid{ display:grid; grid-template-columns:repeat(24,1fr); gap:2px; min-width:480px; }
+.heatcell{ aspect-ratio:1; border-radius:3px; background:var(--panel-2); border:1px solid var(--border); }
+.heataxis{ display:grid; grid-template-columns:repeat(24,1fr); font-size:9px; color:var(--faint);
+  margin-top:4px; min-width:480px; font-family:var(--mono); }
+.heataxis span{ text-align:center; }
+.graph-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:6px; font-size:13px; }
+.graph-lbl{ min-width:190px; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#lrrpMap{ height:320px; border-radius:var(--r-ctrl); border:1px solid var(--border); }
+</style>
+
+<div class="topbar">
+  <div class="brand">📻 DMR <small id="ver"></small></div>
+  <div class="seg" id="seg">
+    <button data-v="home" class="on">🏠 בית</button>
+    <button data-v="calls">📻 שיחות</button>
+    <button data-v="analytics">📊 ניתוח</button>
+  </div>
+</div>
+
+<div class="content">
+  <!-- ============ HOME ============ -->
+  <div id="homeView">
+    <div class="card" id="statusCard">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <div id="homeState" style="font-size:20px;font-weight:700">טוען…</div>
+          <div class="muted" id="homeSub"></div>
+        </div>
+        <div style="text-align:end">
+          <span class="pill" id="healthPill">·</span>
+          <div class="count" id="callsToday"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="homeErr"></div>
+
+    <div class="card">
+      <h2>מצב</h2>
+      <div class="mode-cards">
+        <div class="mode-card" id="cardDmr">
+          <div class="mc-title">📻 DMR</div>
+          <div class="mc-desc">מעקב טראנקינג Cap+ ופענוח שיחות מהמערכת הנבחרת.</div>
+          <button class="btn" id="goDmr">התחל DMR</button>
+        </div>
+        <div class="mode-card" id="cardScan">
+          <div class="mc-title">🔁 סריקה</div>
+          <div class="mc-desc">סבב אוטומטי בין מספר מערכות DMR לפי לוח זמנים.</div>
+          <button class="btn ghost" id="goScan">התחל סריקה</button>
+        </div>
+        <div class="mode-card" id="cardOff">
+          <div class="mc-title">⏻ כיבוי</div>
+          <div class="mc-desc">Standby — משחרר את ה-SDR. הפיד ההיסטורי נשאר זמין.</div>
+          <button class="btn danger" id="goOff">כבה</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>מערכת DMR</h2>
+      <div class="row">
+        <div style="flex:1;min-width:200px">
+          <label>מערכת פעילה</label>
+          <select id="sysSelect"></select>
+        </div>
+        <div style="width:150px">
+          <label>תדר בקרה (MHz)</label>
+          <input class="mono" id="sysControl" inputmode="decimal">
+        </div>
+        <div style="width:110px">
+          <label>Color Code</label>
+          <input class="mono" id="sysCC" inputmode="numeric">
+        </div>
+      </div>
+      <label style="margin-top:var(--sp-3)">מפת ערוצים (LCN → תדר MHz)</label>
+      <div id="cmapList"></div>
+      <div class="row" style="margin-top:var(--sp-2)">
+        <button class="btn ghost" id="cmapAdd">+ ערוץ</button>
+        <button class="btn" id="sysSave">שמור מערכת</button>
+        <span class="muted" id="sysMsg"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📶 איכות RF ובקרת רווח</h2>
+      <div class="stat-row">
+        <div class="stat-tile"><div class="n" id="rfErrPerMin">–</div><div class="l">שגיאות CRC/FEC לדקה</div></div>
+        <div class="stat-tile"><div class="n" id="rfGainVal">0</div><div class="l">נוד-רווח (יחסי)</div></div>
+      </div>
+      <div id="rfByType"></div>
+      <div class="row" style="margin-top:var(--sp-3)">
+        <button class="btn ghost" id="gainDown">− רווח</button>
+        <button class="btn ghost" id="gainUp">+ רווח</button>
+        <span class="muted" id="gainMsg"></span>
+      </div>
+      <div class="muted" style="margin-top:8px;font-size:12px">
+        תדירות שגיאות אמיתית מ-DSD-FME (CRC/FEC) — אין מד dBFS/SNR רציף (DSD-FME
+        לא מספק כזה). נוד-הרווח יחסי בלבד וללא קריאה חוזרת — כוונו לפי מדד השגיאות.
+      </div>
+    </div>
+
+    <div class="card" id="scanCard">
+      <h2>לוח סריקה</h2>
+      <div id="scanLegs"></div>
+      <div class="row" style="margin-top:var(--sp-2)">
+        <button class="btn ghost" id="scanAdd">+ רגל</button>
+        <span class="muted" id="scanStatusTxt"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>אליאסים (שם ל-TG / RID)</h2>
+      <div class="row">
+        <select id="aliasKind" style="width:90px"><option value="tg">TG</option><option value="rid">RID</option></select>
+        <input class="mono" id="aliasId" placeholder="מספר" style="width:130px" inputmode="numeric">
+        <input id="aliasName" placeholder="שם" style="flex:1;min-width:120px">
+        <button class="btn" id="aliasAdd">הוסף</button>
+      </div>
+      <div id="aliasList" style="margin-top:var(--sp-3)"></div>
+      <div class="count" id="aliasCounts"></div>
+    </div>
+
+    <div class="card">
+      <h2>רוסטר — רדיו-IDs / talkgroups <span class="count" id="rosterCount"></span></h2>
+      <div id="rosterList"><div class="muted">אין נתונים עדיין.</div></div>
+    </div>
+  </div>
+
+  <!-- ============ CALLS ============ -->
+  <div id="callsView" class="hidden">
+    <div class="card">
+      <div class="row">
+        <input id="callFilter" placeholder="סינון (TG / RID / שם / מוצפן)" style="flex:1;min-width:160px">
+        <input type="date" id="archDate" style="width:160px">
+        <button class="btn ghost" id="archGo">🔎 ארכיון</button>
+        <button class="btn ghost hidden" id="archLive">◀ חי</button>
+        <a class="btn ghost" id="exportBtn" href="/api/dmr/export?format=csv">⬇ CSV</a>
+      </div>
+      <div class="count" id="feedStatus" style="margin-top:var(--sp-2)"></div>
+    </div>
+    <div id="detail"></div>
+    <div id="feed"><div class="muted">אין שיחות עדיין. התחל מצב DMR מהבית.</div></div>
+  </div>
+
+  <!-- ============ ANALYTICS (Phase 2/3) ============ -->
+  <div id="analyticsView" class="hidden">
+    <div class="card">
+      <div class="row">
+        <label style="margin:0">טווח:</label>
+        <select id="anRange" style="width:130px">
+          <option value="today">היום</option>
+          <option value="all">כל מה שבזיכרון</option>
+          <option value="day">תאריך…</option>
+        </select>
+        <input type="date" id="anDate" class="hidden" style="width:160px">
+        <button class="btn ghost" id="anGo">רענן</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🔒 ניתוח הצפנה</h2>
+      <div class="stat-row">
+        <div class="stat-tile"><div class="n" id="encTotal">–</div><div class="l">שיחות</div></div>
+        <div class="stat-tile"><div class="n" id="encPct">–</div><div class="l">מוצפנות</div></div>
+      </div>
+      <div id="encAlgList"></div>
+      <div style="margin-top:var(--sp-4)">
+        <div class="legend">
+          <span><span class="sw" style="background:var(--st-good)"></span>ללא הצפנה</span>
+          <span><span class="sw" style="background:var(--st-critical)"></span>מוצפן</span>
+        </div>
+        <div id="encTgList"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📈 אנליטיקת תעבורה</h2>
+      <div class="muted" style="margin-bottom:6px">שיחות לפי שעה ביום (שעון מקומי)</div>
+      <div class="heat-wrap">
+        <div class="heatgrid" id="heatGrid"></div>
+        <div class="heataxis" id="heatAxis"></div>
+      </div>
+      <div style="margin-top:var(--sp-4)">
+        <div class="muted" style="margin-bottom:6px">Talkgroups מובילים לפי זמן-שידור</div>
+        <div id="trafficTgList"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🕸️ גרף RID↔TG <span class="muted" style="font-weight:400">(מי מדבר לאן)</span></h2>
+      <div id="graphList"><div class="muted">אין נתונים עדיין.</div></div>
+    </div>
+
+    <div class="card">
+      <h2>📍 מפת LRRP <span class="muted" style="font-weight:400">(מיקום רדיו אחרון-ידוע)</span></h2>
+      <div id="lrrpMap"></div>
+      <div class="muted" id="lrrpNote" style="margin-top:6px">מוצג רק כשהרשת שולחת LRRP סטנדרטי (לא Motorola proprietary).</div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtT = t => t ? new Date(t*1000).toLocaleTimeString("he-IL",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "";
+let STATE={}, SYSTEMS=[], scanLegs=[], appView="home", archiveDay=null, lastId=0, feedMsgs=[], detailId=null;
+
+// ---------- view switching ----------
+function showView(v){
+  appView=v;
+  $("homeView").classList.toggle("hidden", v!=="home");
+  $("callsView").classList.toggle("hidden", v!=="calls");
+  $("analyticsView").classList.toggle("hidden", v!=="analytics");
+  document.querySelectorAll("#seg button").forEach(b=>b.classList.toggle("on", b.dataset.v===v));
+  if(v==="analytics") pollAnalytics();
+  if(v==="calls"){ renderFeed(); pollFeed(); }   // אל תמתין לטיק polling הבא (feedMsgs עשוי כבר להיות מלא)
+}
+$("seg").addEventListener("click", e=>{ if(e.target.dataset.v) showView(e.target.dataset.v); });
+
+// ---------- API helpers ----------
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  let j={}; try{ j=await r.json(); }catch(e){}
+  return {ok:r.ok, status:r.status, body:j};
+}
+async function post(path, data){
+  return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data||{})});
+}
+
+// ---------- mode actions ----------
+async function applyMode(mode, extra){
+  $("homeErr").innerHTML="";
+  const r = await post("/api/mode", Object.assign({mode}, extra||{}));
+  if(!r.ok || r.body.ok===false){
+    $("homeErr").innerHTML = `<div class="err-box">${esc(r.body.error||"שגיאה")}${r.body.detail?`<br><span class=muted>${esc(r.body.detail)}</span>`:""}</div>`;
+  }
+  await refreshState();
+}
+$("goDmr").onclick = ()=> applyMode("dmr", {system: $("sysSelect").value});
+$("goOff").onclick = ()=> applyMode("off");
+$("goScan").onclick = ()=>{
+  if(!scanLegs.length){ $("homeErr").innerHTML=`<div class="err-box">הוסף לפחות רגל אחת ללוח הסריקה.</div>`; return; }
+  applyMode("scan", {plan: scanLegs});
+};
+
+// ---------- state ----------
+async function refreshState(){
+  const r = await api("/api/state");
+  if(!r.ok) return;
+  STATE=r.body; SYSTEMS=r.body.systems||[];
+  $("ver").textContent = "v"+(r.body.version||"");
+  renderHome(); renderSystems(); renderScanEditor();
+}
+function modeLabel(m){ return {dmr:"📻 DMR פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה"}[m]||m; }
+function renderHome(){
+  const m = STATE.app_mode||"off";
+  $("homeState").textContent = modeLabel(m);
+  const sys = SYSTEMS.find(s=>s.id===STATE.system);
+  $("homeSub").textContent = (m==="dmr"&&sys) ? `מערכת: ${sys.name} · CC ${sys.color_code}` :
+    (m==="scan" ? "סבב אוטומטי בין מערכות" : "בחר מערכת והתחל");
+  $("cardDmr").classList.toggle("live", m==="dmr");
+  $("cardScan").classList.toggle("live", m==="scan");
+  $("cardOff").classList.toggle("live", m==="off");
+  if(STATE.mode_ok===false){
+    $("healthPill").className="pill err"; $("healthPill").textContent="תקלה";
+  }
+}
+
+// ---------- systems editor ----------
+function renderSystems(){
+  const sel=$("sysSelect"); const cur=sel.value||STATE.system;
+  sel.innerHTML = SYSTEMS.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+  if(cur) sel.value=cur;
+  loadSysEditor();
+}
+$("sysSelect").onchange = loadSysEditor;
+function loadSysEditor(){
+  const s = SYSTEMS.find(x=>x.id===$("sysSelect").value);
+  if(!s){ $("cmapList").innerHTML=""; return; }
+  $("sysControl").value = s.control; $("sysCC").value = s.color_code;
+  renderCmap(s.channelmap||[]);
+}
+function renderCmap(list){
+  $("cmapList").innerHTML = list.map((c,i)=>`
+    <div class="cmap-row">
+      <input class="mono" data-cm="lcn" data-i="${i}" value="${esc(c.lcn)}" inputmode="numeric">
+      <input class="mono" data-cm="freq" data-i="${i}" value="${esc(c.freq)}" inputmode="decimal">
+      <button class="btn ghost" data-cmdel="${i}">✕</button>
+    </div>`).join("") || `<div class="muted">אין ערוצים.</div>`;
+  $("cmapList").querySelectorAll("[data-cmdel]").forEach(b=>b.onclick=()=>{
+    const s=curSys(); s.channelmap.splice(+b.dataset.cmdel,1); renderCmap(s.channelmap);
+  });
+}
+function curSys(){ return SYSTEMS.find(x=>x.id===$("sysSelect").value); }
+$("cmapAdd").onclick=()=>{ const s=curSys(); if(!s)return; (s.channelmap=s.channelmap||[]).push({lcn:s.channelmap.length+1,freq:0}); renderCmap(s.channelmap); };
+$("sysSave").onclick=async()=>{
+  const s=curSys(); if(!s)return;
+  s.control=parseFloat($("sysControl").value)||s.control;
+  s.color_code=parseInt($("sysCC").value)||0;
+  s.channelmap = [...$("cmapList").querySelectorAll(".cmap-row")].map(r=>({
+    lcn: parseInt(r.querySelector('[data-cm=lcn]').value)||0,
+    freq: parseFloat(r.querySelector('[data-cm=freq]').value)||0,
+  })).filter(c=>c.lcn&&c.freq);
+  const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(SYSTEMS)});
+  $("sysMsg").textContent = (r.ok&&r.body.ok)?"נשמר ✓":("שגיאה: "+(r.body.error||""));
+  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; setTimeout(()=>$("sysMsg").textContent="",2000); }
+};
+
+// ---------- scan editor ----------
+function renderScanEditor(){
+  if(STATE.app_mode==="scan" && STATE.scan_plan && !scanLegs.length) scanLegs = STATE.scan_plan.map(l=>({...l}));
+  $("scanLegs").innerHTML = scanLegs.map((l,i)=>`
+    <div class="scan-leg">
+      <select data-leg="sys" data-i="${i}">${SYSTEMS.map(s=>`<option value="${esc(s.id)}" ${s.id===l.system?"selected":""}>${esc(s.name)}</option>`).join("")}</select>
+      <input class="mono" data-leg="dwell" data-i="${i}" value="${esc(l.dwell_sec)}" title="שניות" inputmode="numeric">
+      <input type="time" data-leg="from" data-i="${i}" value="${esc(l.active_from||"")}">
+      <input type="time" data-leg="to" data-i="${i}" value="${esc(l.active_to||"")}">
+      <button class="btn ghost" data-legdel="${i}">✕</button>
+    </div>`).join("") || `<div class="muted">אין רגלים. הוסף מערכות לסבב.</div>`;
+  $("scanLegs").querySelectorAll("[data-legdel]").forEach(b=>b.onclick=()=>{scanLegs.splice(+b.dataset.legdel,1);renderScanEditor();});
+  $("scanLegs").querySelectorAll("[data-leg]").forEach(inp=>inp.onchange=()=>{
+    const l=scanLegs[+inp.dataset.i], k=inp.dataset.leg;
+    if(k==="sys")l.system=inp.value; else if(k==="dwell")l.dwell_sec=parseInt(inp.value)||60;
+    else if(k==="from")l.active_from=inp.value||undefined; else if(k==="to")l.active_to=inp.value||undefined;
+  });
+}
+$("scanAdd").onclick=()=>{ if(SYSTEMS[0]) scanLegs.push({system:SYSTEMS[0].id,dwell_sec:120}); renderScanEditor(); };
+
+// ---------- aliases ----------
+$("aliasAdd").onclick=async()=>{
+  const kind=$("aliasKind").value, id=$("aliasId").value.trim(), name=$("aliasName").value.trim();
+  if(!id||!name) return;
+  const cur=(await api("/api/aliases")).body.aliases||{tg:{},rid:{}};
+  cur[kind][id]=name;
+  await api("/api/aliases",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({tg:cur.tg,rid:cur.rid})});
+  $("aliasId").value=$("aliasName").value=""; loadAliases();
+};
+async function loadAliases(){
+  const a=(await api("/api/aliases")).body.aliases||{tg:{},rid:{},counts:{}};
+  const rows=[];
+  for(const k of ["tg","rid"]) for(const id in (a[k]||{})) rows.push({k,id,name:a[k][id]});
+  $("aliasList").innerHTML = rows.length ? rows.map(r=>`
+    <div class="roster-row"><span><b class=mono>${r.k.toUpperCase()} ${esc(r.id)}</b> — ${esc(r.name)}</span>
+    <button class="btn ghost" data-adel="${r.k}:${esc(r.id)}">✕</button></div>`).join("")
+    : `<div class="muted">אין אליאסים ידניים.</div>`;
+  $("aliasList").querySelectorAll("[data-adel]").forEach(b=>b.onclick=async()=>{
+    const [k,id]=b.dataset.adel.split(":"); const cur=(await api("/api/aliases")).body.aliases;
+    delete cur[k][id];
+    await api("/api/aliases",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({tg:cur.tg,rid:cur.rid})});
+    loadAliases();
+  });
+  const c=a.counts||{};
+  $("aliasCounts").textContent = `מיובאים: ${c.rid_import||0} RID · ${c.tg_import||0} TG`;
+}
+
+// ---------- roster ----------
+async function pollRoster(){
+  const r=await api("/api/roster"); if(!r.ok)return;
+  const list=r.body.roster||[];
+  $("rosterCount").textContent = list.length?`(${list.length})`:"";
+  $("rosterList").innerHTML = list.length ? list.slice(0,60).map(c=>{
+    const nm=c.alias?` · ${esc(c.alias)}`:"";
+    const tgs=c.kind==="rid"&&c.tgs.length?`<span class=muted> TG: ${c.tgs.slice(0,6).join(", ")}</span>`:"";
+    return `<div class="roster-row"><span><b class=mono>${c.kind.toUpperCase()} ${esc(c.id)}</b>${nm}${c.encrypted_seen?' <span class="tag enc">🔒</span>':""}${tgs}</span>
+      <span class=muted>${c.count} · ${fmtT(c.last_t)}</span></div>`;
+  }).join("") : `<div class="muted">אין נתונים עדיין.</div>`;
+}
+
+// ---------- health + scan status ----------
+async function pollHealth(){
+  const r=await api("/api/health"); if(!r.ok)return;
+  const h=r.body;
+  const p=$("healthPill");
+  if(h.app_mode==="dmr"&&h.ok){ p.className="pill on"; p.textContent = h.calls_today?`מפענח · ${h.calls_today} היום`:"מאזין"; }
+  else if(h.app_mode==="off"){ p.className="pill off"; p.textContent="כבוי"; }
+  else if(h.app_mode==="scan"&&h.ok){ p.className="pill on"; p.textContent="סורק"; }
+  else { p.className="pill err"; p.textContent="תקלה"; }
+  $("callsToday").textContent = h.last_call_at?`שיחה אחרונה: ${fmtT(h.last_call_at)}`:"";
+  if(h.app_mode==="scan"){
+    const s=(await api("/api/scan")).body;
+    $("scanStatusTxt").textContent = s.leg ? `רגל נוכחית: ${s.leg.system}` : (s.active?"ממתין לחלון הזמן":"");
+  } else $("scanStatusTxt").textContent="";
+}
+
+// ---------- איכות RF + נוד-רווח ----------
+// abarRow מוגדר בהמשך (סעיף האנליטיקה) — hoisting של function declaration.
+async function pollRF(){
+  const r=await api("/api/rf"); if(!r.ok||!r.body.ok)return;
+  const d=r.body;
+  $("rfErrPerMin").textContent = d.errors_per_min;
+  $("rfGainVal").textContent = (d.gain_nudge>0?"+":"")+d.gain_nudge;
+  const max = Math.max(1, ...d.by_type.map(t=>t.count), 0);
+  $("rfByType").innerHTML = d.by_type.length
+    ? d.by_type.map(t=>abarRow(t.error_type, t.count, max)).join("")
+    : `<div class="muted">אין שגיאות ב-${d.window_sec|0} השניות האחרונות.</div>`;
+}
+async function nudgeGain(direction){
+  $("gainMsg").textContent = "…";
+  const r = await post("/api/gain", {direction});
+  if(!r.ok || r.body.ok===false){
+    $("gainMsg").textContent = "שגיאה: "+(r.body.error||"");
+    return;
+  }
+  $("rfGainVal").textContent = (r.body.gain_nudge>0?"+":"")+r.body.gain_nudge;
+  $("gainMsg").textContent = "נשלח ✓";
+  setTimeout(()=>$("gainMsg").textContent="", 1500);
+}
+$("gainUp").onclick = ()=>nudgeGain("up");
+$("gainDown").onclick = ()=>nudgeGain("down");
+
+// ---------- call feed ----------
+function callCard(m){
+  const tags=[];
+  tags.push(`<span class="tag ${esc(m.group||"data")}">${esc(m.category||m.call_type)}</span>`);
+  if(m.slot!=null) tags.push(`<span class="tag slot">TS${m.slot}</span>`);
+  if(m.cc!=null) tags.push(`<span class="tag">CC${m.cc}</span>`);
+  if(m.encrypted) tags.push(`<span class="tag enc">🔒 ${esc((m.enc&&m.enc.alg_name)||"מוצפן")}</span>`);
+  if(m.ber!=null) tags.push(`<span class="tag mono">BER ${m.ber}</span>`);
+  const tg = m.tg!=null ? `TG ${m.tg}${m.tg_alias?" · "+esc(m.tg_alias):""}` : (m.tgt!=null?`→ ${m.tgt}`:"—");
+  const rid = m.src!=null ? `RID ${m.src}${m.src_alias?" · "+esc(m.src_alias):""}` : "";
+  return `<div class="call" data-id="${m.id}">
+    <div class="tsl">${fmtT(m.t)}<br><span class=mono>${m.freq!=null?m.freq:""}</span></div>
+    <div><div class="tg">${esc(tg)}</div><div class="rid">${esc(rid)}</div><div class="meta">${tags.join("")}</div>
+      ${m.text?`<div class="muted" style="margin-top:4px">${esc(m.text)}</div>`:""}</div>
+    <div>${m.wav?`<audio class="audio" controls preload="none" src="/recordings/${encodeURIComponent(m.wav)}"></audio>`:""}</div>
+  </div>`;
+}
+function filterMatch(m,q){
+  if(!q)return true; q=q.toLowerCase();
+  if(q==="מוצפן"||q==="enc") return !!m.encrypted;
+  return [m.tg,m.src,m.tgt,m.tg_alias,m.src_alias,m.category].some(v=>String(v==null?"":v).toLowerCase().includes(q));
+}
+function renderFeed(){
+  const q=$("callFilter").value.trim();
+  const rows=feedMsgs.filter(m=>filterMatch(m,q)).slice(-300).reverse();
+  $("feed").innerHTML = rows.length ? rows.map(callCard).join("") :
+    `<div class="muted">${archiveDay?"אין שיחות ביום זה.":"אין שיחות עדיין. התחל מצב DMR מהבית."}</div>`;
+  $("feed").querySelectorAll(".call").forEach(el=>el.onclick=()=>showDetail(+el.dataset.id));
+  $("feedStatus").textContent = archiveDay ? `ארכיון ${archiveDay} · ${feedMsgs.length} שיחות` :
+    `${feedMsgs.length} שיחות היום`;
+}
+function showDetail(id){
+  const m=feedMsgs.find(x=>x.id===id); if(!m)return; detailId=id;
+  const kv=(k,v)=> v==null||v===""?"":`<div class="kv"><span>${k}</span><b>${esc(v)}</b></div>`;
+  $("detail").innerHTML=`<div class="card"><div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">פרטי שיחה</h2><button class="btn ghost" onclick="document.getElementById('detail').innerHTML=''">✕</button></div>
+    ${kv("זמן",new Date(m.t*1000).toLocaleString("he-IL"))}
+    ${kv("Talkgroup", m.tg!=null?`${m.tg}${m.tg_alias?" ("+m.tg_alias+")":""}`:"")}
+    ${kv("Radio ID (מקור)", m.src!=null?`${m.src}${m.src_alias?" ("+m.src_alias+")":""}`:"")}
+    ${kv("יעד (target)", m.tgt)}
+    ${kv("סוג", m.category)} ${kv("Timeslot", m.slot)} ${kv("Color Code", m.cc)}
+    ${kv("LCN", m.lcn)} ${kv("תדר (MHz)", m.freq)} ${kv("BER", m.ber)} ${kv("Level (dBFS)", m.level)}
+    ${kv("משך (ש')", m.dur)} ${kv("הצפנה", m.encrypted?((m.enc&&m.enc.alg_name)||"כן")+(m.enc&&m.enc.key_id!=null?` · key ${m.enc.key_id}`:""):"—")}
+    ${kv("טקסט", m.text)} ${kv("מיקום", m.lat!=null?`${m.lat}, ${m.lon}`:"")}
+    ${m.wav?`<audio class="audio" style="width:100%;margin-top:8px" controls src="/recordings/${encodeURIComponent(m.wav)}"></audio>`:""}
+  </div>`;
+}
+async function pollFeed(){
+  if(archiveDay) return;
+  const r=await api("/api/dmr?since="+lastId); if(!r.ok||!r.body.ok)return;
+  if(r.body.cursor<lastId){ feedMsgs=[]; lastId=0; }  // server restart
+  const msgs=r.body.messages||[];
+  if(msgs.length){
+    for(const m of msgs){ const i=feedMsgs.findIndex(x=>x.id===m.id); if(i>=0)feedMsgs[i]=m; else feedMsgs.push(m); }
+    lastId=Math.max(lastId, ...msgs.map(m=>m.id));
+    if(feedMsgs.length>800) feedMsgs=feedMsgs.slice(-800);
+    if(appView==="calls") renderFeed();
+  }
+}
+$("callFilter").oninput=()=>{ if(appView==="calls") renderFeed(); };
+$("archGo").onclick=async()=>{
+  const d=$("archDate").value; if(!d)return;
+  const r=await api("/api/dmr?day="+d); if(!r.ok||!r.body.ok){ alert(r.body.error||"שגיאה"); return; }
+  archiveDay=d; feedMsgs=(r.body.messages||[]).map((m,i)=>({...m,id:m.id||i+1}));
+  $("archLive").classList.remove("hidden"); $("exportBtn").href="/api/dmr/export?format=csv";
+  renderFeed();
+};
+$("archLive").onclick=()=>{ archiveDay=null; feedMsgs=[]; lastId=0; $("archLive").classList.add("hidden"); renderFeed(); };
+
+// ---------- analytics (Phase 2/3): הצפנה, תעבורה, גרף RID↔TG, מפת LRRP ----------
+// טוקני --st-good/--st-critical עברו ולידציה מול validate_palette.js (ר' CLAUDE.md).
+// heatmap שעתי: גוון יחיד (accent) שקוף→מלא לפי מגניטודה — "sequential = one hue".
+let anMap=null, anMarkers={};
+function anParams(){
+  const range=$("anRange").value;
+  if(range==="all") return "?all=1";
+  if(range==="day"){ const d=$("anDate").value; return d?("?day="+d):""; }
+  return "";
+}
+$("anRange").onchange=()=>{ $("anDate").classList.toggle("hidden", $("anRange").value!=="day"); };
+$("anGo").onclick=()=>pollAnalytics();
+
+function fmtDur(sec){
+  sec=Math.round(sec||0);
+  const m=Math.floor(sec/60), s=sec%60;
+  return m ? `${m}:${String(s).padStart(2,"0")}` : `${s}ש'`;
+}
+function abarRow(label, val, max, valText){
+  const pct = max>0 ? Math.max(val>0?3:0, Math.round(100*val/max)) : 0;
+  return `<div class="abar-row"><div class="abar-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="abar-track"><div class="abar-fill" style="width:${pct}%"></div></div>
+    <div class="abar-val">${esc(valText!=null?valText:val)}</div></div>`;
+}
+function abarStackedRow(label, clear, enc, max, valText){
+  const pc = max>0 ? Math.max(clear>0?3:0, Math.round(100*clear/max)) : 0;
+  const pe = max>0 ? Math.max(enc>0?3:0, Math.round(100*enc/max)) : 0;
+  return `<div class="abar-row"><div class="abar-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="abar-track stacked">
+      <div class="abar-fill" style="width:${pc}%;background:var(--st-good)"></div>
+      <div class="abar-fill" style="width:${pe}%;background:var(--st-critical)"></div>
+    </div>
+    <div class="abar-val">${esc(valText)}</div></div>`;
+}
+
+async function pollAnalytics(){
+  if(appView!=="analytics") return;
+  const q = anParams();
+  const [enc, traf, graph, pos] = await Promise.all([
+    api("/api/analytics/encryption"+q), api("/api/analytics/traffic"+q),
+    api("/api/analytics/graph"+q), api("/api/positions"),
+  ]);
+  if(enc.ok && enc.body.ok) renderEncryption(enc.body);
+  if(traf.ok && traf.body.ok) renderTraffic(traf.body);
+  if(graph.ok && graph.body.ok) renderGraph(graph.body.edges);
+  if(pos.ok && pos.body.ok) renderMap(pos.body.positions);
+}
+
+function renderEncryption(d){
+  $("encTotal").textContent = d.total;
+  $("encPct").textContent = d.encrypted_pct + "%";
+  const algMax = Math.max(1, ...d.by_alg.map(a=>a.count), 0);
+  $("encAlgList").innerHTML = d.by_alg.length
+    ? d.by_alg.map(a=>abarRow(a.alg_name, a.count, algMax)).join("")
+    : `<div class="muted">אין שיחות מוצפנות.</div>`;
+  const tgMax = Math.max(1, ...d.by_tg.map(t=>t.total), 0);
+  $("encTgList").innerHTML = d.by_tg.length ? d.by_tg.map(t=>{
+    const label = t.tg_alias ? `${t.tg} · ${t.tg_alias}` : `TG ${t.tg}`;
+    return abarStackedRow(label, t.clear, t.encrypted, tgMax, t.pct+"%");
+  }).join("") : `<div class="muted">אין נתונים עדיין.</div>`;
+}
+
+function renderTraffic(d){
+  const max = Math.max(1, ...d.hourly, 0);
+  $("heatGrid").innerHTML = d.hourly.map((v,h)=>{
+    const alpha = v>0 ? (0.12 + 0.85*(v/max)) : 0;
+    const style = v>0 ? `background:rgba(var(--accent-rgb),${alpha.toFixed(2)});border-color:transparent` : "";
+    return `<div class="heatcell" style="${style}" title="${String(h).padStart(2,"0")}:00 — ${v} שיחות"></div>`;
+  }).join("");
+  $("heatAxis").innerHTML = Array.from({length:24},(_,h)=>
+    h%6===0 ? `<span>${String(h).padStart(2,"0")}</span>` : `<span></span>`).join("");
+  const tMax = Math.max(1, ...d.by_tg.map(t=>t.airtime), 0);
+  $("trafficTgList").innerHTML = d.by_tg.length ? d.by_tg.map(t=>{
+    const label = t.tg_alias ? `${t.tg} · ${t.tg_alias}` : `TG ${t.tg}`;
+    return abarRow(label, t.airtime, tMax, `${fmtDur(t.airtime)} · ${t.calls} שיחות`);
+  }).join("") : `<div class="muted">אין נתונים עדיין.</div>`;
+}
+
+function renderGraph(edges){
+  if(!edges.length){ $("graphList").innerHTML=`<div class="muted">אין נתונים עדיין.</div>`; return; }
+  const max = Math.max(1, ...edges.map(e=>e.weight), 0);
+  $("graphList").innerHTML = edges.slice(0,60).map(e=>{
+    const rid = e.rid_alias ? `${e.rid} · ${e.rid_alias}` : `RID ${e.rid}`;
+    const tg = e.tg_alias ? `${e.tg} · ${e.tg_alias}` : `TG ${e.tg}`;
+    const pct = Math.max(3, Math.round(100*e.weight/max));
+    return `<div class="graph-row"><div class="graph-lbl mono" title="${esc(rid+" → "+tg)}">${esc(rid)} ← ${esc(tg)}</div>
+      <div class="abar-track" style="flex:1"><div class="abar-fill" style="width:${pct}%"></div></div>
+      <div class="abar-val">${e.weight}</div></div>`;
+  }).join("");
+}
+
+function ensureLeafletMap(){
+  if(anMap) return Promise.resolve();
+  return new Promise(res=>{
+    const s=document.createElement("script");
+    s.src="/static/vendor/leaflet/leaflet.js";
+    s.onload=()=>{ anMap=L.map("lrrpMap").setView([32.0114,34.8867],8);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18}).addTo(anMap);
+      res(); };
+    document.head.appendChild(s);
+  });
+}
+async function renderMap(positions){
+  const ids = Object.keys(positions||{});
+  $("lrrpNote").classList.toggle("hidden", ids.length>0);
+  if(!ids.length) return;
+  await ensureLeafletMap();
+  const seen = new Set();
+  for(const rid of ids){
+    seen.add(rid);
+    const p = positions[rid];
+    const label = p.alias ? `RID ${rid} · ${esc(p.alias)}` : `RID ${rid}`;
+    if(anMarkers[rid]) anMarkers[rid].setLatLng([p.lat,p.lon]);
+    else anMarkers[rid] = L.marker([p.lat,p.lon]).addTo(anMap);
+    anMarkers[rid].bindPopup(`${label}<br>${fmtT(p.t)}`);
+  }
+  for(const rid in anMarkers){
+    if(!seen.has(rid)){ anMap.removeLayer(anMarkers[rid]); delete anMarkers[rid]; }
+  }
+}
+
+// ---------- boot ----------
+async function init(){
+  await refreshState(); await loadAliases();
+  // נחיתה: אם במצב שיחות פעיל נשאר בבית; המשתמש עובר ידנית
+  setInterval(pollHealth, 4000); pollHealth();
+  setInterval(pollRF, 4000); pollRF();
+  setInterval(pollRoster, 20000); pollRoster();
+  setInterval(pollFeed, 3000); pollFeed();
+  setInterval(refreshState, 12000);
+  setInterval(pollAnalytics, 15000);   // no-op כשלא בתצוגת אנליטיקה (guard בפנים)
+}
+if("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+init();
+</script>

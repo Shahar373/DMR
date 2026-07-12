@@ -1,0 +1,299 @@
+# CLAUDE.md — מדריך הפרויקט ל-Claude (וכל מפתח)
+
+מסמך זה הוא מקור-האמת לארכיטקטורה, למוסכמות ולזרימת העבודה של **DMR**. קרא אותו
+לפני כל פיצ'ר או תיקון. כשמוסיפים יכולת מהותית או משנים ארכיטקטורה — **עדכן גם
+את המסמך הזה** (וגם את `README.md` ו-`CHANGELOG.md`).
+
+> שפה: הקוד, התיעוד והממשק בעברית (עם מונחים טכניים באנגלית). שמור על הסגנון הזה.
+>
+> **מוצא:** הפרויקט שוכפל מ-**AIR-AM** (האזנת תעופה). כל הסקאפולד (SDR-אחד-בהחלפה,
+> מתזמר-web, boot-restore, listener→jsonl, scan, roster, PWA, מוקי-בדיקות) ירש
+> ממנו כמעט מילה-במילה; רק לוגיקת התחום הוחלפה מ-תעופה ל-DMR/DSD-FME.
+
+---
+
+## 1. מהות הפרויקט
+
+**DMR** הופך **Raspberry Pi 5 + SDRplay RSP1B** לתחנת פענוח **רשתות DMR** (במיוחד
+**Motorola Capacity Plus / Cap+**) שנשלטת **כולה מהטלפון בדפדפן**. הפענוח ב-**DSD-FME**
+מקומית. מטרות: (1) שליטה מלאה מהטלפון; (2) zero-config (`install.sh` יחיד); (3) headless
+ועמיד (שורד reboot/ניתוק USB/קריסה); (4) פרטי-מקומי (בלי ענן); (5) בטיחות בלי חיכוך
+(משתמש לא-root + sudoers ממוקד, PIN אופציונלי).
+
+---
+
+## 2. הממצא המכריע: DSD-FME אינו "API-first"
+
+בניגוד ל-acarsdec/dumpvdl2 (AIR-AM) שפולטים JSON נקי על UDP, **DSD-FME הוא מפענח
+TUI/מקלדת** — הפלט טקסטואלי והשליטה בהקשות. הפתרון: `webtune/dsd_pty.py` הוא **מתאם**
+שהופך אותו ל-API-first:
+
+```
+אנטנה ─►RSP1B─USB─► sdrplay.service (SDRplay API)
+                          │
+        ┌─────────────── dmr-dsdfme.service ───────────────┐
+        │  dsd_pty.py (ExecStart):                          │
+        │    ├─ rsp_tcp   (גשר SDRplay→rtl_tcp) ← תהליך-בן  │   מחזיק את ה-SDR
+        │    └─ DSD-FME   (תחת PTY, מעקב טראנקינג)          │   מתחבר ל-rsp_tcp
+        │         │ טקסט → parse_dsd_line() → JSON          │
+        └─────────┼─────── UDP 5555 ───────────────────────┘
+                  ▼
+        dmr-web.service :8080  (Flask, המתזמר)  ── REST/JSON ──► דף הבקרה (PWA)
+                  │  _dmr_listener → _normalize_dsd → dmr.jsonl
+```
+
+**SDR אחד, בהחלפה:** ל-RSP1B ניגש תהליך אחד בכל רגע. `dmr-dsdfme` הוא צרכן ה-SDR
+**היחיד** (rsp_tcp רץ כתהליך-בן שלו, לכן יחידת systemd אחת = צרכן אחד, כמו rtl_airband
+ב-AIR-AM). **אף צרכן אינו enabled** — `dmr-web` (שעולה תמיד) קורא `state.json` באתחול
+ומשחזר את המצב השמור (`_boot_restore`) => המצב שורד reboot, כולל `off`. כישלון כניסה
+נופל ל-`off` (`_fail_to_off`), **לעולם** לא "מצב ברירת מחדל".
+
+**⚠ `parse_dsd_line` מבוסס קליטה אמיתית, לא ניחוש:** התבניות (`SLOT N TGT=N SRC=N
+Cap+ Group Call`, `Slot N Data Header - Indiv - ...`, `Sync: +DMR ... CSBK (CRC ERR)`
+וכו') אומתו ב-replay מלא מול 20,000 שורות אמיתיות מרשת Motorola Capacity Plus
+רב-אתרית (SLCO) — ר' `tests/fixtures/capplus_slco_sample.csv` ו-§7. ממצא מרכזי:
+**~80% מהפלט האמיתי הוא רעש תפעולי** (lsn_status/channel_status/site_info/
+ip_mapping/bank_call/preamble_csbk — עדכוני מצב פנימי של הטראנקינג) —
+`parse_dsd_line` מטיל אותו החוצה **במקור** (מחזיר `None`, לא נשלח ב-UDP כלל),
+לא ב-`app.py`. שנה תבניות **רק** לפי דגימות אמיתיות חדשות, לא ניחוש.
+
+---
+
+## 3. מבנה המאגר (file-by-file)
+
+```
+install.sh                  # מתקין-על יחיד. אידמפוטנטי (build-signature פר-רכיב).
+VERSION · CHANGELOG.md · README.md · CLAUDE.md
+
+webtune/
+  app.py                    # ★ הליבה: Flask. מצבים (dmr/off/scan), listener, נרמול,
+                            #   מערכות, אליאסים(join), רוסטר, REST, boot-restore, הקלטות.
+  dsd_pty.py                # ★ המתאם: DSD-FME תחת PTY + rsp_tcp → parse_dsd_line → UDP JSON.
+                            #   הרצה ידנית: python3 dsd_pty.py --selftest
+  aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
+  dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
+  static/
+    index.html              # ה-UI כולו (HTML+CSS+JS inline). PWA. 3 תצוגות: 🏠 בית +
+                            #   📻 שיחות + 📊 ניתוח (הצפנה/תעבורה/גרף RID↔TG/מפת LRRP).
+    manifest.webmanifest · sw.js · icon-*.png · apple-touch-icon.png
+    vendor/leaflet/         # Leaflet vendored (למפת LRRP ב-Phase 3; בלי CDN).
+
+config/
+  dmr.env                   # ברירת-מחדל ל-DSD-FME (EnvironmentFile). ⚠ נדרס ע"י app.py.
+  channelmap.csv            # מפת LCN→תדר (Hz) לדוגמה. ⚠ נדרס ע"י app.py בכל מעבר.
+
+systemd/
+  sdrplay.service           # שירות SDRplay API. enabled.
+  dmr-dsdfme.service        # צרכן ה-SDR (DSD-FME+גשר). Requires+PartOf=sdrplay. *לא* enabled. root.
+  dmr-web.service           # שרת הבקרה + המתזמר. enabled. User=dmr (לא-root).
+
+scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
+udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
+tests/                      # pytest (SDR/systemd ממוקפים). 106 בדיקות. ראה §7.
+  fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
+.github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
+```
+
+---
+
+## 4. נתיבי runtime על ה-Pi (לא במאגר)
+
+| נתיב | תוכן | נכתב ע"י |
+|------|------|----------|
+| `/opt/dmr/webtune/` | הקוד הפרוס | install.sh |
+| `/etc/dmr/dmr.env` | הגדרות DSD-FME חיות (תדר בקרה **ב-Hz**, CC, נתיב מפה) | app.py בכל מעבר DMR |
+| `/etc/dmr/channelmap.csv` | מפת LCN→תדר (**Hz**) | app.py בכל מעבר DMR |
+| `/etc/dmr/rid.csv` · `tg.csv` | ייבוא אליאסים (RadioID.net) | המשתמש |
+| `/etc/dmr/dmr-web.env` | env אופציונלי (PIN, תמלול) — `EnvironmentFile=-` | install.sh / ידני |
+| `/var/lib/dmr/state.json` | מצב אחרון (app_mode: dmr/off/scan, system, scan_plan) | app.py |
+| `/var/lib/dmr/systems.json` | מערכות DMR (נערכות מה-UI) | app.py |
+| `/var/lib/dmr/aliases.json` | עריכות אליאס ידניות | aliases.py |
+| `/var/lib/dmr/dmr.jsonl` | היסטוריית שיחות (retention 8000) | _dmr_listener |
+| `/var/lib/dmr/activity.jsonl` | יומן הקלטות | _activity_watcher |
+| `/var/lib/dmr/recordings/` | per-call WAV (400 קבצים / 400MB) | DSD-FME, נמחק ע"י app.py |
+
+---
+
+## 5. `webtune/app.py` — מפת הקוד
+
+- **`_guard` (before_request):** Origin==Host (CSRF/DNS-rebind) + PIN אופציונלי (`DMR_PIN`).
+  כל route משנה-מצב עובר דרכו.
+- **מצב DMR:** `render_dmr_env`/`write_dmr_env` (⚠ **MHz→Hz**) + `render_channelmap`/
+  `write_channelmap` (⚠ **MHz→Hz**) → `_enter_dmr` (write → `systemctl restart dmr-dsdfme`
+  → poll לקריסה מאוחרת). `_enter_standby` (עוצר את הצרכן, משאיר sdrplay). `_fail_to_off`
+  (כישלון ⇒ standby + state off+prev_mode + payload 500). `MODE_SERVICE`/`_live_mode`.
+- **★ `_normalize_dsd(m)`:** הלב — ממיר אירוע DSD-FME **מוקלד** (dict מ-dsd_pty, שדה
+  `type`) לכרטיס שיחה אחיד: `{t, proto, freq, slot, cc, lcn, tg, tg_alias, src, src_alias,
+  tgt, tgt_alias, call_type, category, group, encrypted, enc{alg,alg_name,key_id}, ber,
+  level, dur, event, lat, lon, text, wav, delivery}`. **רק** ל-`voice_call`/`data_header`/
+  `lrrp_position`/`lrrp_request` (`_CARD_EVENT_TYPES`) — `quality`/`encryption`/כל השאר
+  מחזירים `None` (לא כרטיס; ר' bullet הבא). **לעולם לא ממציא מדד:** `ber`/`level` תמיד
+  `None` (DSD-FME לא מדפיס אותם בקליטה אמיתית — זה תקין, לא חוסר-מימוש). `freq` נגזר
+  מ-`_channelmap_freq(lcn)` (חיפוש ב-channelmap של המערכת הפעילה לפי Rest-LSN), **לא**
+  מטקסט DSD-FME. אליאסים ב-join מ-`aliases.py`. `enc.alg`/`enc.key_id` נשארים `None` תמיד
+  (DSD-FME לא מדפיס ALG/KEY בקליטה שנבדקה — `DMR_ALG_NAMES` שמור כטבלת-מיפוי לעתיד
+  אם קליטה אחרת כן תחשוף אותם).
+- **★ `_dmr_listener` (thread, UDP 5555) — dispatch לפי `type`:**
+  `voice_call`/`data_header`/`lrrp_position`/`lrrp_request` → `_normalize_dsd` + dedup
+  המשך-שיחה (tg+src+slot, חלון 8ש', מצטבר ל-`dur`) → `dmr.jsonl`+`_dmr_msgs`.
+  `quality` → **לא** כרטיס — מוזן ל-`_rf_quality_tick` (מד תדירות-שגיאות, ר' בהמשך).
+  `encryption` → **לא** כרטיס — מתואם ל-`_slot_open_call[slot]` (השיחה הפתוחה כרגע
+  באותו slot, חלון 15ש') ומסמן `encrypted=True` עליה (מוטציה על הרשומה החיה, כמו merge
+  ה-dedup). `voice_call` עם `crc_err=True` מזין גם הוא את מד ה-RF (`VOICE_CRC`), בנוסף
+  לכרטיס עצמו. housekeeping לא מגיע לכאן בכלל — `dsd_pty` כבר סינן במקור (§2).
+  `_append_jsonl_log`/`_trim_jsonl_log`/`_read_dmr_log`/`_load_dmr_history`, `_today_start`/
+  `_day_bounds` (ארכיון יומי, עמיד DST). רץ תמיד ברקע (גם ב-standby).
+- **★ איכות RF (לא dBFS/SNR!) + נוד-רווח:** `_rf_quality_tick`/`_rf_quality_snapshot`
+  (חלון נגלל `RF_WINDOW_SEC`=60s של אירועי CRC/FEC אמיתיים — `errors_per_min` + פילוח
+  `by_type`; **לעולם לא ממציאים dB/SNR**, רק סופרים תדירות אמיתית). `_dmr_gain_nudge`
+  (שולח `g`/`G` דרך `dsd_pty.send_gain_nudge` — הקשה חיה ל-DSD-FME, **בלי לעצור אותו
+  ובלי פטצ' קוד C**; מונה `state.gain_nudge` **יחסי בלבד**, אין readback אמיתי,
+  מתאפס בכל `_enter_dmr`). מד dBFS עצמאי מה-SDR **נדחה במכוון** — ר' §8.
+- **מערכות DMR:** `DEFAULT_SYSTEMS`/`_validate_systems`/`load_systems`/`_find_system`.
+  מערכת = `{id, name, control(MHz), color_code, channelmap:[{lcn,freq(MHz)}]}`.
+- **scan (סבב בין מערכות):** `_validate_scan_plan` (רגל = `{system, dwell_sec, active_from?,
+  active_to?}`), `_leg_active_now`, `_scan_enter_leg`, `_scan_loop`/`_scan_activate`/
+  `_scan_stop_thread` — thread שמסתובב, נועל TUNE_LOCK רק במעבר; כשל-כל-הרגלים ⇒ off.
+- **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
+  TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
+- **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
+  ארכיון/הכל-בזיכרון), אותם פרמטרים כמו `/api/dmr`. `_encryption_stats` (היסטוגרמת
+  ALG + %מוצפן פר-TG — **לעולם לא מפענח**, רק מסכם את התג הקיים). `_traffic_stats`
+  (air-time+שיחות פר-TG + heatmap שעתי 0–23). `_rid_tg_graph` (who-talks-to-whom,
+  צירי RID→TG ממושקלים, רק שיחות קבוצה). `_lrrp_snapshot` (מיקום אחרון-ידוע פר-RID
+  מהזיכרון — "עכשיו" בלבד, כמו `adsb.aircraft_snapshot` ב-AIR-AM; ריק אם הרשת לא
+  שולחת LRRP סטנדרטי — Motorola proprietary לא מפוענח ע"י DSD-FME).
+- **הקלטות:** `_activity_watcher`/`_sweep_recordings` (retention), `_transcribe_worker`
+  (whisper אופציונלי), `/recordings/<name>`.
+- **`_boot_restore`** (thread ב-startup) + `__main__` (listener + watchers + `app.run(threaded=True)`).
+
+---
+
+## 6. REST API
+
+| Method | Route | תיאור |
+|--------|-------|------|
+| GET | `/api/state` | מצב + `mode_ok` + systems + version + alg_names |
+| GET/PUT | `/api/systems` | מערכות DMR (עריכה על הסט המלא) |
+| GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
+| GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
+| POST | `/api/mode` | **מעבר מצב** dmr/off/scan. דרך `_guard`. כישלון ⇒ off + 500 |
+| GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
+| GET | `/api/dmr` | שיחות (היום; `?all=1`; `?day=YYYY-MM-DD` ארכיון; `?since=` cursor) |
+| GET | `/api/dmr/export?format=csv\|json` | ייצוא (CSV עם BOM) |
+| GET | `/api/roster` (·`/api/aircraft`) | רוסטר RID/TG מאוחד — חי בכל מצב |
+| GET | `/api/analytics/encryption` | ניתוח הצפנה: היסטוגרמת ALG + %מוצפן פר-TG (`?day=`/`?all=1`) |
+| GET | `/api/analytics/traffic` | אנליטיקת תעבורה: air-time/TG + heatmap שעתי (`?day=`/`?all=1`) |
+| GET | `/api/analytics/graph` | גרף RID↔TG (who-talks-to-whom) (`?day=`/`?all=1`) |
+| GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו") |
+| GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge`. **אין dBFS/SNR** |
+| POST | `/api/gain` | נוד-רווח חי (`{direction: up\|down}`) — הקשת g/G, בלי לעצור את DSD-FME |
+| GET | `/api/activity` | הקלטות אחרונות |
+| GET | `/recordings/<name>` | קובץ WAV |
+| GET | `/api/power` | מתח/טמפ' ה-Pi |
+
+**כלל:** כל route משנה-מצב = `POST` + `_guard`. מעברי-מצב (`/api/mode`) גם נועלים
+`TUNE_LOCK`; **`/api/gain` לא** — הקשת נוד-רווח לא מפעילה restart ולא מתחרה על
+משאב ה-SDR, אז אין סיבה לחסום אותה מאחורי אותה נעילה.
+
+---
+
+## 7. בדיקות (ללא חומרה)
+
+`python -m pytest tests/ -v` (106 בדיקות). SDR/systemd ממוקפים דרך fixtures ב-`conftest.py`:
+`paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
+`_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
+`render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
+`_lrrp_snapshot`, `_rf_quality_snapshot`) נבדקות ישירות; Flask דרך `app.app.test_client()`.
+
+**★ `tests/fixtures/capplus_slco_sample.csv`:** 68 הצורות הייחודיות (type+pattern) מקליטה
+אמיתית של רשת Cap+/SLCO רב-אתרית (20,000 שורות מקור). `test_fixture_replay_matches_reality`
+מריץ את כל 68 דרך `parse_dsd_line` ומוודא סיווג מדויק (housekeeping⇒None, שיחה⇒type נכון)
+— זו בדיקת ה-regression המרכזית של הפרויקט. **בכל שינוי ב-`parse_dsd_line`, הרץ אותה
+ראשון.** אם מגיעה דגימה אמיתית חדשה (רשת/גרסת DSD-FME אחרת) — הוסף לפיקסצ'ר, אל תמציא.
+
+קבצים: `test_dsd_normalize` (הלב — parse + normalize + replay + listener e2e),
+`test_mode`, `test_boot`, `test_scan`, `test_aliases`, `test_recordings`, `test_security`,
+`test_archive`, `test_analytics` (הצפנה/תעבורה/גרף/LRRP), `test_rf_gain` (שכבת ה-HTTP
+של `/api/rf`/`/api/gain`). **הוסף בדיקה לכל שינוי backend.** CI: pytest (Python 3.11) + `bash -n`.
+
+**UI (`static/index.html`) — ללא סוויטת בדיקות (כמו AIR-AM: אין build step, אין JS
+tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-`<script>` + הרצת השרת
+עם נתונים מדומים ובדיקה ויזואלית (Playwright headless) — כך נתפסה ותוקנה בפועל
+חסרת `dir="rtl"` על ה-`<html>` (Phase 2). **בדוק חזותית כל שינוי UI מהותי, אל
+תסתפק ב-syntax check.**
+
+---
+
+## 8. מוסכמות וגוצ'אות (קרא לפני שינוי)
+
+- **SDR אחד בהחלפה:** צרכן אחד בכל רגע. `off` משחרר; אף צרכן לא enabled; `_boot_restore` משחזר.
+- **⚠ MHz בכל מקום חוץ מ-env/channelmap:** state/UI/systems/API עובדים ב-**MHz**;
+  `render_dmr_env`/`render_channelmap` הם **המקומות היחידים** שממירים ל-**Hz** (DSD-FME/rigctl).
+  אל תערבב (בדיוק כמו כלל ה-VDL2-Hz ב-AIR-AM).
+- **לעולם לא ממציאים מדד:** `ber`/`level` על כרטיס תמיד `None` — DSD-FME לא מדפיס אותם
+  בקליטה אמיתית שנבדקה (זה **תקין**, לא חוסר-מימוש; אל תמלא ערך משוער). הצפנה = **תג
+  בלבד** (`encrypted=True`, `enc.alg_name` גנרי "מוצפן") — DSD-FME לא הדפיס ALG/KEY
+  בקליטה שנבדקה (FLCO/FID הם routing fields, לא אלגוריתם); `DMR_ALG_NAMES` שמור למקרה
+  שגרסה/רשת אחרת כן תחשוף שם אלגוריתם — אל תניח שהוא תמיד ריק.
+- **⚠ אין SNR/RSSI/dBFS רציף מ-DSD-FME:** המדד היחיד הוא **תדירות שגיאות CRC/FEC**
+  (`_rf_quality_tick`/`RF_WINDOW_SEC`=60s, `errors_per_min`) — לא יחס, לא dB. מד dBFS
+  עצמאי מה-SDR עצמו **נדחה במכוון**: SDRplay API הוא single-owner (תהליך אחד מחזיק את
+  ה-RSP1B בכל רגע — `rsp_tcp` כבר תופס אותו), ואין side-channel telemetry ב-rsp_tcp
+  הסטנדרטי (`RSPTCPServer`). המימוש היחיד האפשרי דורש **פטצ' קוד C** על `rsp_tcp` (hook
+  בתוך ה-IQ callback שכבר מחזיק את המכשיר, סטטס-פייל תקופתי בסגנון `channel_dbfs_*`
+  של rtl_airband ב-AIR-AM) — **לא מומש כרגע**, כי לא ניתן לאמת בלי חומרת RSP1B אמיתית.
+  אם מיישמים בעתיד: ודאו בדיקה על חומרה אמיתית לפני merge, ותעדו כאן.
+- **נוד-רווח (gain) הוא יחסי, לא אבסולוטי:** DSD-FME תומך בהקשות `g`/`G` ("Manually
+  decrease/increase RTL gain") בזמן ריצה — נשלחות דרך `DSD_CTRL_SOCK` (unix socket,
+  `dsd_pty.send_gain_nudge`), **בלי לעצור את DSD-FME ובלי צורך בפטצ' rsp_tcp** (ב-מצב
+  rtl_tcp-compatible הסטנדרטי, שהוא גם מה ש-DSD-FME דורש כלקוח rtltcp). **אין readback**
+  מ-DSD-FME — `state.gain_nudge` הוא מונה יחסי best-effort (±1 פר-לחיצה), לא dB אמיתי;
+  מתאפס בכל `_enter_dmr` (restart אמיתי = DSD-FME חוזר לרווח ברירת-המחדל שלו).
+- **DSD-FME הוא ה"מתאם" היחיד תלוי-פורמט:** אם גרסת DSD-FME משנה ניסוח פלט — מתקנים
+  **רק** ב-`dsd_pty.parse_dsd_line` (ונבדק ב-`test_dsd_normalize`, כולל replay מול
+  `tests/fixtures/capplus_slco_sample.csv`). שאר הקוד צורך אירועים מוקלדים נקיים.
+- **rsp_tcp כתהליך-בן:** dsd_pty מריץ אותו => יחידת systemd אחת = צרכן-SDR אחד (מודל
+  ה-standby/PartOf של AIR-AM נשמר). אל תפצל ל-unit נפרד בלי לעדכן את `_enter_standby`.
+- **gain של SDRplay הפוך:** ערך קטן = רווח גדול (רלוונטי לבקרת gain עתידית ברמת
+  IFGR/RFGR עצמאיים — כרגע `_dmr_gain_nudge` הוא נוד יחסי דרך DSD-FME, לא ערך ישיר).
+- **בידוד + כתיבה אטומית:** `_atomic_write` לכל env/state/channelmap. `threaded=True` ל-Flask.
+- **עברית ב-RTL** ב-UI; CSV עם BOM ל-Excel.
+
+---
+
+## 9. צ'קליסט: פיצ'ר / באג
+
+1. הבן את ההקשר (§2 ארכיטקטורה + הבלוק הרלוונטי ב-§5).
+2. שנה במקום הנכון: פרסור DSD-FME → `dsd_pty.py`; לוגיקת שרת/נרמול → `app.py`;
+   אליאסים → `aliases.py`; UI → `static/index.html`; פריסה → `install.sh`+`systemd/`.
+3. שמור על המודל: SDR-אחד, `_guard`/sudoers, כתיבה אטומית, MHz↔Hz רק ב-render_*.
+4. הוסף/עדכן בדיקות (`tests/`, מקף SDR/systemd). ודא `pytest` ירוק.
+5. עדכן `VERSION` (SemVer) + שורות ב-`CHANGELOG.md` תחת `[Unreleased]`.
+6. עדכן `README.md`/`CLAUDE.md` אם ההתנהגות/הארכיטקטורה משתנות.
+7. commit + push לענף המיועד (הודעות בעברית, תיאוריות).
+
+---
+
+## 10. מפת דרכים (שלבים)
+
+- **Phase 1 (הושלם):** יסוד קצה-לקצה — מתאם DSD-FME, מצב DMR+טראנקינג, פיד+ארכיון,
+  מערכות, אליאסים, רוסטר, הקלטות, בריאות, UI, install/systemd, בדיקות.
+- **Phase 2 (הושלם):** ניתוח הצפנה (היסטוגרמת ALG, %מוצפן פר-TG) + אנליטיקת תעבורה
+  (heatmap שעתי, air-time/TG). נגזר מ-`dmr.jsonl`/`_dmr_msgs` הקיימים —
+  `/api/analytics/encryption`+`/api/analytics/traffic`, כרטיסייה 📊 ניתוח ב-UI.
+- **Phase 3 (הושלם):** גרף RID↔TG (who-talks-to-whom, `/api/analytics/graph`) + מפת
+  GPS/LRRP (`/api/positions` + Leaflet vendored, lazy-load). מוצג ריק בשקט כשהרשת
+  לא שולחת LRRP סטנדרטי (Motorola proprietary אינו מפוענח ע"י DSD-FME).
+- **Phase 4 (הושלם):** `parse_dsd_line` נכתב מחדש מול **קליטה אמיתית** (20,000 שורות,
+  רשת Cap+/SLCO רב-אתרית) במקום ניחוש — replay מלא מאמת 68/68 צורות (§7). תוקנו:
+  סינון housekeeping במקור (~80% מהפלט), סמנטיקת tg/tgt (group call: tgt=tg עצמו),
+  קורלציית encryption ל-slot, תדר מ-channelmap במקום מטקסט. נוסף: איכות RF (תדירות
+  שגיאות CRC/FEC, `/api/rf`) + נוד-רווח חי דרך הקשות DSD-FME (`/api/gain`) — שניהם
+  בלי פטצ' קוד C. כרטיס UI "📶 איכות RF ובקרת רווח".
+- **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
+  קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
+- **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —
+  lockout/hold/whitelist דרך הזרקת מקשים ל-PTY (`dsd_pty` כבר תומך בערוץ `DSD_CTRL_SOCK`,
+  אותו ערוץ ששמש לנוד-הרווח — ניתן להרחיב), Web Push להתראות watchlist, ייבוא/ייצוא
+  מערכת כ-QR, מעקב multi-site (שדה `site` נצפה בקליטה אמיתית אך לא מומש).
