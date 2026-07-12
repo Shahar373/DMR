@@ -11,8 +11,8 @@
 
 ## מה זה עושה
 
-- **מעקב טראנקינג (Cap+):** DSD-FME עוקב אחרי ערוץ הבקרה ומתכוונן אוטומטית לערוצי
-  הקול, דרך גשר `rsp_tcp` (SDRplay→rtl_tcp).
+- **מעקב טראנקינג (Cap+):** שרשרת מקומית ממירה IQ מה-SDRplay ל-NFM PCM עבור
+  DSD-FME, ושרת rigctl פנימי מעביר את פקודות הכיוון של DSD-FME חזרה ל-RSP1B.
 - **פיד שיחות חי:** כרטיס לכל שיחה — Talkgroup, Radio ID (מקור), timeslot, סוג שיחה
   (קבוצה/פרטית/נתונים/מיקום), תג 🔒 להצפנה.
 - **אליאסים:** שמות ל-TG/RID (ייבוא `user.csv` של RadioID.net + עריכה מהטלפון).
@@ -20,15 +20,12 @@
 - **רוסטר מאוחד:** מי פעיל, כמה, מתי, ועם אילו talkgroups (חי גם ב-standby).
 - **מערכות מרובות + סריקה:** שומרים כמה רשתות Cap+ ומסובבים ביניהן אוטומטית לפי לוח.
 - **ניתוח (📊):** היסטוגרמת אלגוריתמי הצפנה + %מוצפן פר-talkgroup, אנליטיקת תעבורה
-  (heatmap שעתי + air-time לפי TG), גרף RID↔TG ("מי מדבר לאן"), ומפת מיקום LRRP
-  (כשהרשת שולחת LRRP סטנדרטי).
-- **איכות RF ובקרת רווח (📶):** תדירות שגיאות CRC/FEC אמיתית מ-DSD-FME (חלון 60ש')
-  לזיהוי כיוון-רווח גרוע, וכפתורי נוד-רווח חי (בלי לעצור את הפענוח). **אין מד
-  dBFS/SNR רציף** — DSD-FME לא מספק כזה; ראו הערה בהמשך.
+  (heatmap שעתי + air-time לפי TG), גרף RID↔TG ("מי מדבר לאן"), ומפת מיקום LRRP.
+- **איכות RF ובקרת רווח (📶):** תדירות שגיאות CRC/FEC אמיתית מ-DSD-FME וכפתורי
+  נוד-רווח חי. **אין מד dBFS/SNR רציף** — DSD-FME לא מספק כזה.
 
 > ⚠️ **מיועד לרשת פרטית מהימנה בלבד ולהאזנה חוקית.** אין פענוח תעבורה מוצפנת בלי
-> מפתח — התוכנה רק **מציינת** שהשיחה מוצפנת. שם האלגוריתם מוצג רק כשה-DSD-FME עצמו
-> מדפיס אותו (בפועל, ברוב הרשתות שנבדקו — לא).
+> מפתח — התוכנה רק מציינת שהשיחה מוצפנת.
 
 ---
 
@@ -43,11 +40,16 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
-הסקריפט מתקין הכל אוטומטית: SDRplay API (ללא אישור רישיון ידני), SoapySDRPlay3,
-mbelib, DSD-FME, גשר `rsp_tcp`, שרת הבקרה, ושירותי systemd. אידמפוטנטי — עדכון:
-`git pull && sudo ./install.sh`.
+הסקריפט מתקין אוטומטית את SDRplay API,‏ SoapySDRPlay3,‏ mbelib,‏ DSD-FME,
+`rsp_tcp`, גשר ה-IQ→PCM/rigctl, שרת הבקרה ושירותי systemd. עדכון:
+
+```bash
+git pull
+sudo ./install.sh
+```
 
 תמלול אופציונלי (בנייה ארוכה):
+
 ```bash
 INSTALL_DMR_WHISPER=1 sudo ./install.sh
 ```
@@ -58,47 +60,46 @@ INSTALL_DMR_WHISPER=1 sudo ./install.sh
 
 פותחים בטלפון: **`http://<IP-של-ה-Pi>:8080`**
 
-1. **בית → מערכת DMR:** מזינים את פרטי רשת ה-Cap+ שלכם — תדר ערוץ הבקרה (MHz),
-   ה-color code, ומפת הערוצים (LCN → תדר). לוחצים **שמור מערכת**.
+1. **בית → מערכת DMR:** מזינים תדר ערוץ בקרה (MHz), color code ומפת LCN→תדר.
 2. לוחצים **התחל DMR**. לאחר מספר שניות מופיעות שיחות בתצוגת **📻 שיחות**.
-3. **אליאסים:** מוסיפים שמות ל-TG/RID, או מייבאים `user.csv` של RadioID.net (ראו למטה).
-4. **סריקה:** מגדירים לוח של מספר מערכות (עם חלונות שעות אופציונליים) ולוחצים
-   **התחל סריקה** לסבב אוטומטי.
-5. **כיבוי (⏻):** משחרר את ה-SDR; הפיד ההיסטורי נשאר זמין וניתן לחיפוש בארכיון.
+3. מוסיפים שמות TG/RID או מייבאים `user.csv` של RadioID.net.
+4. ניתן להגדיר סריקה בין מספר מערכות לפי לוח.
+5. **כיבוי (⏻)** עוצר את כל שרשרת הקליטה ומשחרר את ה-SDR.
 
 ### ייבוא שמות רדיו (RadioID.net)
+
 ```bash
-# על ה-Pi:
 curl -L -o /etc/dmr/rid.csv "https://radioid.net/static/user.csv"
 sudo systemctl restart dmr-web
 ```
-(העמודות מזוהות אוטומטית; `CALLSIGN` עדיף כשם.)
 
 ---
 
-## ארכיטקטורה (בקצרה)
+## ארכיטקטורה
 
+```text
+אנטנה ─► RSP1B ─USB─► sdrplay.service
+                          │
+                       rsp_tcp                  IQ u8 @ 240 kHz
+                          │
+                       rsp_fm.py                NFM + decimation
+                          ├────────► PCM TCP 48 kHz ─────► DSD-FME
+                          └◄─────── rigctl retunes ◄──────┘
+                                                           │
+                                                     PTY text output
+                                                           │
+                         dsd_pty.py ── JSON/UDP 5555 ─► dmr-web :8080
 ```
-אנטנה ─►RSP1B─USB─► Pi5:  sdrplay.service (API)
-                            │
-                    rsp_tcp (גשר SDRplay→rtl_tcp)         ← תהליך-בן של dsd_pty
-                            │  rtl_tcp
-                    DSD-FME (תחת PTY, מעקב טראנקינג)       ← dmr-dsdfme.service
-                            │  טקסט → JSON (dsd_pty)
-                            │  UDP 5555
-                    dmr-web :8080 (Flask, המתזמר)          ← dmr-web.service
-                            │
-                    דף הבקרה בטלפון (REST/JSON, PWA)
-```
 
-**SDR אחד, בהחלפה:** ל-RSP1B ניגש תהליך אחד בכל רגע. `dmr-dsdfme` הוא צרכן ה-SDR
-היחיד; `off` (standby) משחרר אותו. אף צרכן אינו enabled ב-systemd — `dmr-web`
-(שעולה תמיד) משחזר את המצב השמור באתחול, כך שהמצב שורד reboot.
+DSD-FME **אינו** לקוח `rtl_tcp`; לכן אין להעביר אליו `-i rtltcp:...`. הגשר
+`rsp_fm.py` הוא שכבת ההתאמה בין IQ של `rsp_tcp` לבין קלט ה-PCM ופקודות ה-rigctl
+ש-DSD-FME תומך בהם בפועל.
 
-**הפרסור מבוסס קליטה אמיתית:** התבניות שה-DMR קורא מפלט DSD-FME (`dsd_pty.
-parse_dsd_line`) אומתו מול 20,000 שורות אמיתיות מרשת Cap+/SLCO רב-אתרית —
-לא ניחוש. אם קליטה מרשת אחרת/גרסת DSD-FME אחרת מתנהגת שונה, פותחים issue עם
-דוגמת לוג; התיקון תמיד ממוקד בקובץ אחד (`dsd_pty.py`).
+**SDR אחד, בהחלפה:** `dmr-dsdfme` הוא צרכן ה-SDR היחיד ומפקח על כל תהליכי הבן.
+מצב `off` עוצר את ה-cgroup ומשחרר את המכשיר. `dmr-web` משחזר את המצב לאחר reboot.
+
+**הפרסור מבוסס קליטה אמיתית:** `parse_dsd_line` אומת מול 20,000 שורות אמיתיות
+מרשת Cap+/SLCO רב-אתרית. כל פלט DSD-FME הגולמי משוקף גם ל-journald לצורך אבחון.
 
 פרטים מלאים: ראו [`CLAUDE.md`](CLAUDE.md).
 
@@ -107,18 +108,25 @@ parse_dsd_line`) אומתו מול 20,000 שורות אמיתיות מרשת Cap
 ## לוגים ותחזוקה
 
 ```bash
-sudo journalctl -u dmr-dsdfme -f     # המפענח (DSD-FME + הגשר)
-sudo journalctl -u dmr-web -f        # שרת הבקרה
+sudo journalctl -u dmr-dsdfme -f
+sudo journalctl -u dmr-web -f
 ```
 
-בדיקות (ללא חומרה): `python3 -m pytest tests/ -v`
-בדיקת הפרסר: `python3 webtune/dsd_pty.py --selftest`
+בדיקות ללא חומרה:
+
+```bash
+python3 -m pytest tests/ -v
+python3 webtune/dsd_pty.py --selftest
+```
+
+לאחר שינוי בשכבת ה-RF יש לבצע גם בדיקת חומרה על Pi + RSP1B: נעילה על ערוץ המנוחה,
+מעבר לערוץ קול לפי grant, חזרה לערוץ המנוחה ויצירת WAV ב-`/var/lib/dmr/recordings`.
 
 ---
 
 ## אבטחה
 
-- `dmr-web` רץ כמשתמש **לא-root** (`dmr`) עם sudoers ממוקד ל-restart/stop של
+- `dmr-web` רץ כמשתמש לא-root (`dmr`) עם sudoers ממוקד ל-restart/stop של
   `dmr-dsdfme` בלבד.
-- הגנת CSRF/DNS-rebind (Origin==Host) לכל בקשה משנת-מצב; PIN אופציונלי (`DMR_PIN`).
+- הגנת CSRF/DNS-rebind לכל בקשה משנת-מצב; PIN אופציונלי (`DMR_PIN`).
 - **אל תחשוף את 8080 לאינטרנט.** לגישה מרחוק — VPN/Tailscale.
