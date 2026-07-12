@@ -2,12 +2,12 @@
 # ============================================================================
 #  DMR  -  התקנה מלאה ל-Raspberry Pi (Pi 5 / Pi 4, Raspberry Pi OS 64-bit)
 # ----------------------------------------------------------------------------
-#  מתקין הכל אוטומטית: SDRplay API, SoapySDR + SoapySDRPlay3, mbelib, DSD-FME,
+#  מתקין הכל אוטומטית: SDRplay API, SoapySDR + SoapySDRPlay3, mbelib, dsd-neo,
 #  גשר rsp_tcp (SDRplay→rtl_tcp), שרת הבקרה הוובי, ושירותי systemd.
 #
 #  ⚠️ הרץ *על ה-Pi עצמו*:   chmod +x install.sh && sudo ./install.sh
 #  דגלים:  INSTALL_DMR_WHISPER=1  => תמלול אופציונלי (בנייה ארוכה)
-#          עדכון SDRPLAY_VER / DSD_FME_VER בראש הקובץ לגרסה חדשה.
+#          עדכון SDRPLAY_VER / DSD_NEO_VER בראש הקובץ לגרסה חדשה.
 # ============================================================================
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -15,7 +15,8 @@ export DEBIAN_FRONTEND=noninteractive
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${SUDO_USER:-}" ]]; then BUILD_DIR="/home/$SUDO_USER/dmr-build"; else BUILD_DIR="/root/dmr-build"; fi
 SDRPLAY_VER="3.15.2"        # אם יצא עדכון: עדכן כאן (ודא שהקובץ קיים באתר sdrplay)
-DSD_FME_BRANCH="main"       # lwvmobile/dsd-fme — ה-fork הפעיל של DSD-FME
+DSD_NEO_VER="v2.3.0"        # arancormonk/dsd-neo — ⚠ *לא* lwvmobile/dsd-fme (אין לו
+                             # קלט rtltcp; ראה CHANGELOG — מעבר נדרש אחרי כשל בחומרה אמיתית)
 
 log()  { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33m[!] %s\033[0m\n' "$*"; }
@@ -30,12 +31,13 @@ mkdir -p "$BUILD_DIR"
 log "מתקין תלויות (apt)..."
 apt-get update
 apt-get install -y \
-  git cmake build-essential pkg-config curl usbutils \
+  git cmake ninja-build build-essential pkg-config curl usbutils \
   libusb-1.0-0-dev \
   libsoapysdr-dev soapysdr-tools \
   librtlsdr-dev \
   libsndfile1-dev libncurses-dev libncursesw5-dev \
   libpulse-dev libitpp-dev \
+  libssl-dev libfftw3-dev libblas-dev liblapack-dev gfortran libcurl4-openssl-dev \
   python3 python3-flask
 
 # ----------------------------------------------------------------------------
@@ -115,28 +117,34 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 5. DSD-FME  (מפענח ה-DMR; lwvmobile fork)  -- החליף את rtl_airband/acars/vdl2
+# 5. dsd-neo  (מפענח ה-DMR; arancormonk/dsd-neo)  -- החליף את rtl_airband/acars/vdl2
 # ----------------------------------------------------------------------------
-# חתימת בנייה פר-רכיב (כמו ב-AIR-AM): שינוי branch/flags => בנייה מחדש בעדכון הבא.
-DSD_CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release"
-DSD_BUILD_SIG="$(printf '%s' "$DSD_FME_BRANCH $DSD_CMAKE_FLAGS" | sha256sum | awk '{print $1}')"
-DSD_MARK="/usr/local/share/dmr/dsd-fme.build-sig"
-if command -v dsd-fme >/dev/null 2>&1 && [[ "$(cat "$DSD_MARK" 2>/dev/null)" == "$DSD_BUILD_SIG" ]]; then
-  log "DSD-FME (${DSD_FME_BRANCH}) כבר מותקן - מדלג."
+# ⚠ *לא* lwvmobile/dsd-fme: אומת (מול תיעוד CLI רשמי) שאין לו קלט ‎-i rtltcp: —
+# רק ‎-i tcp: (פרוטוקול קנייני של SDR++, לא rtl_tcp) ו-‎-i rtl: (librtlsdr USB
+# מקומי בלבד). dsd-neo תומך ‎-i rtltcp:host:port במפורש, שמתאים בדיוק לגשר
+# rsp_tcp שכבר בנוי בשלב 6. נתפס בהרצה ראשונה על חומרה אמיתית — ר' CHANGELOG.
+# חתימת בנייה פר-רכיב (כמו ב-AIR-AM): שינוי גרסה/flags => בנייה מחדש בעדכון הבא.
+DSD_CMAKE_FLAGS="-G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DDSD_WARNINGS_AS_ERRORS=OFF"
+DSD_BUILD_SIG="$(printf '%s' "$DSD_NEO_VER $DSD_CMAKE_FLAGS" | sha256sum | awk '{print $1}')"
+DSD_MARK="/usr/local/share/dmr/dsd-neo.build-sig"
+if command -v dsd-neo >/dev/null 2>&1 && [[ "$(cat "$DSD_MARK" 2>/dev/null)" == "$DSD_BUILD_SIG" ]]; then
+  log "dsd-neo (${DSD_NEO_VER}) כבר מותקן - מדלג."
 else
-  log "בונה DSD-FME (${DSD_FME_BRANCH})..."
+  log "בונה dsd-neo (${DSD_NEO_VER})..."
   cd "$BUILD_DIR"
-  if [[ -d dsd-fme/.git ]]; then
-    git -C dsd-fme fetch --depth 1 origin "$DSD_FME_BRANCH" && \
-      git -C dsd-fme checkout -f "$DSD_FME_BRANCH" && \
-      git -C dsd-fme reset --hard "origin/$DSD_FME_BRANCH" || true
+  if [[ -d dsd-neo/.git ]]; then
+    git -C dsd-neo fetch --depth 1 origin "tag" "$DSD_NEO_VER" && \
+      git -C dsd-neo checkout -f "$DSD_NEO_VER" || true
   else
-    rm -rf dsd-fme
-    git clone --depth 1 --branch "$DSD_FME_BRANCH" https://github.com/lwvmobile/dsd-fme.git
+    rm -rf dsd-neo
+    git clone --depth 1 --branch "$DSD_NEO_VER" https://github.com/arancormonk/dsd-neo.git
   fi
-  cd dsd-fme && rm -rf build && mkdir build && cd build
-  cmake $DSD_CMAKE_FLAGS .. && make -j"$(nproc)" && make install && ldconfig
-  command -v dsd-fme >/dev/null 2>&1 || die "בניית DSD-FME נכשלה (בדוק mbelib/ncurses/sndfile)."
+  cd dsd-neo && rm -rf build
+  cmake -S . -B build $DSD_CMAKE_FLAGS -DCMAKE_INSTALL_PREFIX=/usr/local
+  cmake --build build -j"$(nproc)"
+  cmake --install build
+  ldconfig
+  command -v dsd-neo >/dev/null 2>&1 || die "בניית dsd-neo נכשלה (בדוק mbelib/ncurses/sndfile/fftw)."
   mkdir -p "$(dirname "$DSD_MARK")"
   printf '%s' "$DSD_BUILD_SIG" > "$DSD_MARK"
 fi

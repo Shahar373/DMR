@@ -129,3 +129,20 @@ def test_render_channelmap(paths):
     app = paths
     txt = app.render_channelmap([{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}])
     assert "1,461037500" in txt and "2,461062500" in txt
+
+
+def test_render_channelmap_control_hint_row(paths):
+    # אין דגל -c ב-dsd-neo; תדר הבקרה מוזרק כשורה ראשונה (ערוץ-דמה 999) — סדר
+    # השורות הוא ה"בוא לכאן קודם" היחיד שהפורמט תומך בו.
+    app = paths
+    txt = app.render_channelmap(
+        [{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}], control_mhz=461.0375)
+    lines = txt.strip().split("\n")
+    assert lines[0] == f"{app.CONTROL_HINT_LCN},461037500,control"
+    assert lines[1:] == ["1,461037500", "2,461062500"]
+
+
+def test_render_channelmap_no_control(paths):
+    app = paths
+    txt = app.render_channelmap([{"lcn": 1, "freq": 461.0375}])
+    assert txt.strip() == "1,461037500"

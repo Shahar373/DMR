@@ -287,10 +287,24 @@ def _sanitize_freq(val, default=None):
     return s if _FREQ_RE.match(s) else default
 
 
-def render_channelmap(channelmap):
-    """בונה את תוכן channelmap.csv (LCN,FREQ_HZ) ל-DSD-FME (‎-C). התדרים ב-Hz.
-    פורמט DSD-FME: כל שורה 'lcn,freq_hz'. פונקציה טהורה => נבדקת בלי חומרה."""
+CONTROL_HINT_LCN = 999   # ערוץ-דמה ל"בוא לכאן קודם" (מוסכמת התיעוד של dsd-neo)
+
+
+def render_channelmap(channelmap, control_mhz=None):
+    """בונה את תוכן channelmap.csv (LCN,FREQ_HZ[,note]) ל-dsd-neo (‎-C). התדרים ב-Hz.
+    אין ל-dsd-neo דגל ‎-c לתדר-בקרה נפרד — הכוונה הראשונית נגזרת מסדר השורות
+    (התדר הראשון בקובץ = "בוא לכאן קודם"). לכן אם סופק control_mhz, נוסיף אותו
+    כשורה ראשונה עם ערוץ-דמה (CONTROL_HINT_LCN) — בהשראת הדוגמה הרשמית של
+    dsd-neo (`999,<hz>,default cc`). ב-Cap+ ערוץ הבקרה מסתובב בין ה-LCN
+    הפיזיים, כך שהתדר הזה בד"כ כבר מופיע גם בשורות ה-LCN הרגילות למטה —
+    זו כפילות מכוונת (hint), לא שגיאה. פונקציה טהורה => נבדקת בלי חומרה."""
     lines = []
+    if control_mhz not in (None, ""):
+        try:
+            hz = int(round(float(control_mhz) * 1e6))
+            lines.append(f"{CONTROL_HINT_LCN},{hz},control")
+        except (TypeError, ValueError):
+            pass
     for ch in channelmap or []:
         try:
             lcn = int(ch["lcn"])
@@ -301,8 +315,8 @@ def render_channelmap(channelmap):
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def write_channelmap(channelmap):
-    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap))
+def write_channelmap(channelmap, control_mhz=None):
+    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap, control_mhz))
 
 
 def render_dmr_env(system):
@@ -314,8 +328,8 @@ def render_dmr_env(system):
     lines = [
         '# נכתב אוטומטית ע"י DMR web (מעבר למצב DMR). שינויים ידניים נדרסים.',
         f"# מערכת: {system.get('name', system.get('id', ''))}",
-        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — ערוץ הבקרה (CC) של Cap+
-        f"DSD_COLOR_CODE={cc}",
+        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — לשורת ה-hint הראשונה ב-channelmap (לא דגל CLI)
+        f"DSD_COLOR_CODE={cc}",             # מטא-דאטה בלבד — dsd-neo מזהה CC מהסנכרון, אין דגל קלט
         f"DSD_CHANNELMAP={CHANNELMAP_PATH}",
         f"DSD_UDP={DMR_UDP_HOST}:{DMR_UDP_PORT}",   # יעד פיד ה-JSON (dsd_pty → app.py)
         f"DSD_WAV_DIR={REC_DIR}",                    # per-call WAV לתיקיית ההקלטות
@@ -334,14 +348,14 @@ def _enter_dmr(system):
     """כותב env + channelmap ומריץ את dmr-dsdfme (DSD-FME תחת PTY). מחזיר
     (error, detail). מבנה זהה ל-_enter_acars ב-AIR-AM: write-env → restart → poll
     לקריסה מאוחרת (השירות יכול לעלות ואז לקרוס על תדר/מפה רעים ~2ש' אחר-כך)."""
-    write_channelmap(system.get("channelmap"))
+    write_channelmap(system.get("channelmap"), system.get("control"))
     write_dmr_env(system)
     try:
         r = _sysctl("restart", DMR_SERVICE, timeout=45)
     except subprocess.TimeoutExpired:
         return "הפעלת DMR נתקעה — בדוק שה-SDR מחובר", None
     if r.returncode != 0:
-        return (r.stderr or "dsd-fme failed").strip(), _journal_tail(DMR_SERVICE)
+        return (r.stderr or "dsd-neo failed").strip(), _journal_tail(DMR_SERVICE)
     for _ in range(7):
         time.sleep(0.5)
         if not _is_active(DMR_SERVICE):

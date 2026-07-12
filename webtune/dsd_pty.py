@@ -5,9 +5,9 @@
 #  ExecStart של dmr-dsdfme.service. הבעיה: DSD-FME אינו API-first — הפלט שלו
 #  טקסטואלי (ncurses/console) והשליטה בהקשות מקלדת. המודול הזה עוטף אותו:
 #
-#    1. build_command(env) — בונה את שורת הפקודה של dsd-fme מתוך משתני dmr.env
-#       (תדר בקרה, color code, channel-map, טראנקינג, יעד WAV, קלט rsp_tcp).
-#    2. מריץ את dsd-fme תחת pseudo-terminal (PTY) — כי DSD-FME מצפה ל-TTY.
+#    1. build_command(env) — בונה את שורת הפקודה של dsd-neo מתוך משתני dmr.env
+#       (channel-map עם שורת-hint לתדר הבקרה, טראנקינג, יעד WAV, קלט rsp_tcp).
+#    2. מריץ את dsd-neo תחת pseudo-terminal (PTY) — כי DSD-FME מצפה ל-TTY.
 #    3. parse_dsd_line(text) — הלב הטקסטואלי: מפרסר כל שורת פלט ל-dict אירוע
 #       *מוקלד* (type), או None לשורת housekeeping (לא נשלח ל-UDP כלל — ~80%
 #       מהפלט בפועל הוא lsn_status/channel_status/site_info/ip_mapping/
@@ -34,7 +34,9 @@ import time
 
 # --- קבועים -----------------------------------------------------------------
 DEFAULT_UDP = "127.0.0.1:5555"
-DSD_BIN = os.environ.get("DSD_BIN", "dsd-fme")
+# ⚠ arancormonk/dsd-neo (לא lwvmobile/dsd-fme — האחרון לא תומך -i rtltcp:
+# מאומת מול תיעוד CLI; ר' install.sh §5 והחלטת המעבר ב-CHANGELOG).
+DSD_BIN = os.environ.get("DSD_BIN", "dsd-neo")
 CTRL_SOCK_PATH = os.environ.get("DSD_CTRL_SOCK", "/run/dmr/dsd-ctrl.sock")
 # rsp_tcp: הגשר SoapySDR→rtl_tcp שמזין את DSD-FME (RSP1B אינו נתמך native ב-DSD-FME).
 RSP_TCP_HOST = os.environ.get("DSD_RTLTCP", "127.0.0.1:1234")
@@ -162,25 +164,19 @@ def build_rsp_tcp_command(env):
 
 
 def build_command(env):
-    """בונה את argv של dsd-fme ממשתני הסביבה (dmr.env). פונקציה טהורה => נבדקת.
-    קלט rsp_tcp (‎-i rtltcp), פלט per-call WAV (‎-6/‎-P), טראנקינג (‎-T) עם
-    channel-map (‎-C) ותדר בקרה (‎-c). ‎-N מריץ בלי ncurses-input (headless)."""
+    """בונה את argv של dsd-neo ממשתני הסביבה (dmr.env). פונקציה טהורה => נבדקת.
+    קלט rsp_tcp (‎-i rtltcp), פלט per-call WAV (‎-7 <dir> לפני ‎-P), טראנקינג
+    (‎-T) עם channel-map (‎-C). ⚠ אין ל-dsd-neo דגל ‎-c לתדר-בקרה נפרד ואין דגל
+    קלט לצבע-קוד DMR (זה מזוהה מהסנכרון בפועל, לא ניתן כארגומנט) — תדר הבקרה
+    מגיע דרך שורת ה-hint הראשונה שכתב app.py ל-channelmap.csv (ר' render_channelmap)."""
     rtltcp = env.get("DSD_RTLTCP", RSP_TCP_HOST)
     cmd = [DSD_BIN, "-i", f"rtltcp:{rtltcp}", "-o", "null"]
-    # מצב DMR + פענוח מטא-דאטה מלא
     cmd += ["-fs"]                       # -fs = DMR stereo (שני ה-slots)
-    cc = env.get("DSD_COLOR_CODE")
-    if cc not in (None, ""):
-        cmd += ["-C", str(env.get("DSD_CHANNELMAP", ""))] if env.get("DSD_CHANNELMAP") else []
-    control = env.get("DSD_CONTROL_FREQ")
-    if env.get("DSD_TRUNK") in ("1", "true", "yes") and control:
-        cmd += ["-T"]                    # מעקב טראנקינג
-        if env.get("DSD_CHANNELMAP"):
-            cmd += ["-C", str(env["DSD_CHANNELMAP"])]
-        cmd += ["-c", str(control)]      # תדר ערוץ הבקרה (Hz)
+    if env.get("DSD_TRUNK") in ("1", "true", "yes") and env.get("DSD_CHANNELMAP"):
+        cmd += ["-T", "-C", str(env["DSD_CHANNELMAP"])]   # מעקב טראנקינג + מפת ערוצים
     wav_dir = env.get("DSD_WAV_DIR")
     if wav_dir:
-        cmd += ["-6", str(wav_dir)]      # per-call WAV לתיקייה
+        cmd += ["-7", str(wav_dir), "-P"]   # per-call WAV: תיקייה (-7) לפני ההפעלה (-P)
     return cmd
 
 
@@ -221,11 +217,15 @@ def _run():   # pragma: no cover  (רץ רק על חומרה, לא ב-CI)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     env = dict(os.environ)
 
-    # גשר rsp_tcp (מחזיק את ה-RSP1B) כתהליך-בן — DSD-FME מתחבר אליו כ-rtl_tcp.
+    # גשר rsp_tcp (מחזיק את ה-RSP1B) כתהליך-בן — dsd-neo מתחבר אליו כ-rtl_tcp.
+    # stdout/stderr יורשים את אלה של dsd_pty (=> journalctl -u dmr-dsdfme) כדי
+    # שכשלי-פתיחת-SDR/bind לא יעלמו בשקט (היו מנותבים ל-DEVNULL בעבר).
     rsp_cmd = build_rsp_tcp_command(env)
     sys.stderr.write("dsd_pty: exec (bridge) %s\n" % " ".join(rsp_cmd))
-    rsp = subprocess.Popen(rsp_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    time.sleep(2)   # שהות לגשר לפתוח את ה-SDR ולהאזין לפני ש-DSD-FME מתחבר
+    rsp = subprocess.Popen(rsp_cmd, stdout=None, stderr=None)
+    time.sleep(2)   # שהות לגשר לפתוח את ה-SDR ולהאזין לפני ש-dsd-neo מתחבר
+    if rsp.poll() is not None:
+        sys.stderr.write("dsd_pty: rsp_tcp exited early (code %s) — בדוק חיבור RSP1B\n" % rsp.returncode)
 
     cmd = build_command(env)
     sys.stderr.write("dsd_pty: exec %s\n" % " ".join(cmd))
@@ -269,6 +269,10 @@ def _run():   # pragma: no cover  (רץ רק על חומרה, לא ב-CI)
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     text = line.decode("utf-8", "replace")
+                    # מהדהד כל שורת פלט גולמית ל-stderr (=> journalctl) — לא רק
+                    # אירועים מפורסרים. בלי זה, שגיאות/קריסה של dsd-neo (usage
+                    # error, קלט לא-תקין וכו') נעלמות בשקט מ-journalctl.
+                    sys.stderr.write(text + "\n")
                     ev = parse_dsd_line(text)
                     if ev:
                         ev["t"] = time.time()
@@ -276,6 +280,9 @@ def _run():   # pragma: no cover  (רץ רק על חומרה, לא ב-CI)
                             sock.sendto(json.dumps(ev).encode("utf-8"), target)
                         except OSError:
                             pass
+        if buf:
+            sys.stderr.write(buf.decode("utf-8", "replace") + "\n")
+        sys.stderr.write("dsd_pty: dsd-neo exited (code %s)\n" % proc.poll())
     finally:
         for p in (proc, rsp):
             try:

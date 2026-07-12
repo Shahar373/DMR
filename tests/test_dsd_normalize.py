@@ -149,15 +149,30 @@ def test_parse_noise_returns_none():
 
 # --- build_command / build_rsp_tcp_command: argv טהור ----------------------
 def test_build_command_trunking():
+    # ⚠ regression guard: קליטה אמיתית על חומרה חשפה פקודה שבורה (‎-C כפול +
+    # ‎-c שלא קיים ב-dsd-neo) — dmr-dsdfme.service קרס מיד. תדר הבקרה לא נכנס
+    # לארגומנטים כלל יותר: הוא מגיע דרך שורת ה-hint הראשונה ב-channelmap.csv
+    # עצמו (render_channelmap ב-app.py), לא כדגל CLI.
     env = {"DSD_CONTROL_FREQ": "461037500", "DSD_COLOR_CODE": "1",
            "DSD_CHANNELMAP": "/etc/dmr/channelmap.csv", "DSD_TRUNK": "1",
            "DSD_WAV_DIR": "/var/lib/dmr/recordings", "DSD_RTLTCP": "127.0.0.1:1234"}
     cmd = dsd_pty.build_command(env)
+    assert cmd[0] == "dsd-neo"
     assert "-T" in cmd                              # טראנקינג
-    assert "461037500" in cmd                       # תדר בקרה
-    assert "/etc/dmr/channelmap.csv" in cmd         # channel map
-    assert cmd[cmd.index("-6") + 1] == "/var/lib/dmr/recordings"
-    assert "rtltcp:127.0.0.1:1234" in cmd
+    assert cmd.count("-C") == 1                      # לא כפול
+    assert cmd[cmd.index("-C") + 1] == "/etc/dmr/channelmap.csv"
+    assert "-c" not in cmd                           # אין דגל כזה ב-dsd-neo
+    assert "461037500" not in cmd                    # תדר בקרה לא בארגומנטים
+    assert cmd[cmd.index("-7") + 1] == "/var/lib/dmr/recordings"
+    assert "-P" in cmd
+    assert "rtltcp:127.0.0.1:1234" in " ".join(cmd)
+
+
+def test_build_command_no_trunk_no_wav():
+    env = {"DSD_RTLTCP": "127.0.0.1:1234"}
+    cmd = dsd_pty.build_command(env)
+    assert "-T" not in cmd and "-C" not in cmd
+    assert "-7" not in cmd and "-P" not in cmd
 
 
 def test_build_rsp_tcp_command():

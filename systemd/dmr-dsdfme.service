@@ -1,6 +1,6 @@
 [Unit]
-Description=DMR - DSD-FME decoder (Capacity Plus trunking, SDRplay RSP1B)
-Documentation=https://github.com/lwvmobile/dsd-fme
+Description=DMR - dsd-neo decoder (Capacity Plus trunking, SDRplay RSP1B)
+Documentation=https://github.com/arancormonk/dsd-neo
 After=network-online.target sdrplay.service
 Wants=network-online.target
 # Requires => עצירת sdrplay עוצרת גם אותנו (תלות קשיחה ב-API).
@@ -20,7 +20,7 @@ EnvironmentFile=-/etc/dmr/dmr.env
 # שער מוכנות: מחכה שה-SDRplay API באמת יענה לפני שהגשר/DSD-FME פותחים את ה-SDR
 ExecStartPre=/usr/local/bin/dmr-wait-sdrplay
 # dsd_pty.py הוא ה"מתאם": מריץ את rsp_tcp (גשר SDRplay→rtl_tcp) כתהליך-בן ואת
-# DSD-FME תחת PTY, מפרסר את הפלט ל-JSON ושולח ב-UDP ל-dmr-web. יחידה אחת =
+# dsd-neo תחת PTY, מפרסר את הפלט ל-JSON ושולח ב-UDP ל-dmr-web. יחידה אחת =
 # צרכן-SDR אחד (כמו rtl_airband ב-AIR-AM) => מודל ה-standby/Conflicts נשמר.
 ExecStart=/usr/bin/python3 /opt/dmr/webtune/dsd_pty.py
 # גישת חומרה (SDR) => רץ כ-root
