@@ -1,5 +1,6 @@
 import socket
 import struct
+import time
 
 import numpy as np
 
@@ -40,12 +41,25 @@ def test_rigctl_commands(monkeypatch):
     assert server.handle_command("unknown") == "RPRT 1\n"
 
 
+def _wait_for_client(server, previous=None):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with server._lock:
+            current = server.client
+        if current is not None and current is not previous:
+            return current
+        time.sleep(0.01)
+    raise AssertionError("audio client was not accepted")
+
+
 def test_audio_server_accepts_replacement_clients():
     server = rsp_fm.AudioServer("127.0.0.1", 0)
     server.start()
     port = server.listener.getsockname()[1]
     first = socket.create_connection(("127.0.0.1", port))
+    accepted_first = _wait_for_client(server)
     second = socket.create_connection(("127.0.0.1", port))
+    _wait_for_client(server, accepted_first)
     try:
         server.send(b"\x01\x02")
         second.settimeout(2)
