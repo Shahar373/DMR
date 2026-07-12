@@ -1,3 +1,5 @@
+<!doctype html>
+<html lang="he" dir="rtl">
 <!-- DMR - לוח בקרה (PWA יחיד, HTML+CSS+JS inline, RTL עברית). ראה CLAUDE.md §7. -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -6,6 +8,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 <title>DMR - תחנת האזנה</title>
 <style>
 :root{
@@ -15,6 +18,11 @@
   --text:#e6edf3; --dim:#9db0c0; --faint:#6b7d8d;
   --accent:#3b9dff; --accent-rgb:59,157,255;
   --green:#3fb950; --amber:#d29922; --red:#f85149; --purple:#a371f7; --teal:#39c5cf;
+  /* טוקני אנליטיקה (Phase 2/3) — ולידציה מול validate_palette.js: שני הצבעים
+     עוברים lightness-band/chroma/CVD/contrast מול panel-2 בהיר וכהה כאחד, לכן
+     ערך יחיד לשני המצבים (כמו ב-references/palette.md §status). אל תערבב עם
+     --green/--red הכלליים (אלה ל-tags, אלה למדידה בלבד). */
+  --st-good:#0ca30c; --st-critical:#d03b3b;
   --r-card:14px; --r-ctrl:10px; --r-sm:8px;
   --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px;
   --sh-card:0 2px 8px rgba(0,0,0,.28); --topbar-h:52px;
@@ -102,6 +110,31 @@ button.btn:disabled{ opacity:.5; cursor:default; }
 .count{ color:var(--faint); font-size:12px; }
 .cmap-row{ display:grid; grid-template-columns:70px 1fr auto; gap:var(--sp-2); margin-bottom:6px; }
 .scan-leg{ display:grid; grid-template-columns:1fr 90px auto auto auto; gap:var(--sp-2); align-items:center; margin-bottom:6px; }
+/* ---- אנליטיקה (Phase 2/3): מקרא, בר-מגניטודה, בר מוערם, heatmap, גרף, מפה ---- */
+.legend{ display:flex; gap:var(--sp-4); font-size:12px; color:var(--dim); margin-bottom:var(--sp-2); }
+.legend .sw{ width:10px; height:10px; border-radius:3px; display:inline-block; margin-inline-end:5px; vertical-align:-1px; }
+.stat-row{ display:flex; gap:var(--sp-4); flex-wrap:wrap; margin-bottom:var(--sp-3); }
+.stat-tile{ flex:1; min-width:120px; background:var(--panel-2); border:1px solid var(--border);
+  border-radius:var(--r-sm); padding:10px var(--sp-3); }
+.stat-tile .n{ font-size:22px; font-weight:700; font-family:var(--mono); }
+.stat-tile .l{ font-size:12px; color:var(--faint); }
+.abar-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:7px; font-size:13px; }
+.abar-label{ min-width:110px; max-width:150px; color:var(--dim); white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; }
+.abar-track{ flex:1; height:8px; background:var(--panel-2); border:1px solid var(--border);
+  border-radius:4px; overflow:hidden; }
+.abar-track.stacked{ display:flex; gap:2px; background:none; border:none; }
+.abar-fill{ height:100%; border-radius:4px; background:var(--accent); }
+.abar-val{ min-width:50px; text-align:end; font-family:var(--mono); color:var(--faint); font-size:12px; }
+.heat-wrap{ overflow-x:auto; }
+.heatgrid{ display:grid; grid-template-columns:repeat(24,1fr); gap:2px; min-width:480px; }
+.heatcell{ aspect-ratio:1; border-radius:3px; background:var(--panel-2); border:1px solid var(--border); }
+.heataxis{ display:grid; grid-template-columns:repeat(24,1fr); font-size:9px; color:var(--faint);
+  margin-top:4px; min-width:480px; font-family:var(--mono); }
+.heataxis span{ text-align:center; }
+.graph-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:6px; font-size:13px; }
+.graph-lbl{ min-width:190px; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#lrrpMap{ height:320px; border-radius:var(--r-ctrl); border:1px solid var(--border); }
 </style>
 
 <div class="topbar">
@@ -109,6 +142,7 @@ button.btn:disabled{ opacity:.5; cursor:default; }
   <div class="seg" id="seg">
     <button data-v="home" class="on">🏠 בית</button>
     <button data-v="calls">📻 שיחות</button>
+    <button data-v="analytics">📊 ניתוח</button>
   </div>
 </div>
 
@@ -218,6 +252,62 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     <div id="detail"></div>
     <div id="feed"><div class="muted">אין שיחות עדיין. התחל מצב DMR מהבית.</div></div>
   </div>
+
+  <!-- ============ ANALYTICS (Phase 2/3) ============ -->
+  <div id="analyticsView" class="hidden">
+    <div class="card">
+      <div class="row">
+        <label style="margin:0">טווח:</label>
+        <select id="anRange" style="width:130px">
+          <option value="today">היום</option>
+          <option value="all">כל מה שבזיכרון</option>
+          <option value="day">תאריך…</option>
+        </select>
+        <input type="date" id="anDate" class="hidden" style="width:160px">
+        <button class="btn ghost" id="anGo">רענן</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🔒 ניתוח הצפנה</h2>
+      <div class="stat-row">
+        <div class="stat-tile"><div class="n" id="encTotal">–</div><div class="l">שיחות</div></div>
+        <div class="stat-tile"><div class="n" id="encPct">–</div><div class="l">מוצפנות</div></div>
+      </div>
+      <div id="encAlgList"></div>
+      <div style="margin-top:var(--sp-4)">
+        <div class="legend">
+          <span><span class="sw" style="background:var(--st-good)"></span>ללא הצפנה</span>
+          <span><span class="sw" style="background:var(--st-critical)"></span>מוצפן</span>
+        </div>
+        <div id="encTgList"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📈 אנליטיקת תעבורה</h2>
+      <div class="muted" style="margin-bottom:6px">שיחות לפי שעה ביום (שעון מקומי)</div>
+      <div class="heat-wrap">
+        <div class="heatgrid" id="heatGrid"></div>
+        <div class="heataxis" id="heatAxis"></div>
+      </div>
+      <div style="margin-top:var(--sp-4)">
+        <div class="muted" style="margin-bottom:6px">Talkgroups מובילים לפי זמן-שידור</div>
+        <div id="trafficTgList"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🕸️ גרף RID↔TG <span class="muted" style="font-weight:400">(מי מדבר לאן)</span></h2>
+      <div id="graphList"><div class="muted">אין נתונים עדיין.</div></div>
+    </div>
+
+    <div class="card">
+      <h2>📍 מפת LRRP <span class="muted" style="font-weight:400">(מיקום רדיו אחרון-ידוע)</span></h2>
+      <div id="lrrpMap"></div>
+      <div class="muted" id="lrrpNote" style="margin-top:6px">מוצג רק כשהרשת שולחת LRRP סטנדרטי (לא Motorola proprietary).</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -232,7 +322,10 @@ function showView(v){
   appView=v;
   $("homeView").classList.toggle("hidden", v!=="home");
   $("callsView").classList.toggle("hidden", v!=="calls");
+  $("analyticsView").classList.toggle("hidden", v!=="analytics");
   document.querySelectorAll("#seg button").forEach(b=>b.classList.toggle("on", b.dataset.v===v));
+  if(v==="analytics") pollAnalytics();
+  if(v==="calls"){ renderFeed(); pollFeed(); }   // אל תמתין לטיק polling הבא (feedMsgs עשוי כבר להיות מלא)
 }
 $("seg").addEventListener("click", e=>{ if(e.target.dataset.v) showView(e.target.dataset.v); });
 
@@ -470,6 +563,127 @@ $("archGo").onclick=async()=>{
 };
 $("archLive").onclick=()=>{ archiveDay=null; feedMsgs=[]; lastId=0; $("archLive").classList.add("hidden"); renderFeed(); };
 
+// ---------- analytics (Phase 2/3): הצפנה, תעבורה, גרף RID↔TG, מפת LRRP ----------
+// טוקני --st-good/--st-critical עברו ולידציה מול validate_palette.js (ר' CLAUDE.md).
+// heatmap שעתי: גוון יחיד (accent) שקוף→מלא לפי מגניטודה — "sequential = one hue".
+let anMap=null, anMarkers={};
+function anParams(){
+  const range=$("anRange").value;
+  if(range==="all") return "?all=1";
+  if(range==="day"){ const d=$("anDate").value; return d?("?day="+d):""; }
+  return "";
+}
+$("anRange").onchange=()=>{ $("anDate").classList.toggle("hidden", $("anRange").value!=="day"); };
+$("anGo").onclick=()=>pollAnalytics();
+
+function fmtDur(sec){
+  sec=Math.round(sec||0);
+  const m=Math.floor(sec/60), s=sec%60;
+  return m ? `${m}:${String(s).padStart(2,"0")}` : `${s}ש'`;
+}
+function abarRow(label, val, max, valText){
+  const pct = max>0 ? Math.max(val>0?3:0, Math.round(100*val/max)) : 0;
+  return `<div class="abar-row"><div class="abar-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="abar-track"><div class="abar-fill" style="width:${pct}%"></div></div>
+    <div class="abar-val">${esc(valText!=null?valText:val)}</div></div>`;
+}
+function abarStackedRow(label, clear, enc, max, valText){
+  const pc = max>0 ? Math.max(clear>0?3:0, Math.round(100*clear/max)) : 0;
+  const pe = max>0 ? Math.max(enc>0?3:0, Math.round(100*enc/max)) : 0;
+  return `<div class="abar-row"><div class="abar-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="abar-track stacked">
+      <div class="abar-fill" style="width:${pc}%;background:var(--st-good)"></div>
+      <div class="abar-fill" style="width:${pe}%;background:var(--st-critical)"></div>
+    </div>
+    <div class="abar-val">${esc(valText)}</div></div>`;
+}
+
+async function pollAnalytics(){
+  if(appView!=="analytics") return;
+  const q = anParams();
+  const [enc, traf, graph, pos] = await Promise.all([
+    api("/api/analytics/encryption"+q), api("/api/analytics/traffic"+q),
+    api("/api/analytics/graph"+q), api("/api/positions"),
+  ]);
+  if(enc.ok && enc.body.ok) renderEncryption(enc.body);
+  if(traf.ok && traf.body.ok) renderTraffic(traf.body);
+  if(graph.ok && graph.body.ok) renderGraph(graph.body.edges);
+  if(pos.ok && pos.body.ok) renderMap(pos.body.positions);
+}
+
+function renderEncryption(d){
+  $("encTotal").textContent = d.total;
+  $("encPct").textContent = d.encrypted_pct + "%";
+  const algMax = Math.max(1, ...d.by_alg.map(a=>a.count), 0);
+  $("encAlgList").innerHTML = d.by_alg.length
+    ? d.by_alg.map(a=>abarRow(a.alg_name, a.count, algMax)).join("")
+    : `<div class="muted">אין שיחות מוצפנות.</div>`;
+  const tgMax = Math.max(1, ...d.by_tg.map(t=>t.total), 0);
+  $("encTgList").innerHTML = d.by_tg.length ? d.by_tg.map(t=>{
+    const label = t.tg_alias ? `${t.tg} · ${t.tg_alias}` : `TG ${t.tg}`;
+    return abarStackedRow(label, t.clear, t.encrypted, tgMax, t.pct+"%");
+  }).join("") : `<div class="muted">אין נתונים עדיין.</div>`;
+}
+
+function renderTraffic(d){
+  const max = Math.max(1, ...d.hourly, 0);
+  $("heatGrid").innerHTML = d.hourly.map((v,h)=>{
+    const alpha = v>0 ? (0.12 + 0.85*(v/max)) : 0;
+    const style = v>0 ? `background:rgba(var(--accent-rgb),${alpha.toFixed(2)});border-color:transparent` : "";
+    return `<div class="heatcell" style="${style}" title="${String(h).padStart(2,"0")}:00 — ${v} שיחות"></div>`;
+  }).join("");
+  $("heatAxis").innerHTML = Array.from({length:24},(_,h)=>
+    h%6===0 ? `<span>${String(h).padStart(2,"0")}</span>` : `<span></span>`).join("");
+  const tMax = Math.max(1, ...d.by_tg.map(t=>t.airtime), 0);
+  $("trafficTgList").innerHTML = d.by_tg.length ? d.by_tg.map(t=>{
+    const label = t.tg_alias ? `${t.tg} · ${t.tg_alias}` : `TG ${t.tg}`;
+    return abarRow(label, t.airtime, tMax, `${fmtDur(t.airtime)} · ${t.calls} שיחות`);
+  }).join("") : `<div class="muted">אין נתונים עדיין.</div>`;
+}
+
+function renderGraph(edges){
+  if(!edges.length){ $("graphList").innerHTML=`<div class="muted">אין נתונים עדיין.</div>`; return; }
+  const max = Math.max(1, ...edges.map(e=>e.weight), 0);
+  $("graphList").innerHTML = edges.slice(0,60).map(e=>{
+    const rid = e.rid_alias ? `${e.rid} · ${e.rid_alias}` : `RID ${e.rid}`;
+    const tg = e.tg_alias ? `${e.tg} · ${e.tg_alias}` : `TG ${e.tg}`;
+    const pct = Math.max(3, Math.round(100*e.weight/max));
+    return `<div class="graph-row"><div class="graph-lbl mono" title="${esc(rid+" → "+tg)}">${esc(rid)} ← ${esc(tg)}</div>
+      <div class="abar-track" style="flex:1"><div class="abar-fill" style="width:${pct}%"></div></div>
+      <div class="abar-val">${e.weight}</div></div>`;
+  }).join("");
+}
+
+function ensureLeafletMap(){
+  if(anMap) return Promise.resolve();
+  return new Promise(res=>{
+    const s=document.createElement("script");
+    s.src="/static/vendor/leaflet/leaflet.js";
+    s.onload=()=>{ anMap=L.map("lrrpMap").setView([32.0114,34.8867],8);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18}).addTo(anMap);
+      res(); };
+    document.head.appendChild(s);
+  });
+}
+async function renderMap(positions){
+  const ids = Object.keys(positions||{});
+  $("lrrpNote").classList.toggle("hidden", ids.length>0);
+  if(!ids.length) return;
+  await ensureLeafletMap();
+  const seen = new Set();
+  for(const rid of ids){
+    seen.add(rid);
+    const p = positions[rid];
+    const label = p.alias ? `RID ${rid} · ${esc(p.alias)}` : `RID ${rid}`;
+    if(anMarkers[rid]) anMarkers[rid].setLatLng([p.lat,p.lon]);
+    else anMarkers[rid] = L.marker([p.lat,p.lon]).addTo(anMap);
+    anMarkers[rid].bindPopup(`${label}<br>${fmtT(p.t)}`);
+  }
+  for(const rid in anMarkers){
+    if(!seen.has(rid)){ anMap.removeLayer(anMarkers[rid]); delete anMarkers[rid]; }
+  }
+}
+
 // ---------- boot ----------
 async function init(){
   await refreshState(); await loadAliases();
@@ -478,6 +692,7 @@ async function init(){
   setInterval(pollRoster, 20000); pollRoster();
   setInterval(pollFeed, 3000); pollFeed();
   setInterval(refreshState, 12000);
+  setInterval(pollAnalytics, 15000);   // no-op כשלא בתצוגת אנליטיקה (guard בפנים)
 }
 if("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
 init();

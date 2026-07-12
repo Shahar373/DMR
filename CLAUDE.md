@@ -64,7 +64,8 @@ webtune/
   aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
   dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
   static/
-    index.html              # ה-UI כולו (HTML+CSS+JS inline). PWA. 2 תצוגות: 🏠 בית + 📻 שיחות.
+    index.html              # ה-UI כולו (HTML+CSS+JS inline). PWA. 3 תצוגות: 🏠 בית +
+                            #   📻 שיחות + 📊 ניתוח (הצפנה/תעבורה/גרף RID↔TG/מפת LRRP).
     manifest.webmanifest · sw.js · icon-*.png · apple-touch-icon.png
     vendor/leaflet/         # Leaflet vendored (למפת LRRP ב-Phase 3; בלי CDN).
 
@@ -125,7 +126,14 @@ tests/                      # pytest (SDR/systemd ממוקפים). 71 בדיקו
   active_to?}`), `_leg_active_now`, `_scan_enter_leg`, `_scan_loop`/`_scan_activate`/
   `_scan_stop_thread` — thread שמסתובב, נועל TUNE_LOCK רק במעבר; כשל-כל-הרגלים ⇒ off.
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
-  TG-ים כל RID דיבר — בסיס לגרף RID↔TG של Phase 3). חי בכל מצב.
+  TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
+- **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
+  ארכיון/הכל-בזיכרון), אותם פרמטרים כמו `/api/dmr`. `_encryption_stats` (היסטוגרמת
+  ALG + %מוצפן פר-TG — **לעולם לא מפענח**, רק מסכם את התג הקיים). `_traffic_stats`
+  (air-time+שיחות פר-TG + heatmap שעתי 0–23). `_rid_tg_graph` (who-talks-to-whom,
+  צירי RID→TG ממושקלים, רק שיחות קבוצה). `_lrrp_snapshot` (מיקום אחרון-ידוע פר-RID
+  מהזיכרון — "עכשיו" בלבד, כמו `adsb.aircraft_snapshot` ב-AIR-AM; ריק אם הרשת לא
+  שולחת LRRP סטנדרטי — Motorola proprietary לא מפוענח ע"י DSD-FME).
 - **הקלטות:** `_activity_watcher`/`_sweep_recordings` (retention), `_transcribe_worker`
   (whisper אופציונלי), `/recordings/<name>`.
 - **`_boot_restore`** (thread ב-startup) + `__main__` (listener + watchers + `app.run(threaded=True)`).
@@ -145,6 +153,10 @@ tests/                      # pytest (SDR/systemd ממוקפים). 71 בדיקו
 | GET | `/api/dmr` | שיחות (היום; `?all=1`; `?day=YYYY-MM-DD` ארכיון; `?since=` cursor) |
 | GET | `/api/dmr/export?format=csv\|json` | ייצוא (CSV עם BOM) |
 | GET | `/api/roster` (·`/api/aircraft`) | רוסטר RID/TG מאוחד — חי בכל מצב |
+| GET | `/api/analytics/encryption` | ניתוח הצפנה: היסטוגרמת ALG + %מוצפן פר-TG (`?day=`/`?all=1`) |
+| GET | `/api/analytics/traffic` | אנליטיקת תעבורה: air-time/TG + heatmap שעתי (`?day=`/`?all=1`) |
+| GET | `/api/analytics/graph` | גרף RID↔TG (who-talks-to-whom) (`?day=`/`?all=1`) |
+| GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו") |
 | GET | `/api/activity` | הקלטות אחרונות |
 | GET | `/recordings/<name>` | קובץ WAV |
 | GET | `/api/power` | מתח/טמפ' ה-Pi |
@@ -155,14 +167,22 @@ tests/                      # pytest (SDR/systemd ממוקפים). 71 בדיקו
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (71 בדיקות). SDR/systemd ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (85 בדיקות). SDR/systemd ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
-`render_dmr_env`, `_validate_*`) נבדקות ישירות; Flask דרך `app.app.test_client()`.
+`render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
+`_lrrp_snapshot`) נבדקות ישירות; Flask דרך `app.app.test_client()`.
 
 קבצים: `test_dsd_normalize` (הלב — parse + normalize), `test_mode`, `test_boot`,
-`test_scan`, `test_aliases`, `test_recordings`, `test_security`, `test_archive`.
+`test_scan`, `test_aliases`, `test_recordings`, `test_security`, `test_archive`,
+`test_analytics` (הצפנה/תעבורה/גרף/LRRP — Phase 2/3).
 **הוסף בדיקה לכל שינוי backend.** CI: pytest (Python 3.11) + `bash -n`.
+
+**UI (`static/index.html`) — ללא סוויטת בדיקות (כמו AIR-AM: אין build step, אין JS
+tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-`<script>` + הרצת השרת
+עם נתונים מדומים ובדיקה ויזואלית (Playwright headless) — כך נתפסה ותוקנה בפועל
+חסרת `dir="rtl"` על ה-`<html>` (Phase 2). **בדוק חזותית כל שינוי UI מהותי, אל
+תסתפק ב-syntax check.**
 
 ---
 
@@ -201,7 +221,12 @@ tests/                      # pytest (SDR/systemd ממוקפים). 71 בדיקו
 
 - **Phase 1 (הושלם):** יסוד קצה-לקצה — מתאם DSD-FME, מצב DMR+טראנקינג, פיד+ארכיון,
   מערכות, אליאסים, רוסטר, הקלטות, בריאות, UI, install/systemd, בדיקות.
-- **Phase 2:** ניתוח הצפנה (היסטוגרמת ALG, %מוצפן פר-TG) + אנליטיקת תעבורה (heatmap,
-  air-time/TG). נגזר מ-`dmr.jsonl` הקיים.
-- **Phase 3:** גרף RID↔TG (who-talks-to-whom, מעל הרוסטר) + מפת GPS/LRRP (Leaflet כבר
-  vendored). מותנה בזמינות LRRP סטנדרטי ברשת (לא Motorola proprietary).
+- **Phase 2 (הושלם):** ניתוח הצפנה (היסטוגרמת ALG, %מוצפן פר-TG) + אנליטיקת תעבורה
+  (heatmap שעתי, air-time/TG). נגזר מ-`dmr.jsonl`/`_dmr_msgs` הקיימים —
+  `/api/analytics/encryption`+`/api/analytics/traffic`, כרטיסייה 📊 ניתוח ב-UI.
+- **Phase 3 (הושלם):** גרף RID↔TG (who-talks-to-whom, `/api/analytics/graph`) + מפת
+  GPS/LRRP (`/api/positions` + Leaflet vendored, lazy-load). מוצג ריק בשקט כשהרשת
+  לא שולחת LRRP סטנדרטי (Motorola proprietary אינו מפוענח ע"י DSD-FME).
+- **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —
+  lockout/hold/whitelist דרך הזרקת מקשים ל-PTY (`dsd_pty` כבר תומך בערוץ `DSD_CTRL_SOCK`,
+  לא מחובר ל-UI), Web Push להתראות watchlist, ייבוא/ייצוא מערכת כ-QR.

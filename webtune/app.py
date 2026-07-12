@@ -907,6 +907,161 @@ def _build_roster():
     return out[:ROSTER_MAX]
 
 
+# --- Phase 2/3: אנליטיקה (הצפנה, תעבורה, גרף RID↔TG, מפת LRRP) --------------
+# כל הפונקציות כאן טהורות (מקבלות רשימת רשומות מנורמלות) => נבדקות בלי חומרה.
+# מקור הנתונים תמיד dmr.jsonl/_dmr_msgs — שום אינדוקציה, שום המצאת מדד.
+ANALYTICS_TOP_N = 50
+GRAPH_TOP_N = 300
+
+
+def _analytics_source(day=None, show_all=False):
+    """(records, error) — מקור אחיד לאנליטיקה: ?day=YYYY-MM-DD (ארכיון מהדיסק),
+    ?all=1 (כל מה שבזיכרון), אחרת *היום* בלבד (כמו /api/dmr). error=None כשתקין."""
+    if day:
+        bounds = _day_bounds(day)
+        if bounds is None:
+            return None, "תאריך לא תקין (פורמט: YYYY-MM-DD)"
+        start, end = bounds
+        return [r for r in _read_dmr_log() if start <= (r.get("t") or 0) < end], None
+    if show_all:
+        with _dmr_lock:
+            return list(_dmr_msgs), None
+    floor = _today_start()
+    with _dmr_lock:
+        return [m for m in _dmr_msgs if (m.get("t") or 0) >= floor], None
+
+
+def _encryption_stats(recs):
+    """ניתוח הצפנה: היסטוגרמת ALG + %מוצפן פר-TG. לעולם לא מפענח — רק מסכם את
+    התג (encrypted/alg_name) שכבר קיים בכל כרטיס מנורמל."""
+    by_alg = collections.Counter()
+    tg_total, tg_enc, tg_alias = collections.Counter(), collections.Counter(), {}
+    total = encrypted_total = 0
+    for r in recs:
+        if r.get("call_type") not in ("group", "private"):
+            continue
+        total += 1
+        tg = r.get("tg")
+        if tg is not None:
+            tg_total[tg] += 1
+            tg_alias.setdefault(tg, r.get("tg_alias"))
+        if r.get("encrypted"):
+            encrypted_total += 1
+            enc = r.get("enc") or {}
+            by_alg[enc.get("alg_name") or "מוצפן"] += 1
+            if tg is not None:
+                tg_enc[tg] += 1
+    by_tg = [{"tg": tg, "tg_alias": tg_alias.get(tg), "total": tot,
+              "encrypted": tg_enc.get(tg, 0), "clear": tot - tg_enc.get(tg, 0),
+              "pct": round(100 * tg_enc.get(tg, 0) / tot, 1) if tot else 0.0}
+             for tg, tot in tg_total.items()]
+    by_tg.sort(key=lambda x: x["total"], reverse=True)
+    return {
+        "total": total, "encrypted_total": encrypted_total,
+        "encrypted_pct": round(100 * encrypted_total / total, 1) if total else 0.0,
+        "by_alg": [{"alg_name": k, "count": v} for k, v in by_alg.most_common()],
+        "by_tg": by_tg[:ANALYTICS_TOP_N],
+    }
+
+
+def _traffic_stats(recs):
+    """אנליטיקת תעבורה: air-time+שיחות פר-TG, והתפלגות שעתית (0–23, שעון מקומי)
+    לזיהוי שעות עומס. dur מגיע מה-listener (dedup המשך-שיחה); None => 0 (שיחה
+    בודדת שלא נצפו לה מסגרות המשך — לא מדד שהומצא, פשוט חוסר מידע)."""
+    by_tg = {}
+    hourly = [0] * 24
+    for r in recs:
+        if r.get("call_type") not in ("group", "private"):
+            continue
+        tg = r.get("tg")
+        if tg is not None:
+            e = by_tg.setdefault(tg, {"tg": tg, "tg_alias": r.get("tg_alias"),
+                                      "calls": 0, "airtime": 0.0})
+            e["calls"] += 1
+            e["airtime"] += r.get("dur") or 0.0
+            e["tg_alias"] = e["tg_alias"] or r.get("tg_alias")
+        t = r.get("t")
+        if t:
+            hourly[time.localtime(t).tm_hour] += 1
+    out = [{**e, "airtime": round(e["airtime"], 1)} for e in by_tg.values()]
+    out.sort(key=lambda x: x["airtime"], reverse=True)
+    return {"by_tg": out[:ANALYTICS_TOP_N], "hourly": hourly,
+            "total_calls": sum(hourly)}
+
+
+def _rid_tg_graph(recs):
+    """גרף RID↔TG (who-talks-to-whom): צירי source-RID→talkgroup ממושקלים
+    במספר שיחות. רק שיחות קבוצה (ל-private אין TG בעל משמעות רשתית)."""
+    edges = collections.Counter()
+    rid_alias, tg_alias = {}, {}
+    for r in recs:
+        if r.get("call_type") != "group":
+            continue
+        rid, tg = r.get("src"), r.get("tg")
+        if rid is None or tg is None:
+            continue
+        edges[(rid, tg)] += 1
+        rid_alias.setdefault(rid, r.get("src_alias"))
+        tg_alias.setdefault(tg, r.get("tg_alias"))
+    out = [{"rid": rid, "rid_alias": rid_alias.get(rid), "tg": tg,
+            "tg_alias": tg_alias.get(tg), "weight": w}
+           for (rid, tg), w in edges.items()]
+    out.sort(key=lambda x: x["weight"], reverse=True)
+    return out[:GRAPH_TOP_N]
+
+
+def _lrrp_snapshot():
+    """מיקום אחרון-ידוע פר-RID מאירועי LRRP שבזיכרון (לא מהדיסק — "עכשיו" בלבד,
+    כמו adsb.aircraft_snapshot ב-AIR-AM). {rid: {lat, lon, t, alias}}."""
+    out = {}
+    with _dmr_lock:
+        snapshot = list(_dmr_msgs)
+    for m in snapshot:
+        if m.get("lat") is None or m.get("src") is None:
+            continue
+        rid, t = m["src"], m.get("t") or 0
+        if rid not in out or t >= out[rid]["t"]:
+            out[rid] = {"lat": m["lat"], "lon": m["lon"], "t": t, "alias": m.get("src_alias")}
+    return out
+
+
+@app.route("/api/analytics/encryption")
+def api_analytics_encryption():
+    """ניתוח הצפנה: ?day=YYYY-MM-DD ארכיון | ?all=1 הכל-בזיכרון | ברירת מחדל היום."""
+    recs, err = _analytics_source(request.args.get("day"),
+                                  request.args.get("all") in ("1", "true", "yes"))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, **_encryption_stats(recs))
+
+
+@app.route("/api/analytics/traffic")
+def api_analytics_traffic():
+    """אנליטיקת תעבורה: air-time/TG + heatmap שעתי. אותם פרמטרים כמו הצפנה."""
+    recs, err = _analytics_source(request.args.get("day"),
+                                  request.args.get("all") in ("1", "true", "yes"))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, **_traffic_stats(recs))
+
+
+@app.route("/api/analytics/graph")
+def api_analytics_graph():
+    """גרף RID↔TG (who-talks-to-whom). אותם פרמטרים כמו הצפנה/תעבורה."""
+    recs, err = _analytics_source(request.args.get("day"),
+                                  request.args.get("all") in ("1", "true", "yes"))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, edges=_rid_tg_graph(recs))
+
+
+@app.route("/api/positions")
+def api_positions():
+    """מיקום LRRP אחרון-ידוע פר-RID (Phase 3). ריק כשהרשת לא שולחת LRRP סטנדרטי
+    (Motorola proprietary לא מפוענח ע"י DSD-FME — ר' CLAUDE.md §8)."""
+    return jsonify(ok=True, positions=_lrrp_snapshot())
+
+
 # --- הקלטות + יומן + תמלול אופציונלי ----------------------------------------
 def _append_activity(rows):
     try:
