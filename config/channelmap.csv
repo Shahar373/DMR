@@ -1,0 +1,6 @@
+# DMR channel-map (LCN,FREQ_HZ) ל-DSD-FME (-C). נכתב מחדש ע"י dmr-web בכל מעבר מצב.
+# כל שורה: <logical channel number>,<frequency in Hz>. ⚠️ החלף במפת הרשת שלך.
+1,461037500
+2,461062500
+3,461087500
+4,461112500

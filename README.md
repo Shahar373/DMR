@@ -1,1 +1,112 @@
-# DMR
+# DMR — תחנת האזנה לרשתות DMR, בשליטה מהטלפון
+
+**DMR** הופך **Raspberry Pi 5 + SDRplay RSP1B** לתחנת פענוח **רשתות DMR** (במיוחד
+**Motorola Capacity Plus / Cap+**) שנשלטת **כולה מהטלפון דרך הדפדפן** — בלי אפליקציה
+ובלי סיסמאות. הפענוח נעשה ב-**DSD-FME** מקומית על ה-Pi; שום דבר לא עולה לענן.
+
+> אחיו של פרויקט **AIR-AM** (האזנת תעופה): אותה ארכיטקטורה — שליטה מהטלפון,
+> zero-config, headless ועמיד, פרטי-מקומי — מוחלת כאן על DMR במקום תעופה.
+
+---
+
+## מה זה עושה
+
+- **מעקב טראנקינג (Cap+):** DSD-FME עוקב אחרי ערוץ הבקרה ומתכוונן אוטומטית לערוצי
+  הקול, דרך גשר `rsp_tcp` (SDRplay→rtl_tcp).
+- **פיד שיחות חי:** כרטיס לכל שיחה — Talkgroup, Radio ID (מקור), color code, timeslot,
+  סוג שיחה (קבוצה/פרטית/נתונים), תג 🔒 להצפנה, ו-BER.
+- **אליאסים:** שמות ל-TG/RID (ייבוא `user.csv` של RadioID.net + עריכה מהטלפון).
+- **הקלטות:** DSD-FME מקליט WAV לכל שיחה; מתנגן ישירות בדפדפן (תמלול whisper אופציונלי).
+- **רוסטר מאוחד:** מי פעיל, כמה, מתי, ועם אילו talkgroups (חי גם ב-standby).
+- **מערכות מרובות + סריקה:** שומרים כמה רשתות Cap+ ומסובבים ביניהן אוטומטית לפי לוח.
+
+> ⚠️ **מיועד לרשת פרטית מהימנה בלבד ולהאזנה חוקית.** אין פענוח תעבורה מוצפנת בלי
+> מפתח — התוכנה רק **מציינת** שהשיחה מוצפנת ואת סוג האלגוריתם.
+
+---
+
+## התקנה (פקודה אחת)
+
+על ה-Pi (Raspberry Pi OS 64-bit, Pi 5/Pi 4):
+
+```bash
+git clone https://github.com/Shahar373/DMR.git
+cd DMR
+chmod +x install.sh
+sudo ./install.sh
+```
+
+הסקריפט מתקין הכל אוטומטית: SDRplay API (ללא אישור רישיון ידני), SoapySDRPlay3,
+mbelib, DSD-FME, גשר `rsp_tcp`, שרת הבקרה, ושירותי systemd. אידמפוטנטי — עדכון:
+`git pull && sudo ./install.sh`.
+
+תמלול אופציונלי (בנייה ארוכה):
+```bash
+INSTALL_DMR_WHISPER=1 sudo ./install.sh
+```
+
+---
+
+## שימוש
+
+פותחים בטלפון: **`http://<IP-של-ה-Pi>:8080`**
+
+1. **בית → מערכת DMR:** מזינים את פרטי רשת ה-Cap+ שלכם — תדר ערוץ הבקרה (MHz),
+   ה-color code, ומפת הערוצים (LCN → תדר). לוחצים **שמור מערכת**.
+2. לוחצים **התחל DMR**. לאחר מספר שניות מופיעות שיחות בתצוגת **📻 שיחות**.
+3. **אליאסים:** מוסיפים שמות ל-TG/RID, או מייבאים `user.csv` של RadioID.net (ראו למטה).
+4. **סריקה:** מגדירים לוח של מספר מערכות (עם חלונות שעות אופציונליים) ולוחצים
+   **התחל סריקה** לסבב אוטומטי.
+5. **כיבוי (⏻):** משחרר את ה-SDR; הפיד ההיסטורי נשאר זמין וניתן לחיפוש בארכיון.
+
+### ייבוא שמות רדיו (RadioID.net)
+```bash
+# על ה-Pi:
+curl -L -o /etc/dmr/rid.csv "https://radioid.net/static/user.csv"
+sudo systemctl restart dmr-web
+```
+(העמודות מזוהות אוטומטית; `CALLSIGN` עדיף כשם.)
+
+---
+
+## ארכיטקטורה (בקצרה)
+
+```
+אנטנה ─►RSP1B─USB─► Pi5:  sdrplay.service (API)
+                            │
+                    rsp_tcp (גשר SDRplay→rtl_tcp)         ← תהליך-בן של dsd_pty
+                            │  rtl_tcp
+                    DSD-FME (תחת PTY, מעקב טראנקינג)       ← dmr-dsdfme.service
+                            │  טקסט → JSON (dsd_pty)
+                            │  UDP 5555
+                    dmr-web :8080 (Flask, המתזמר)          ← dmr-web.service
+                            │
+                    דף הבקרה בטלפון (REST/JSON, PWA)
+```
+
+**SDR אחד, בהחלפה:** ל-RSP1B ניגש תהליך אחד בכל רגע. `dmr-dsdfme` הוא צרכן ה-SDR
+היחיד; `off` (standby) משחרר אותו. אף צרכן אינו enabled ב-systemd — `dmr-web`
+(שעולה תמיד) משחזר את המצב השמור באתחול, כך שהמצב שורד reboot.
+
+פרטים מלאים: ראו [`CLAUDE.md`](CLAUDE.md).
+
+---
+
+## לוגים ותחזוקה
+
+```bash
+sudo journalctl -u dmr-dsdfme -f     # המפענח (DSD-FME + הגשר)
+sudo journalctl -u dmr-web -f        # שרת הבקרה
+```
+
+בדיקות (ללא חומרה): `python3 -m pytest tests/ -v`
+בדיקת הפרסר: `python3 webtune/dsd_pty.py --selftest`
+
+---
+
+## אבטחה
+
+- `dmr-web` רץ כמשתמש **לא-root** (`dmr`) עם sudoers ממוקד ל-restart/stop של
+  `dmr-dsdfme` בלבד.
+- הגנת CSRF/DNS-rebind (Origin==Host) לכל בקשה משנת-מצב; PIN אופציונלי (`DMR_PIN`).
+- **אל תחשוף את 8080 לאינטרנט.** לגישה מרחוק — VPN/Tailscale.

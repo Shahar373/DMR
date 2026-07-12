@@ -1,0 +1,25 @@
+[Unit]
+Description=DMR web control (DSD-FME orchestrator + call feed)
+# dmr-web הוא המתזמר (orchestrator) של ה-SDR: השירות היחיד שקם באתחול מבין
+# מפעילי-המצבים — קורא את state.json ומשחזר את המצב השמור (dmr/off/scan).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dmr/webtune
+# PIN אופציונלי (DMR_PIN=...) + דגלי תמלול — הקובץ אופציונלי (-), נוצר ע"י install.sh
+EnvironmentFile=-/etc/dmr/dmr-web.env
+ExecStart=/usr/bin/python3 /opt/dmr/webtune/app.py
+# חיזוק אבטחה: רץ כמשתמש לא-root. כתיבת ההגדרות מתאפשרת ע"י chown של /etc/dmr
+# ו-/var/lib/dmr, וה-restart/stop של dmr-dsdfme דרך sudoers ממוקד.
+# קבוצות journal/video (journalctl, vcgencmd) מגיעות מחברות המשתמש (install.sh).
+User=dmr
+Group=dmr
+# always (לא on-failure): זה משטח הבקרה היחיד — חייב לקום גם אחרי יציאה "נקייה"
+StartLimitIntervalSec=0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

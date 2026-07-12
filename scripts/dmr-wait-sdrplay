@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  DMR  -  שער מוכנות ל-SDRplay (ExecStartPre של dmr-dsdfme)
+# ----------------------------------------------------------------------------
+#  חוסם עד שה-SDRplay API מגיב *ומכשיר ניתן לאיתור*, או עד timeout. מונע מרוץ
+#  אתחול שבו הגשר rsp_tcp / DSD-FME עולים לפני ש-sdrplay_apiService מוכן.
+#
+#  התאוששות מ-daemon תקוע: ה-sdrplay_apiService יכול להיות "active" ב-systemd
+#  אך להחזיר ServiceNotResponding ללקוחות (מרוץ אתחול / אחרי התקנת/עדכון API).
+#  במצב הזה probe חוזר *לעולם לא* יתאושש לבד — לכן אחרי כמה ניסיונות מפעילים
+#  מחדש את sdrplay פעם אחת וממשיכים לבדוק. (אומת בשטח ב-AIR-AM: restart פותר.)
+#
+#  יציאה != 0 => systemd ינסה שוב (Restart=always).
+# ============================================================================
+
+device_ready() {
+  SoapySDRUtil --find="driver=sdrplay" 2>/dev/null | grep -q "driver = sdrplay"
+}
+
+for attempt in $(seq 1 30); do
+  if device_ready; then
+    exit 0
+  fi
+  if [ "$attempt" -eq 8 ]; then
+    systemctl restart --no-block sdrplay.service 2>/dev/null || true
+  fi
+  sleep 1
+done
+exit 1
