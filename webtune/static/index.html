@@ -210,6 +210,24 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       </div>
     </div>
 
+    <div class="card">
+      <h2>📶 איכות RF ובקרת רווח</h2>
+      <div class="stat-row">
+        <div class="stat-tile"><div class="n" id="rfErrPerMin">–</div><div class="l">שגיאות CRC/FEC לדקה</div></div>
+        <div class="stat-tile"><div class="n" id="rfGainVal">0</div><div class="l">נוד-רווח (יחסי)</div></div>
+      </div>
+      <div id="rfByType"></div>
+      <div class="row" style="margin-top:var(--sp-3)">
+        <button class="btn ghost" id="gainDown">− רווח</button>
+        <button class="btn ghost" id="gainUp">+ רווח</button>
+        <span class="muted" id="gainMsg"></span>
+      </div>
+      <div class="muted" style="margin-top:8px;font-size:12px">
+        תדירות שגיאות אמיתית מ-DSD-FME (CRC/FEC) — אין מד dBFS/SNR רציף (DSD-FME
+        לא מספק כזה). נוד-הרווח יחסי בלבד וללא קריאה חוזרת — כוונו לפי מדד השגיאות.
+      </div>
+    </div>
+
     <div class="card" id="scanCard">
       <h2>לוח סריקה</h2>
       <div id="scanLegs"></div>
@@ -494,6 +512,32 @@ async function pollHealth(){
   } else $("scanStatusTxt").textContent="";
 }
 
+// ---------- איכות RF + נוד-רווח ----------
+// abarRow מוגדר בהמשך (סעיף האנליטיקה) — hoisting של function declaration.
+async function pollRF(){
+  const r=await api("/api/rf"); if(!r.ok||!r.body.ok)return;
+  const d=r.body;
+  $("rfErrPerMin").textContent = d.errors_per_min;
+  $("rfGainVal").textContent = (d.gain_nudge>0?"+":"")+d.gain_nudge;
+  const max = Math.max(1, ...d.by_type.map(t=>t.count), 0);
+  $("rfByType").innerHTML = d.by_type.length
+    ? d.by_type.map(t=>abarRow(t.error_type, t.count, max)).join("")
+    : `<div class="muted">אין שגיאות ב-${d.window_sec|0} השניות האחרונות.</div>`;
+}
+async function nudgeGain(direction){
+  $("gainMsg").textContent = "…";
+  const r = await post("/api/gain", {direction});
+  if(!r.ok || r.body.ok===false){
+    $("gainMsg").textContent = "שגיאה: "+(r.body.error||"");
+    return;
+  }
+  $("rfGainVal").textContent = (r.body.gain_nudge>0?"+":"")+r.body.gain_nudge;
+  $("gainMsg").textContent = "נשלח ✓";
+  setTimeout(()=>$("gainMsg").textContent="", 1500);
+}
+$("gainUp").onclick = ()=>nudgeGain("up");
+$("gainDown").onclick = ()=>nudgeGain("down");
+
 // ---------- call feed ----------
 function callCard(m){
   const tags=[];
@@ -689,6 +733,7 @@ async function init(){
   await refreshState(); await loadAliases();
   // נחיתה: אם במצב שיחות פעיל נשאר בבית; המשתמש עובר ידנית
   setInterval(pollHealth, 4000); pollHealth();
+  setInterval(pollRF, 4000); pollRF();
   setInterval(pollRoster, 20000); pollRoster();
   setInterval(pollFeed, 3000); pollFeed();
   setInterval(refreshState, 12000);

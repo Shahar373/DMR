@@ -6,6 +6,52 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-12
+### Changed — פרסור DSD-FME מבוסס קליטה אמיתית (לא ניחוש)
+עד גרסה זו `dsd_pty.parse_dsd_line` היה בנוי על ניחוש סביר של פורמט הפלט של
+DSD-FME. בגרסה זו הוא **נכתב מחדש מול קליטה אמיתית** — 20,000 שורות מרשת
+Motorola Capacity Plus רב-אתרית (SLCO) — ואומת ב-replay מלא: **כל אחת מ-68
+הצורות הייחודיות** בקליטה (`tests/fixtures/capplus_slco_sample.csv`) מסווגת
+נכון (100% התאמה, כולל housekeeping שנופל).
+
+- **ממצא מרכזי:** ~80% מהפלט האמיתי הוא רעש תפעולי (`lsn_status`/
+  `channel_status`/`site_info`/`ip_mapping`/`bank_call`/`preamble_csbk`) —
+  `parse_dsd_line` כעת **מטיל את אלה החוצה במקור** (מחזיר `None`, לא נשלח
+  ב-UDP כלל) במקום להציף את `dmr.jsonl`.
+- **תיקון סמנטי:** אין שדה TG נפרד בפרוטוקול DMR — בשיחת קבוצה `TGT` *הוא*
+  ה-talkgroup עצמו; בשיחה פרטית `TGT` נשאר יעד. `_normalize_dsd` תוקן בהתאם.
+- **הצפנה:** DSD-FME לא הדפיס בקליטה שנבדקה שם אלגוריתם/מזהה מפתח (FLCO/FID
+  הם routing fields, לא ALG/KEY) — אירוע `encryption` **מתואם** (לא כרטיס
+  עצמאי) לשיחת הקול הפתוחה באותו slot (`_slot_open_call`, חלון 15ש'), ומסמן
+  `encrypted=True` בלבד. לעולם לא ממציאים שם אלגוריתם.
+- **תדר:** DSD-FME לא מדפיס תדר בקליטה אמיתית — `freq` על כרטיס נגזר כעת
+  מ-channelmap המערכת הפעילה (`_channelmap_freq`, לפי LCN/Rest-LSN), לא מטקסט.
+
+### Added — איכות RF (תדירות שגיאות) + נוד-רווח חי
+- **`_rf_quality_tick`/`_rf_quality_snapshot`:** DSD-FME לא נותן שום SNR/RSSI/
+  dBFS רציף — רק אירועי CRC/FEC בודדים (`SLCO_CRC`/`CACH_BURST_FEC`/
+  `CSBK_CRC`/`CSBK_FEC`, וגם פריימי-קול עם `(CRC ERR)`). חלון נגלל של 60
+  שניות סופר תדירות שגיאות אמיתית (`errors_per_min` + פילוח לפי סוג) —
+  **לא ממציאים יחס/SNR**. `GET /api/rf`.
+- **נוד-רווח חי (`dsd_pty.send_gain_nudge`):** DSD-FME תומך בהקשות מקלדת
+  `g`/`G` ("Manually decrease/increase RTL gain") בזמן ריצה, שנשלחות דרך
+  ה-unix socket הקיים (`DSD_CTRL_SOCK`) — **בלי לעצור את DSD-FME ובלי פטצ'
+  קוד C**. מונה יחסי best-effort ב-state (`gain_nudge`, מתאפס בכל
+  `_enter_dmr`) — אין readback אמיתי מ-DSD-FME. `POST /api/gain
+  {direction: up|down}`.
+- **UI:** כרטיס "📶 איכות RF ובקרת רווח" בבית — תדירות שגיאות + פילוח לפי
+  סוג + כפתורי נוד-רווח, עם הבהרה מפורשת שאין מד dBFS/SNR רציף.
+- **נדחה במכוון (Phase עוקב):** מד dBFS עצמאי מה-SDR עצמו דורש פטצ' קוד C על
+  `rsp_tcp` (SDRplay API הוא single-owner; אין side-channel telemetry
+  בגרסה הסטנדרטית) — לא ניתן לאמת בלי חומרה אמיתית (RSP1B). ר' CLAUDE.md §8.
+
+### Tests
+- `tests/fixtures/capplus_slco_sample.csv` — 68 הצורות הייחודיות מהקליטה
+  האמיתית (type+pattern), עם replay-test שמוודא 68/68 סיווג מדויק.
+- `tests/test_dsd_normalize.py` נכתב מחדש (32 בדיקות) מול הפורמט האמיתי.
+- `tests/test_rf_gain.py` (7 בדיקות) — שכבת ה-HTTP של `/api/rf`/`/api/gain`.
+- סה"כ 106 בדיקות (היו 85).
+
 ## [0.2.0] - 2026-07-12
 ### Added — Phase 2: אנליטיקה (הצפנה + תעבורה)
 - `_encryption_stats`: היסטוגרמת אלגוריתמי הצפנה (ALG) + %מוצפן פר-talkgroup —
@@ -73,6 +119,7 @@ Motorola Capacity Plus) באמצעות **DSD-FME**, על Raspberry Pi 5 + SDRpla
 - **Phase 2:** ניתוח הצפנה (היסטוגרמת ALG, %מוצפן פר-TG) + אנליטיקת תעבורה (heatmap).
 - **Phase 3:** גרף RID↔TG (who-talks-to-whom) + מפת GPS/LRRP (Leaflet).
 
-[Unreleased]: https://github.com/Shahar373/DMR/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Shahar373/DMR/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Shahar373/DMR/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Shahar373/DMR/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Shahar373/DMR/releases/tag/v0.1.0

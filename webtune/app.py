@@ -32,6 +32,7 @@ from flask import Flask, request, jsonify, send_from_directory, abort
 
 import aliases as aliasdb   # ניהול אליאסים (TG/RID) — טעינת CSV + חנות נערכת-מהטלפון
 import dsd_export           # ייצוא CSV/JSON (BOM ל-Excel)
+import dsd_pty              # build_command וכו', וגם send_gain_nudge (נוד-רווח חי דרך PTY)
 
 # stdout => journald (השירות רץ תחת systemd); journalctl -u dmr-web מציג הכל
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -221,6 +222,7 @@ DEFAULT_STATE = {
     # ברירת המחדל ניטרלית (off): התקנה טרייה נוחתת במסך הבית, המצב שורד reboot.
     "app_mode": "off",
     "system": None,          # id המערכת הפעילה (או None => הראשונה ב-load_systems)
+    "gain_nudge": 0,         # מונה יחסי best-effort (g/G) — מתאפס בכל כניסה למצב DMR
 }
 
 
@@ -344,6 +346,13 @@ def _enter_dmr(system):
         time.sleep(0.5)
         if not _is_active(DMR_SERVICE):
             return "DSD-FME נכשל לעלות — בדוק journalctl -u dmr-dsdfme", _journal_tail(DMR_SERVICE)
+    # restart אמיתי של DSD-FME => מרווח ברירת-המחדל שלו מחדש; מונה נוד-הרווח
+    # היחסי שלנו (g/G, ר' _dmr_gain_nudge) לא רלוונטי יותר, בכל נקודת כניסה
+    # (UI/scan/boot-restore) — לא רק דרך api_mode.
+    try:
+        save_state({**load_state(), "gain_nudge": 0})
+    except Exception:
+        pass
     return None, None
 
 
@@ -408,68 +417,50 @@ def _float_or_none(v):
         return None
 
 
-def _normalize_dsd(m):
-    """★ הלב: ממיר אירוע DSD-FME (dict שהגיע מ-dsd_pty כ-JSON) לכרטיס שיחה אחיד.
-    לעולם *לא* ממציא מדד — ber/level רק אם DSD-FME הדפיס אותם (כמו ACARS_level ב-AIR-AM).
-    מחזיר dict או None לאירוע שאין בו tg/src/event (רעש שאין מה להציג)."""
-    if not isinstance(m, dict):
+_CARD_EVENT_TYPES = frozenset({"voice_call", "data_header", "lrrp_position", "lrrp_request"})
+
+
+def _channelmap_freq(lcn):
+    """תדר (MHz) לפי LCN/Rest-LSN, מתוך ה-channelmap של המערכת הפעילה כרגע
+    (state.system). best-effort — None אם אין LCN/מערכת/ערוץ תואם; DSD-FME
+    (בקליטה אמיתית שנבדקה) לא מדפיס תדר בטקסט כלל, אז זה המקור האמין היחיד."""
+    if lcn is None:
         return None
-    t = _float_or_none(m.get("t") or m.get("timestamp")) or time.time()
+    try:
+        system = _find_system(load_systems(), load_state().get("system"))
+        if not system:
+            return None
+        for ch in system.get("channelmap") or []:
+            if int(ch.get("lcn", -1)) == int(lcn):
+                return float(ch["freq"])
+    except Exception:
+        return None
+    return None
 
-    # תדר: מקבל freq (MHz) או freq_hz (Hz)
-    freq = _float_or_none(m.get("freq"))
-    if freq is None and m.get("freq_hz") is not None:
-        hz = _float_or_none(m.get("freq_hz"))
-        freq = round(hz / 1e6, 6) if hz else None
-    if freq is not None and freq > 3000:      # ננחש Hz אם ערך גדול מדי
-        freq = round(freq / 1e6, 6)
 
-    tg = _int_or_none(m.get("tg") or m.get("talkgroup"))
-    src = _int_or_none(m.get("src") or m.get("source") or m.get("rid"))
-    tgt = _int_or_none(m.get("tgt") or m.get("target") or m.get("dst"))
-    slot = _int_or_none(m.get("slot") or m.get("ts"))
-    cc = _int_or_none(m.get("cc") or m.get("color_code"))
-    lcn = _int_or_none(m.get("lcn") or m.get("lsn"))
-    ber = _float_or_none(m.get("ber"))
-    level = _float_or_none(m.get("level") or m.get("sig"))
-    dur = _float_or_none(m.get("dur") or m.get("duration"))
+def _normalize_dsd(m):
+    """★ הלב: ממיר אירוע DSD-FME מוקלד (dict מ-dsd_pty.parse_dsd_line, שדה
+    'type') לכרטיס שיחה אחיד. **quality/encryption לא הופכים לכרטיס** —
+    quality מוזן ל-_rf_quality_tick (מד תדירות-שגיאות), encryption מתואם
+    ל-slot ע"י ה-listener (_dmr_correlate_encryption). מחזיר None לכל type
+    אחר (כולל housekeeping — אך dsd_pty כבר לא שולח אותם כלל).
+    לעולם *לא* ממציא מדד: ber/level נשארים None כי DSD-FME לא מדפיס אותם
+    בקליטה אמיתית שנבדקה (אין "לרמות" למספר — ר' CLAUDE.md §8)."""
+    if not isinstance(m, dict) or m.get("type") not in _CARD_EVENT_TYPES:
+        return None
+    typ = m["type"]
+    t = _float_or_none(m.get("t")) or time.time()
 
-    # סוג שיחה מנורמל
-    ct = str(m.get("call_type") or m.get("type") or "").strip().lower()
-    if ct in ("grp", "group_call"):
-        ct = "group"
-    elif ct in ("priv", "private_call", "unit"):
-        ct = "private"
-    elif ct in ("gps", "loc", "lrrp"):
-        ct = "lrrp"
-    elif ct in ("registration", "affiliation", "ars"):
-        ct = "reg"
-    elif ct in ("csbk", "signalling", "control"):
-        ct = "control"
+    slot = _int_or_none(m.get("slot"))
+    tg = _int_or_none(m.get("tg"))
+    src = _int_or_none(m.get("src"))
+    tgt = _int_or_none(m.get("tgt"))
+    lcn = _int_or_none(m.get("lcn"))
+    ct = str(m.get("call_type") or "data").strip().lower()
     if ct not in DMR_CALL_TYPES:
-        # ננחש מהאירוע: יש tg+src => שיחת קבוצה; tgt+src בלי tg => פרטית
-        if m.get("event") == "control" or (lcn is not None and tg is None and src is None):
-            ct = "control"
-        elif tg is not None:
-            ct = "group"
-        elif tgt is not None and src is not None:
-            ct = "private"
-        else:
-            ct = m.get("event") or "control"
-    category, group = DMR_CALL_TYPES.get(ct, (ct, "data"))
+        ct = "data"
+    category, group = DMR_CALL_TYPES[ct]
 
-    # הצפנה: DSD-FME מדפיס ALG id (hex) + key id. אנו ממפים שם בלבד — לא מפענחים.
-    alg = _int_or_none(m.get("alg") or m.get("algid"))
-    key_id = _int_or_none(m.get("key_id") or m.get("keyid"))
-    enc = None
-    encrypted = bool(m.get("encrypted") or m.get("enc"))
-    if alg is not None and alg not in (0x00,):
-        encrypted = True
-    if encrypted:
-        enc = {"alg": alg, "alg_name": DMR_ALG_NAMES.get(alg, f"ALG 0x{alg:02X}" if alg is not None else "מוצפן"),
-               "key_id": key_id}
-
-    # מיקום (LRRP) — Phase 3; הסכמה מוכנה כבר עכשיו
     lat = _float_or_none(m.get("lat"))
     lon = _float_or_none(m.get("lon"))
     if lat is not None and lon is not None:
@@ -477,34 +468,21 @@ def _normalize_dsd(m):
             lat = lon = None
         else:
             group = "position"
-            if ct == "group" or ct == "control":
-                ct, category = "lrrp", DMR_CALL_TYPES["lrrp"][0]
-
-    text = m.get("text") or m.get("message")
-    if isinstance(text, str):
-        text = text.strip() or None
-
-    # אירוע ריק לגמרי (בלי tg/src/tgt/lcn/text) => אין מה להציג
-    if tg is None and src is None and tgt is None and lcn is None and not text and lat is None:
-        return None
 
     card = {
-        "t": round(t, 3), "proto": str(m.get("proto") or "DMR"),
-        "freq": round(freq, 6) if freq is not None else None,
-        "slot": slot, "cc": cc, "lcn": lcn,
+        "t": round(t, 3), "proto": "DMR",
+        "freq": _channelmap_freq(lcn), "slot": slot, "cc": None, "lcn": lcn,
         "tg": tg, "tg_alias": aliasdb.tg_name(tg),
         "src": src, "src_alias": aliasdb.rid_name(src),
         "tgt": tgt, "tgt_alias": aliasdb.rid_name(tgt),
         "call_type": ct, "category": category, "group": group,
-        "encrypted": encrypted, "enc": enc,
-        "ber": round(ber, 2) if ber is not None else None,
-        "level": round(level, 1) if level is not None else None,
-        "dur": round(dur, 1) if dur is not None else None,
-        "event": m.get("event") or ct,
+        "encrypted": False, "enc": None,   # מתואם בהמשך ע"י ה-listener אם רלוונטי
+        "ber": None, "level": None,        # DSD-FME לא מדפיס — אף פעם לא ממציאים
+        "dur": None, "event": typ,
         "lat": round(lat, 5) if lat is not None else None,
         "lon": round(lon, 5) if lon is not None else None,
-        "text": text,
-        "wav": m.get("wav"),   # שם קובץ ההקלטה (אם DSD-FME הקליט את השיחה)
+        "text": None, "wav": None,
+        "delivery": m.get("delivery"),   # אופציונלי (data_header בלבד)
     }
     return card
 
@@ -536,6 +514,59 @@ def _append_dmr_log(rec):
 
 def _trim_dmr_log():
     _trim_jsonl_log(DMR_LOG_PATH, DMR_LOG_KEEP)
+
+
+# --- איכות RF: תדירות שגיאות (לא dBFS/SNR) + נוד-רווח חי ---------------------
+# DSD-FME (בקליטה אמיתית שנבדקה מול רשת Cap+/SLCO) לא נותן שום SNR/RSSI/dBFS
+# רציף — רק אירועי CRC/FEC בודדים (quality) ו"Protected LC" (encryption).
+# **לעולם לא ממציאים יחס/dB** — רק סופרים תדירות שגיאות אמיתית בחלון נגלל.
+# מד dBFS עצמאי מה-SDR עצמו נדחה במכוון (דורש פטצ' rsp_tcp; ר' CLAUDE.md §8).
+RF_WINDOW_SEC = 60.0
+_rf_lock = threading.Lock()
+_rf_ticks = collections.deque()   # (t, error_type) — נגזם לחלון RF_WINDOW_SEC
+
+
+def _rf_quality_tick(error_type):
+    now = time.time()
+    with _rf_lock:
+        _rf_ticks.append((now, error_type))
+        cutoff = now - RF_WINDOW_SEC
+        while _rf_ticks and _rf_ticks[0][0] < cutoff:
+            _rf_ticks.popleft()
+
+
+def _rf_quality_snapshot():
+    """תדירות שגיאות CRC/FEC אמיתית ב-RF_WINDOW_SEC האחרונות. פונקציה טהורה
+    (קוראת מהחלון הנגלל בלבד) => נבדקת בלי חומרה."""
+    now = time.time()
+    with _rf_lock:
+        cutoff = now - RF_WINDOW_SEC
+        while _rf_ticks and _rf_ticks[0][0] < cutoff:
+            _rf_ticks.popleft()
+        ticks = list(_rf_ticks)
+    by_type = collections.Counter(t for _, t in ticks)
+    total = len(ticks)
+    return {"window_sec": RF_WINDOW_SEC, "total_errors": total,
+            "errors_per_min": round(total * 60.0 / RF_WINDOW_SEC, 1),
+            "by_type": [{"error_type": k, "count": v} for k, v in by_type.most_common()]}
+
+
+# נוד-רווח חי: g/G דרך dsd_pty.send_gain_nudge (הקשה ל-DSD-FME, בלי לעצור אותו).
+# יחסי בלבד — אין readback מ-DSD-FME, אז אין מספר dB אמיתי לעקוב אחריו; מונה
+# best-effort ב-state, מתאפס בכל כניסה חדשה למצב DMR (ההנחה: DSD-FME מתחיל
+# מרווח ברירת-מחדל משלו בכל restart).
+GAIN_NUDGE_MIN, GAIN_NUDGE_MAX = -30, 30
+
+
+def _dmr_gain_nudge(direction):
+    """שולח הקשת נוד-רווח בודדת ומעדכן מונה יחסי. מחזיר (ok, gain_nudge_value)."""
+    ok = dsd_pty.send_gain_nudge(direction)
+    st = load_state()
+    cur = int(st.get("gain_nudge", 0))
+    if ok:
+        cur = max(GAIN_NUDGE_MIN, min(GAIN_NUDGE_MAX, cur + (1 if direction == "up" else -1)))
+        save_state({**st, "gain_nudge": cur})
+    return ok, cur
 
 
 def _today_start():
@@ -601,7 +632,10 @@ def _load_dmr_history():
 def _dmr_listener():
     """thread רקע: מאזין ל-UDP מ-dsd_pty (DSD-FME), שומר ל-dmr.jsonl ומכניס
     ל-ring buffer. רץ תמיד (גם ב-standby) — פשוט לא מגיעות דאטהגרמות כש-DSD-FME כבוי.
-    dedup: אירועי המשך של אותה שיחה (voice frames) מתאחדים לכרטיס אחד."""
+    dedup: אירועי המשך של אותה שיחה (voice frames) מתאחדים לכרטיס אחד (8ש').
+    quality/encryption *לא* הופכים לכרטיס: quality מוזן ל-_rf_quality_tick
+    (מד תדירות-שגיאות), encryption מתואם לשיחה הפתוחה באותו slot (_slot_open_call,
+    חלון 15ש' — best-effort; אם אין שיחה פתוחה מתאימה, מדולג בשקט)."""
     global _dmr_seq
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -610,7 +644,8 @@ def _dmr_listener():
         log.warning("DMR listener: port %d busy - /api/dmr יחזיר ריק", DMR_UDP_PORT)
         return
     seen = 0
-    _dedup: dict = {}   # (tg, src, slot) → (timestamp, rec) — איחוד המשך-שיחה
+    _dedup: dict = {}           # (tg, src, slot, call_type) → (timestamp, rec) — איחוד המשך-שיחה
+    _slot_open_call: dict = {}  # slot → (timestamp, rec) — לקורלציית encryption
     while True:
         try:
             data, _ = sock.recvfrom(65535)
@@ -620,19 +655,38 @@ def _dmr_listener():
             msg = json.loads(data.decode("utf-8", "replace"))
         except (ValueError, UnicodeError):
             continue
+        if not isinstance(msg, dict):
+            continue
+
+        mtype = msg.get("type")
+        if mtype == "quality":
+            _rf_quality_tick(msg.get("error_type") or "UNKNOWN")
+            continue
+        if mtype == "encryption":
+            entry = _slot_open_call.get(msg.get("slot"))
+            ts = msg.get("t") or time.time()
+            if entry is not None and ts - entry[0] < 15:
+                with _dmr_lock:   # open_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
+                    entry[1]["encrypted"] = True
+                    entry[1]["enc"] = entry[1].get("enc") or {"alg": None, "alg_name": "מוצפן", "key_id": None}
+            continue
+
         try:
             rec = _normalize_dsd(msg)
         except Exception:
             log.exception("DMR: נרמול נכשל על דאטהגרם — מדולג")
             continue
+        if mtype == "voice_call" and msg.get("crc_err"):
+            _rf_quality_tick("VOICE_CRC")   # פריים קול שנכשל => גם מד ה-RF, גם (אם יש) הכרטיס
         if rec is None:
             continue
 
-        # dedup: אותה שיחה (tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים (משך/BER),
+        # dedup: אותה שיחה (tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים (משך/wav),
         # לא כרטיס חדש. שיחות voice ב-DMR משדרות מסגרות רבות לאורך השיחה.
         key = (rec.get("tg"), rec.get("src"), rec.get("slot"), rec.get("call_type"))
         ts = rec.get("t") or time.time()
-        if rec.get("call_type") in ("group", "private") and (rec.get("tg") or rec.get("src")):
+        is_voice = rec.get("call_type") in ("group", "private") and (rec.get("tg") or rec.get("src"))
+        if is_voice:
             prev_ts, prev_rec = _dedup.get(key, (0, None))
             if prev_rec is not None and ts - prev_ts < 8:
                 with _dmr_lock:   # prev_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
@@ -641,6 +695,8 @@ def _dmr_listener():
                         prev_rec["wav"] = rec["wav"]
                     prev_rec["frames"] = prev_rec.get("frames", 1) + 1
                 _dedup[key] = (ts, prev_rec)
+                if rec.get("slot") is not None:
+                    _slot_open_call[rec["slot"]] = (ts, prev_rec)
                 continue
             rec["_start"] = ts
             _dedup[key] = (ts, rec)
@@ -654,6 +710,12 @@ def _dmr_listener():
             _dmr_seq += 1
             rec["id"] = _dmr_seq
             _dmr_msgs.append(rec)
+        if is_voice and rec.get("slot") is not None:
+            _slot_open_call[rec["slot"]] = (ts, rec)
+            if len(_slot_open_call) > 8:   # רק 2 slots אפשריים בפועל — הגנה בכל זאת
+                cutoff = ts - 15
+                for k in [k for k, (t0, _) in _slot_open_call.items() if t0 < cutoff]:
+                    del _slot_open_call[k]
         seen += 1
         if seen % 200 == 0:
             _trim_dmr_log()
@@ -1062,6 +1124,29 @@ def api_positions():
     return jsonify(ok=True, positions=_lrrp_snapshot())
 
 
+@app.route("/api/rf")
+def api_rf():
+    """איכות RF: תדירות שגיאות CRC/FEC אמיתית מ-DSD-FME (חלון RF_WINDOW_SEC).
+    **אין dBFS/SNR** — נדחה במכוון (ר' CLAUDE.md §8: דורש פטצ' rsp_tcp)."""
+    st = load_state()
+    return jsonify(ok=True, gain_nudge=int(st.get("gain_nudge", 0)), **_rf_quality_snapshot())
+
+
+@app.route("/api/gain", methods=["POST"])
+def api_gain():
+    """נוד-רווח חי (הקשת g/G דרך dsd_pty, בלי לעצור את DSD-FME). יחסי בלבד —
+    אין readback אמיתי מ-DSD-FME, ר' _dmr_gain_nudge. דרך _guard (POST)."""
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("direction", "")).lower()
+    if direction not in ("up", "down"):
+        return jsonify(ok=False, error="direction חייב להיות up/down"), 400
+    ok, val = _dmr_gain_nudge(direction)
+    if not ok:
+        return jsonify(ok=False, error="שליחת הפקודה נכשלה — dmr-dsdfme רץ?",
+                       gain_nudge=val), 500
+    return jsonify(ok=True, gain_nudge=val)
+
+
 # --- הקלטות + יומן + תמלול אופציונלי ----------------------------------------
 def _append_activity(rows):
     try:
@@ -1450,7 +1535,8 @@ def api_mode():
         if err:
             payload, status = _fail_to_off(st, err, detail, "enter dmr")
             return jsonify(payload), status
-        new_state = {**st, "app_mode": "dmr", "system": system["id"]}
+        # gain_nudge כבר אופס בתוך _enter_dmr (restart אמיתי) — טוענים state עדכני
+        new_state = {**load_state(), "app_mode": "dmr", "system": system["id"]}
         save_state(new_state)
         return jsonify(ok=True, app_mode="dmr", system=system["id"])
     finally:
