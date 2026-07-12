@@ -3,11 +3,11 @@
 #  DMR  -  התקנה מלאה ל-Raspberry Pi (Pi 5 / Pi 4, Raspberry Pi OS 64-bit)
 # ----------------------------------------------------------------------------
 #  מתקין הכל אוטומטית: SDRplay API, SoapySDR + SoapySDRPlay3, mbelib, DSD-FME,
-#  גשר rsp_tcp (SDRplay→rtl_tcp), שרת הבקרה הוובי, ושירותי systemd.
+#  rsp_tcp + גשר IQ→PCM/rigctl, שרת הבקרה הוובי, ושירותי systemd.
 #
 #  ⚠️ הרץ *על ה-Pi עצמו*:   chmod +x install.sh && sudo ./install.sh
 #  דגלים:  INSTALL_DMR_WHISPER=1  => תמלול אופציונלי (בנייה ארוכה)
-#          עדכון SDRPLAY_VER / DSD_FME_VER בראש הקובץ לגרסה חדשה.
+#          עדכון SDRPLAY_VER / DSD_FME_BRANCH בראש הקובץ לגרסה חדשה.
 # ============================================================================
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -15,7 +15,7 @@ export DEBIAN_FRONTEND=noninteractive
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${SUDO_USER:-}" ]]; then BUILD_DIR="/home/$SUDO_USER/dmr-build"; else BUILD_DIR="/root/dmr-build"; fi
 SDRPLAY_VER="3.15.2"        # אם יצא עדכון: עדכן כאן (ודא שהקובץ קיים באתר sdrplay)
-DSD_FME_BRANCH="main"       # lwvmobile/dsd-fme — ה-fork הפעיל של DSD-FME
+DSD_FME_BRANCH="audio_work" # ענף ברירת-המחדל הפעיל של lwvmobile/dsd-fme
 
 log()  { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33m[!] %s\033[0m\n' "$*"; }
@@ -25,7 +25,7 @@ die()  { printf '\n\033[1;31m[X] %s\033[0m\n' "$*" >&2; exit 1; }
 mkdir -p "$BUILD_DIR"
 
 # ----------------------------------------------------------------------------
-# 1. תלויות מערכת (כולל תלויות DSD-FME: ncurses, sndfile, rtl-sdr, pulse)
+# 1. תלויות מערכת (כולל DSD-FME + NumPy לגשר IQ→PCM)
 # ----------------------------------------------------------------------------
 log "מתקין תלויות (apt)..."
 apt-get update
@@ -36,7 +36,7 @@ apt-get install -y \
   librtlsdr-dev \
   libsndfile1-dev libncurses-dev libncursesw5-dev \
   libpulse-dev libitpp-dev \
-  python3 python3-flask
+  python3 python3-flask python3-numpy
 
 # ----------------------------------------------------------------------------
 # 2. SDRplay API  (הורדה + חילוץ + התקנה אוטומטית, ללא אישור רישיון אינטראקטיבי)
@@ -58,7 +58,6 @@ else
     || die "הורדת SDRplay API נכשלה. בדוק רשת או עדכן SDRPLAY_VER בראש הסקריפט."
   chmod +x "$RUN"
   rm -rf "$EXT"
-  # חילוץ ללא הרצה (makeself) => עוקפים את אישור הרישיון האינטראקטיבי
   "$RUN" --noexec --target "$EXT"
   if [[ ! -d "$EXT/$APIARCH" ]]; then
     case "$APIARCH" in
@@ -89,7 +88,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 3. SoapySDRPlay3  (דרייבר SoapySDR ל-RSP1B — נדרש ל-rsp_tcp)
+# 3. SoapySDRPlay3  (דרייבר SoapySDR ל-RSP1B — נשמר לכלי אבחון/תאימות)
 # ----------------------------------------------------------------------------
 if SoapySDRUtil --info 2>/dev/null | grep -qi sdrplay; then
   log "SoapySDRPlay3 כבר מותקן - מדלג."
@@ -115,9 +114,8 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 5. DSD-FME  (מפענח ה-DMR; lwvmobile fork)  -- החליף את rtl_airband/acars/vdl2
+# 5. DSD-FME  (מפענח ה-DMR; lwvmobile fork)
 # ----------------------------------------------------------------------------
-# חתימת בנייה פר-רכיב (כמו ב-AIR-AM): שינוי branch/flags => בנייה מחדש בעדכון הבא.
 DSD_CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release"
 DSD_BUILD_SIG="$(printf '%s' "$DSD_FME_BRANCH $DSD_CMAKE_FLAGS" | sha256sum | awk '{print $1}')"
 DSD_MARK="/usr/local/share/dmr/dsd-fme.build-sig"
@@ -142,10 +140,10 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 6. rsp_tcp  (גשר SDRplay→rtl_tcp — DSD-FME מתחבר אליו כלקוח rtl_tcp)
+# 6. rsp_tcp (שרת IQ תואם rtl_tcp ל-SDRplay)
 # ----------------------------------------------------------------------------
-# DSD-FME אינו תומך native ב-SDRplay; rsp_tcp מגיש שרת תואם-rtl_tcp מעל ה-RSP1B,
-# ו-DSD-FME מתכוונן דרכו (טראנקינג). dsd_pty מריץ אותו כתהליך-בן.
+# DSD-FME אינו לקוח rtl_tcp. dsd_pty מפעיל rsp_fm.py שממיר את ה-IQ ל-NFM PCM
+# ב-48 kHz ומספק rigctl לניתוב תדרי הטראנקינג אל rsp_tcp.
 if command -v rsp_tcp >/dev/null 2>&1; then
   log "rsp_tcp כבר מותקן - מדלג."
 else
@@ -154,7 +152,7 @@ else
   [[ -d rsp_tcp ]] || git clone https://github.com/SDRplay/RSPTCPServer.git rsp_tcp
   cd rsp_tcp && rm -rf build && mkdir build && cd build
   cmake .. && make -j"$(nproc)" && make install && ldconfig \
-    || warn "בניית rsp_tcp נכשלה — בדוק שה-SDRplay API v${SDRPLAY_VER} מותקן. מצב DMR ידרוש אותה."
+    || die "בניית rsp_tcp נכשלה — בדוק שה-SDRplay API v${SDRPLAY_VER} מותקן."
 fi
 
 # ----------------------------------------------------------------------------
@@ -162,9 +160,13 @@ fi
 # ----------------------------------------------------------------------------
 log "מתקין הגדרות התחלתיות..."
 mkdir -p /etc/dmr /var/lib/dmr /var/lib/dmr/recordings /run/dmr
-[[ -f /etc/dmr/dmr.env ]]        || cp "$REPO_DIR/config/dmr.env" /etc/dmr/dmr.env
+[[ -f /etc/dmr/dmr.env ]] || cp "$REPO_DIR/config/dmr.env" /etc/dmr/dmr.env
 [[ -f /etc/dmr/channelmap.csv ]] || cp "$REPO_DIR/config/channelmap.csv" /etc/dmr/channelmap.csv
-# קובצי אליאסים (נזרעים ריקים; המשתמש מייבא RadioID.net user.csv ל-rid.csv)
+# מיגרציה לא-הרסנית להתקנות קיימות. app.py שומר את תדר המערכת והמפה הפעילים.
+grep -q '^DSD_AUDIO_TCP=' /etc/dmr/dmr.env || printf 'DSD_AUDIO_TCP=127.0.0.1:7355\n' >> /etc/dmr/dmr.env
+grep -q '^DSD_RIGCTL=' /etc/dmr/dmr.env || printf 'DSD_RIGCTL=127.0.0.1:4532\n' >> /etc/dmr/dmr.env
+grep -q '^DSD_IQ_RATE=' /etc/dmr/dmr.env || printf 'DSD_IQ_RATE=240000\n' >> /etc/dmr/dmr.env
+grep -q '^DSD_AUDIO_GAIN=' /etc/dmr/dmr.env || printf 'DSD_AUDIO_GAIN=4.0\n' >> /etc/dmr/dmr.env
 [[ -f /etc/dmr/rid.csv ]] || printf 'RADIO_ID,CALLSIGN,NAME\n' > /etc/dmr/rid.csv
 [[ -f /etc/dmr/tg.csv ]]  || printf 'TGID,NAME\n' > /etc/dmr/tg.csv
 
@@ -173,25 +175,22 @@ mkdir -p /etc/dmr /var/lib/dmr /var/lib/dmr/recordings /run/dmr
 # ----------------------------------------------------------------------------
 log "מגדיר משתמש 'dmr' לשרת הווב (הרצה ללא root)..."
 id -u dmr >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin dmr
-# הבעלות מאפשרת ל-dmr לכתוב env/channelmap/state/systems/aliases והקלטות
 chown -R dmr:dmr /etc/dmr /var/lib/dmr
 for grp in systemd-journal video; do
   getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" dmr || true
 done
-# sudoers: מתיר ל-dmr *רק* את restart/stop של dmr-dsdfme (NOPASSWD), לא יותר.
-cat > /etc/sudoers.d/dmr <<'EOF'
+cat > /etc/sudoers.d/dmr <<'SUDOEOF'
 dmr ALL=(root) NOPASSWD: /usr/bin/systemctl restart dmr-dsdfme
 dmr ALL=(root) NOPASSWD: /usr/bin/systemctl stop dmr-dsdfme
-EOF
+SUDOEOF
 chmod 440 /etc/sudoers.d/dmr
 visudo -cf /etc/sudoers.d/dmr >/dev/null || die "קובץ sudoers לא תקין (/etc/sudoers.d/dmr)."
-# קובץ environment לשרת הווב (PIN אופציונלי + תמלול). כבוי כברירת מחדל.
 if [[ ! -f /etc/dmr/dmr-web.env ]]; then
-  cat > /etc/dmr/dmr-web.env <<'EOF'
+  cat > /etc/dmr/dmr-web.env <<'WEBEOF'
 # DMR web control - משתני סביבה.
 # כדי לדרוש PIN לשינוי מצב/מערכת, בטל את ההערה (ואז: systemctl restart dmr-web):
 # DMR_PIN=1234
-EOF
+WEBEOF
 fi
 chown -R dmr:dmr /etc/dmr
 
@@ -203,13 +202,12 @@ mkdir -p /opt/dmr/webtune
 cp -r "$REPO_DIR/webtune/." /opt/dmr/webtune/
 [[ -f "$REPO_DIR/VERSION" ]] && cp "$REPO_DIR/VERSION" /opt/dmr/webtune/VERSION
 cp "$REPO_DIR/scripts/dmr-wait-sdrplay" /usr/local/bin/
-chmod 755 /usr/local/bin/dmr-wait-sdrplay
+chmod 755 /usr/local/bin/dmr-wait-sdrplay /opt/dmr/webtune/dsd_pty.py /opt/dmr/webtune/rsp_fm.py
 cp "$REPO_DIR/udev/99-dmr.rules" /etc/udev/rules.d/
 udevadm control --reload-rules 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 # 8b. תמלול (אופציונלי) - whisper.cpp + מודל base (רב-לשוני)
-#     הפעלה:  INSTALL_DMR_WHISPER=1 sudo ./install.sh
 # ----------------------------------------------------------------------------
 if [[ "${INSTALL_DMR_WHISPER:-0}" == "1" ]]; then
   log "מתקין תמלול (whisper.cpp + base) - עשוי לקחת כמה דקות ..."
@@ -238,10 +236,7 @@ cp "$REPO_DIR/systemd/sdrplay.service"     /etc/systemd/system/
 cp "$REPO_DIR/systemd/dmr-dsdfme.service"  /etc/systemd/system/
 cp "$REPO_DIR/systemd/dmr-web.service"     /etc/systemd/system/
 systemctl daemon-reload
-# dmr-dsdfme אינו enabled בכוונה: dmr-web (המתזמר, enabled) משחזר את המצב השמור
-# באתחול (dmr/off/scan). אין "מצב ראשי"; off שורד reboot.
 systemctl enable sdrplay.service dmr-web.service
-# restart (לא enable --now שהוא no-op לשירות שכבר רץ) => בעדכון הקוד/units נטענים החדשים.
 systemctl restart sdrplay.service || warn "sdrplay.service לא עלה - בדוק חיבור ה-RSP1B."
 sleep 2
 systemctl restart dmr-web.service || warn "dmr-web לא עלה - בדוק journalctl -u dmr-web"
