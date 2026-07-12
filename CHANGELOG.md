@@ -5,10 +5,35 @@
 [SemVer](https://semver.org/lang/he/).
 
 ## [Unreleased]
-### Fixed
-- **`install.sh`:** `DSD_FME_BRANCH` הצביע ל-`main`, שלא קיים בכלל בריפו
-  `lwvmobile/dsd-fme` (הענף הפעיל האמיתי הוא `audio_work`) — `git clone` נכשל
-  מיד בשלב 5. נתפס בהרצה ראשונה על חומרה אמיתית (Pi5+RSP1B). תוקן.
+### Fixed — מעבר ל-dsd-neo (נתפס בהרצה ראשונה על חומרה אמיתית, Pi5+RSP1B)
+ההרצה הראשונה על חומרה אמיתית חשפה שתי שכבות של תקלות ב-`lwvmobile/dsd-fme`:
+
+- **שלב 1 (נתפס):** `DSD_FME_BRANCH` הצביע ל-`main`, שלא קיים בכלל בריפו
+  (הענף הפעיל האמיתי הוא `audio_work`) — `git clone` נכשל מיד בשלב 5.
+- **שלב 2 (נתפס אחרי תיקון שלב 1, מ-journalctl של `dmr-dsdfme.service`):**
+  גם עם הענף הנכון, `dmr-dsdfme.service` קרס מיד (`exit 1`). בדיקה של הפקודה
+  שבאמת רצה חשפה `build_command()` שבור: דגל `‎-C` כפול (בלוק `DSD_COLOR_CODE`
+  ישן הזריק `‎-C` בטעות — ל-DMR *אין* דגל CLI לצבע-קוד, הוא מזוהה מהסנכרון
+  בפועל) ודגל `‎-c <תדר>` שלא קיים בכלל באף fork (אומת מול תיעוד CLI מלא).
+  חקירה נוספת גילתה בעיה עמוקה יותר: `lwvmobile/dsd-fme` **לא תומך כלל** בקלט
+  `‎-i rtltcp:` (רק `‎-i tcp:` הקנייני של SDR++ ו-`‎-i rtl:` USB מקומי) — כל
+  ארכיטקטורת הגשר `rsp_tcp` מ-Phase 1 נשענה על הנחה שגויה.
+  **הפתרון:** מעבר ל-`arancormonk/dsd-neo` (v2.3.0) — fork פעיל ומתועד היטב
+  שתומך `‎-i rtltcp:host:port` במפורש (מתאים בדיוק לגשר `rsp_tcp` הקיים,
+  שנשמר ללא שינוי) וגם SoapySDR ישיר (לא מנוצל כרגע — שיפור ארכיטקטוני עתידי
+  מתועד, לא יושם תחת לחץ זמן). תוקן: `install.sh` (בלוק בנייה חדש עם
+  `ninja-build`/`libfftw3-dev`/`libblas-dev`/`liblapack-dev`/`gfortran`/
+  `libssl-dev`/`libcurl4-openssl-dev` שדסק-נאו דורש, `cmake --install`),
+  `dsd_pty.build_command` (הוסר `‎-C` הכפול ו-`‎-c`; `‎-6 <dir>` (WAV רציף)
+  הוחלף ב-`‎-7 <dir> -P` הנכון (WAV per-call), `DSD_BIN` ברירת מחדל `dsd-neo`).
+  תדר ערוץ הבקרה כבר לא דגל CLI — `app.render_channelmap` מזריק אותו כשורת
+  "בוא לכאן קודם" ראשונה בקובץ ה-channelmap עצמו (ערוץ-דמה `999`, לפי מוסכמת
+  התיעוד הרשמי של dsd-neo).
+- **נוסף:** `dsd_pty._run` היה בולע את הפלט הגולמי של DSD-FME/`rsp_tcp` (רק
+  אירועים מפורסרים נשלחו הלאה) — שגיאות/קריסה של המפענח לא הגיעו ל-
+  `journalctl -u dmr-dsdfme` כלל, מה שהקשה מאוד על האבחון בפועל. כעת כל שורת
+  פלט גולמית מהודהדת ל-stderr (=> journal), ו-`rsp_tcp` יורש stdout/stderr
+  במקום `DEVNULL`.
 
 ## [0.3.0] - 2026-07-12
 ### Changed — פרסור DSD-FME מבוסס קליטה אמיתית (לא ניחוש)
