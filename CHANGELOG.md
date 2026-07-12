@@ -5,6 +5,14 @@
 [SemVer](https://semver.org/lang/he/).
 
 ## [Unreleased]
+
+## [0.3.1] - תיקון-ביניים: מעבר ל-dsd-neo (הוחזר ב-0.4.0, ר' למטה)
+> ⚠ **המעבר ל-dsd-neo בגרסה הזו הוחזר ב-0.4.0** — הבינארי בפועל מ-0.4.0 ואילך
+> הוא שוב `lwvmobile/dsd-fme`, מוזן דרך גשר IQ→PCM+rigctl עצמאי במקום לעבור
+> binary. **הממצא המרכזי כאן נשאר נכון ותקף:** `lwvmobile/dsd-fme` אכן אינו
+> תומך בקלט `‎-i rtltcp:` ישיר — זו הסיבה שהוחלט שלא לחזור לחיבור הישיר
+> המקורי, אלא לפתור את זה בגשר עצמאי.
+
 ### Fixed — מעבר ל-dsd-neo (נתפס בהרצה ראשונה על חומרה אמיתית, Pi5+RSP1B)
 ההרצה הראשונה על חומרה אמיתית חשפה שתי שכבות של תקלות ב-`lwvmobile/dsd-fme`:
 
@@ -34,6 +42,58 @@
   `journalctl -u dmr-dsdfme` כלל, מה שהקשה מאוד על האבחון בפועל. כעת כל שורת
   פלט גולמית מהודהדת ל-stderr (=> journal), ו-`rsp_tcp` יורש stdout/stderr
   במקום `DEVNULL`.
+
+## [0.4.0] - תיקון קריסת dmr-dsdfme + גשר IQ→PCM עצמאי (✅ אומת על חומרה אמיתית)
+### Fixed — קריסת `dmr-dsdfme` תוך שניות מהעלייה
+`rsp_tcp` היה נופל (`strmHandlerThread`/`heartBeatThread`/`eventHandlerThread: Exit`,
+`sdrplay_api_Close`) תוך שניות מהתחברות DSD-FME אליו כלקוח rtl_tcp ישיר
+(`-i rtltcp:...`) — חוסר-תאימות ידוע בין לקוח ה-rtl_tcp של DSD-FME לבין ה-emulator
+של SDRplay. הפתרון מסיר את החיבור הישיר לגמרי במקום להטליא אותו.
+
+**מחליף את 0.3.1:** גרסה זו נוסתה גם עם `arancormonk/dsd-neo` (ר' 0.3.1 למעלה),
+שנבחר כי הוא תומך `‎-i rtltcp:` ישיר — אך הוחלט להחזיר את `lwvmobile/dsd-fme`
+ולפתור את חוסר-תמיכת ה-rtltcp בגשר עצמאי (`webtune/rsp_fm.py`) במקום להחליף
+בינארי, כדי לשמר את עבודת הפרסור/הנרמול הקיימת (`parse_dsd_line`,
+`tests/fixtures/capplus_slco_sample.csv`) שתלויה בפורמט הפלט הספציפי של
+lwvmobile/dsd-fme.
+
+### Changed — ארכיטקטורה: rsp_tcp → rsp_fm.py (IQ→PCM+rigctl) → DSD-FME
+- **`webtune/rsp_fm.py` (חדש, תלות NumPy):** דמודולטור NFM עצמאי (IQ u8 240kHz →
+  PCM signed-16 48kHz, FIR 121-taps + DC-blocker stateful חד-קוטבי) + שרת rigctl
+  לכיוונון טראנקינג + שרת בקרת-רווח (unix socket).
+- **`dsd_pty.py`:** מפקח כעת על 3 תהליכי-בן (rsp_tcp, rsp_fm.py, DSD-FME תחת PTY)
+  במקום 2. DSD-FME עבר מ-`-i rtltcp:...` ל-`-i tcp:...` (קלט אודיו) + `-U` (rigctl)
+  — דפוס השימוש הרשמי של lwvmobile/dsd-fme לרדיו בלי טראנקינג IQ נטיבי. תוקן גם
+  באג ותיק בהקלטות per-call (`-6` השגוי → `-7 <dir> -P` הנכון).
+- **`install.sh`:** `DSD_FME_BRANCH` עבר מ-`main` (שוב לא קיים ב-upstream) ל-`audio_work`
+  (ברירת המחדל הנוכחית של lwvmobile/dsd-fme, שם חיות `-i tcp`/`-U`/`-7`/`-P`).
+- **`app.py`:** `render_dmr_env` כולל כעת גם את קבועי הגשר (`DSD_RTLTCP`/`DSD_AUDIO_TCP`/
+  `DSD_RIGCTL`/`DSD_IQ_RATE`/`DSD_AUDIO_GAIN`) — בלי זה הם נדרסים מתוך `/etc/dmr/dmr.env`
+  בכל מעבר מצב (`_enter_dmr`/מעבר-רגל-סריקה).
+- **נוד-רווח (`/api/gain`):** מגיע כעת בפועל ל-SDR (`rsp_fm.RtlTcpClient.nudge_gain`
+  → פקודות rtl_tcp אמיתיות ל-`rsp_tcp`) במקום הקשה מדומה ל-DSD-FME, שכבר לא נוגע ב-SDR.
+
+### Fixed — חיזוקי אמינות בגשר החדש
+- `RtlTcpClient` היה בלי read-timeout אחרי handshake (`settimeout(None)`) — אם
+  `rsp_tcp` נתקע בלי לסגור את הסוקט, הגשר היה נתקע לנצח וה-health-check לא תופס
+  את זה. עכשיו timeout קבוע (5s) הופך תקיעה לשגיאה מטופלת (restart).
+- דמודולטור ה-DC-blocking עבר מ"ממוצע בלוק" (מחושב מחדש בנפרד על כל chunk של
+  ~100ms — קפיצה בכל גבול chunk) לפילטר IIR חד-קוטבי עם מצב הנשמר לרוחב chunks,
+  כמו ה-FIR overlap הקיים.
+- שליחת PCM ל-DSD-FME (`AudioSender`) עברה ל-thread נפרד עם תור חסום — במקום לחסום
+  את ה-thread שקורא IQ מ-`rsp_tcp` (עד 2 שניות אם DSD-FME נתקע).
+- שלושת תהליכי-הבן (`rsp_tcp`/`rsp_fm.py`/DSD-FME) מקבלים כעת `PR_SET_PDEATHSIG`
+  — הגנה מפני תהליכים יתומים שממשיכים להחזיק את ה-SDR/פורטים אם המפקח עצמו נופל
+  (למשל OOM-kill), מה שהיה גורם ל-restart הבא להיכשל באותה צורה.
+
+### ✅ אומת על חומרה אמיתית (Pi 5 + SDRplay RSP1B)
+כל שרשרת האותות (`rsp_tcp`→`rsp_fm.py`→DSD-FME) היא `pragma: no cover` — לא
+נבדקת ב-CI; pytest ירוק (107/107) מוודא רק לוגיקה טהורה (argv, פרסור, דמודולטור
+מול אות מסונתז). **אומת בנוסף בפועל** על Pi 5 + RSP1B: לאחר `sudo ./install.sh`,
+`dmr-dsdfme.service` נשאר `active (running)` יציב (בעבר קרס תוך שניות), כל
+תהליכי-הבן (`rsp_tcp`/`rsp_fm.py`/DSD-FME) חיים ב-cgroup אחד, ו-DSD-FME מתחבר
+בהצלחה ל-audio socket ("TCP Connection Success!") ומתחיל תהליך פענוח/טראנקינג
+מול רשת Cap+ אמיתית.
 
 ## [0.3.0] - 2026-07-12
 ### Changed — פרסור DSD-FME מבוסס קליטה אמיתית (לא ניחוש)

@@ -49,6 +49,16 @@ DMR_SERVICE = "dmr-dsdfme"
 # כל שורת אירוע ל-dict, ושולח כ-JSON ב-UDP לכאן — בדיוק כמו "acarsdec -j" ב-AIR-AM.
 DMR_UDP_HOST = "127.0.0.1"
 DMR_UDP_PORT = 5555                   # חייב להתאים ל-DMR_UDP ב-dmr.env / dsd_pty
+
+# גשר IQ→PCM (dsd_pty מריץ rsp_tcp + rsp_fm.py כתהליכי-בן; ר' CLAUDE.md §2).
+# אלה נתיבי loopback/פרמטרים קבועים של התשתית (לא פר-מערכת) — זהים לברירות-
+# המחדל במודולי dsd_pty/rsp_fm עצמם. render_dmr_env דורס את כל dmr.env בכל
+# מעבר מצב, אז חובה לכלול אותם כאן — אחרת הם נעלמים מהקובץ החי בכל מעבר.
+DMR_BRIDGE_RTLTCP = "127.0.0.1:1234"
+DMR_BRIDGE_AUDIO_TCP = "127.0.0.1:7355"
+DMR_BRIDGE_RIGCTL = "127.0.0.1:4532"
+DMR_BRIDGE_IQ_RATE = 240000
+DMR_BRIDGE_AUDIO_GAIN = 4.0
 DMR_BUF_MAX = 800                     # שיחות אחרונות בזיכרון (נטענות בעלייה, היום בלבד)
 DMR_LOG_PATH = Path("/var/lib/dmr/dmr.jsonl")
 DMR_LOG_KEEP = 8000                   # retention בדיסק (זנב נשמר; ייצוא לניתוח)
@@ -287,24 +297,10 @@ def _sanitize_freq(val, default=None):
     return s if _FREQ_RE.match(s) else default
 
 
-CONTROL_HINT_LCN = 999   # ערוץ-דמה ל"בוא לכאן קודם" (מוסכמת התיעוד של dsd-neo)
-
-
-def render_channelmap(channelmap, control_mhz=None):
-    """בונה את תוכן channelmap.csv (LCN,FREQ_HZ[,note]) ל-dsd-neo (‎-C). התדרים ב-Hz.
-    אין ל-dsd-neo דגל ‎-c לתדר-בקרה נפרד — הכוונה הראשונית נגזרת מסדר השורות
-    (התדר הראשון בקובץ = "בוא לכאן קודם"). לכן אם סופק control_mhz, נוסיף אותו
-    כשורה ראשונה עם ערוץ-דמה (CONTROL_HINT_LCN) — בהשראת הדוגמה הרשמית של
-    dsd-neo (`999,<hz>,default cc`). ב-Cap+ ערוץ הבקרה מסתובב בין ה-LCN
-    הפיזיים, כך שהתדר הזה בד"כ כבר מופיע גם בשורות ה-LCN הרגילות למטה —
-    זו כפילות מכוונת (hint), לא שגיאה. פונקציה טהורה => נבדקת בלי חומרה."""
+def render_channelmap(channelmap):
+    """בונה את תוכן channelmap.csv (LCN,FREQ_HZ) ל-DSD-FME (‎-C). התדרים ב-Hz.
+    פורמט DSD-FME: כל שורה 'lcn,freq_hz'. פונקציה טהורה => נבדקת בלי חומרה."""
     lines = []
-    if control_mhz not in (None, ""):
-        try:
-            hz = int(round(float(control_mhz) * 1e6))
-            lines.append(f"{CONTROL_HINT_LCN},{hz},control")
-        except (TypeError, ValueError):
-            pass
     for ch in channelmap or []:
         try:
             lcn = int(ch["lcn"])
@@ -315,8 +311,8 @@ def render_channelmap(channelmap, control_mhz=None):
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def write_channelmap(channelmap, control_mhz=None):
-    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap, control_mhz))
+def write_channelmap(channelmap):
+    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap))
 
 
 def render_dmr_env(system):
@@ -328,12 +324,17 @@ def render_dmr_env(system):
     lines = [
         '# נכתב אוטומטית ע"י DMR web (מעבר למצב DMR). שינויים ידניים נדרסים.',
         f"# מערכת: {system.get('name', system.get('id', ''))}",
-        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — לשורת ה-hint הראשונה ב-channelmap (לא דגל CLI)
-        f"DSD_COLOR_CODE={cc}",             # מטא-דאטה בלבד — dsd-neo מזהה CC מהסנכרון, אין דגל קלט
+        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — ערוץ הבקרה (CC) של Cap+
+        f"DSD_COLOR_CODE={cc}",
         f"DSD_CHANNELMAP={CHANNELMAP_PATH}",
         f"DSD_UDP={DMR_UDP_HOST}:{DMR_UDP_PORT}",   # יעד פיד ה-JSON (dsd_pty → app.py)
         f"DSD_WAV_DIR={REC_DIR}",                    # per-call WAV לתיקיית ההקלטות
         "DSD_TRUNK=1",                               # מעקב טראנקינג (Cap+)
+        f"DSD_RTLTCP={DMR_BRIDGE_RTLTCP}",           # rsp_tcp — IQ גולמי מה-RSP1B
+        f"DSD_AUDIO_TCP={DMR_BRIDGE_AUDIO_TCP}",     # rsp_fm.py — PCM 48kHz ל-DSD-FME
+        f"DSD_RIGCTL={DMR_BRIDGE_RIGCTL}",           # rsp_fm.py — rigctl לכיוונון טראנקינג
+        f"DSD_IQ_RATE={DMR_BRIDGE_IQ_RATE}",         # קצב IQ מבוקש מ-rsp_tcp (Hz)
+        f"DSD_AUDIO_GAIN={DMR_BRIDGE_AUDIO_GAIN}",   # מכפיל רווח discriminator ב-rsp_fm.py
         "",
     ]
     return "\n".join(lines)
@@ -348,14 +349,14 @@ def _enter_dmr(system):
     """כותב env + channelmap ומריץ את dmr-dsdfme (DSD-FME תחת PTY). מחזיר
     (error, detail). מבנה זהה ל-_enter_acars ב-AIR-AM: write-env → restart → poll
     לקריסה מאוחרת (השירות יכול לעלות ואז לקרוס על תדר/מפה רעים ~2ש' אחר-כך)."""
-    write_channelmap(system.get("channelmap"), system.get("control"))
+    write_channelmap(system.get("channelmap"))
     write_dmr_env(system)
     try:
         r = _sysctl("restart", DMR_SERVICE, timeout=45)
     except subprocess.TimeoutExpired:
         return "הפעלת DMR נתקעה — בדוק שה-SDR מחובר", None
     if r.returncode != 0:
-        return (r.stderr or "dsd-neo failed").strip(), _journal_tail(DMR_SERVICE)
+        return (r.stderr or "dsd-fme failed").strip(), _journal_tail(DMR_SERVICE)
     for _ in range(7):
         time.sleep(0.5)
         if not _is_active(DMR_SERVICE):
