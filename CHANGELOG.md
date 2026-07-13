@@ -6,6 +6,49 @@
 
 ## [Unreleased]
 
+## [0.5.0] - גילוי רשתות DMR (frequency discovery)
+### Added — מצב `discover`: סריקת תדרים חכמה + גילוי פרמטרים
+מצב חדש שסורק טווח RF, מזהה תדרים חשודים כ-DMR (גילוי אנרגיה FFT), ואז בודק כל
+מועמד עם DSD-FME ומגלה: תדר בקרה, color code, סוג ערוץ (בקרה/קול/קונבנציונלי),
+LSN-ים ו-TG-ים פעילים. תוצאה: דוח גילוי + "שמור כמערכת" (מיזוג ל-systems.json).
+
+- **`webtune/discovery.py` (מודול חדש, לוגיקה טהורה):** `validate_sweep_plan`
+  (ברירת מחדל 450–470 MHz, תחום 24–1300, רוחב עד 100MHz), `build_freq_grid`
+  (צעד לפי חלון שמיש ‎~1.8MHz), `detect_candidates` (סף אדפטיבי median+k·MAD עם
+  מרווח-מינימום יחסי, מסכת DC spike מרכזי, crop קצוות, מיזוג בינים לפי רוחב ערוץ
+  12.5kHz), `aggregate_probe` (אירועים→רשומת רשת: is_dmr/cc/channel_type/rest_lsns/
+  talkgroups/rids/encrypted/confidence), `discovery_to_system`.
+- **`webtune/rsp_fm.py`:** `compute_power_spectrum` (Hann→FFT→dBFS, טהור ונבדק),
+  מצב `--sweep` (מדלג על ה-NFM demod, gain ידני קבוע, FFT על ה-IQ הגולמי עם
+  איפוס ב-generation change), verb `SPECTRUM` בשרת ה-rigctl, `set_fixed_gain`.
+- **`webtune/dsd_pty.py`:** `parse_dsd_line(..., emit_status=True)` מוסיף אירועי
+  `sync` (‎`Sync: +DMR ... Color Code=NN | state`) ו-`channel_status` (Rest LSN +
+  LSN states) — שדות ש-DSD-FME כבר מדפיס אך נזרקו. **ברירת המחדל (emit_status=False)
+  ללא שינוי** — פרסור רגיל זהה byte-for-byte, ה-fixture replay (68/68) נשאר ירוק.
+  מצב sweep ב-`_run` (רק rsp_tcp+rsp_fm, בלי DSD-FME).
+- **`webtune/app.py`:** תזמור `_discover_activate`/`_discover_loop`/
+  `_discover_stop_thread` (מודל scan; TUNE_LOCK per-step בלבד; job חולף בזיכרון —
+  לא מַתמיד ב-state, לא משוחזר ב-boot), collector side-tap ב-`_dmr_listener`
+  (מתויג-epoch, לא נוגע ב-dedup), `render_dmr_env` עם `trunk` פר-מערכת (במקום
+  קבוע) + דגלי sweep/emit_status, `_probe_system` (non-trunk), `discovery.json`.
+  נקודות REST: `POST /api/mode {mode:"discover"}`, `GET /api/discover`,
+  `POST /api/discover/save`. `api_state`/`api_health` מדווחים discover כשפעיל.
+- **UI:** תצוגת "🔎 גילוי" חדשה — טופס טווח, התקדמות חיה (שלב/progress/תדר),
+  טבלת רשתות מגולות + "שמור כמערכת". הערה מפורשת על מיפוי-ערוצים חלקי.
+- **בדיקות:** `tests/test_discovery.py` (33 בדיקות: טהור + Flask + e2e ממוקף),
+  `compute_power_spectrum` ב-`test_rsp_fm`, אירועי sync/channel_status ב-
+  `test_dsd_normalize`. סה"כ 140 בדיקות ירוקות.
+
+> ⚠ **גבול אימות חומרה:** שרשרת האותות של הסריקה (מצב sweep ב-rsp_fm/dsd_pty,
+> לקוח ה-rigctl/spectrum ב-app.py, בדיקת DSD-FME) היא `pragma: no cover` —
+> מתאמתת רק על Pi 5 + RSP1B אמיתי, כמו הגשר של 0.4.0. CI מכסה את כל הלוגיקה
+> הטהורה, `compute_power_spectrum`, שינויי ה-parser, ונקודות ה-Flask. הזמנים/
+> הרגישות בשטח (התייצבות retune, יציבות gain, peaks אמיתיים) ייאומתו על חומרה.
+>
+> **מיפוי LCN↔תדר אינו ניתן לגילוי אוטומטי מלא:** Cap+ משדר LSN לוגי (לא תדר),
+> ו-SDR יחיד לא יכול לצפות בבקרה ובקול בו-זמנית — הדוח מדווח LSN-ים שנצפו + CC +
+> תדר בקרה; מפת הערוצים המלאה נשלמת ידנית.
+
 ## [0.3.1] - תיקון-ביניים: מעבר ל-dsd-neo (הוחזר ב-0.4.0, ר' למטה)
 > ⚠ **המעבר ל-dsd-neo בגרסה הזו הוחזר ב-0.4.0** — הבינארי בפועל מ-0.4.0 ואילך
 > הוא שוב `lwvmobile/dsd-fme`, מוזן דרך גשר IQ→PCM+rigctl עצמאי במקום לעבור

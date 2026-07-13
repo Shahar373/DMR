@@ -57,14 +57,31 @@ _QUALITY_ERR_MAP = {
     "slco crc err": "SLCO_CRC",
 }
 _RE_QUALITY_CC = re.compile(r"Color Code=(?P<cc>\d+)", re.I)
+# Discovery-only patterns (see parse_dsd_line emit_status). A clean "Sync: +DMR"
+# line (no error) is the most reliable positive "this frequency carries DMR"
+# signal, and the Capacity Plus Channel Status line is the trunk control-channel
+# fingerprint (periodic CSBK + Rest LSN). Both are printed by DSD-FME but dropped
+# in normal operation to keep the UDP feed quiet (~80% of output is housekeeping).
+_RE_SYNC = re.compile(r"Sync:\s*\+DMR", re.I)
+_RE_SYNC_SLOT = re.compile(r"\[\s*slot\s*(?P<slot>\d)\s*\]", re.I)
+_RE_CHAN_STATUS = re.compile(
+    r"Channel Status\b.*?Rest LSN:\s*(?P<rest_lsn>\d+)", re.I)
+_RE_LSN_STATE = re.compile(r"LSN\s*(?P<lsn>\d+):\s*(?P<state>Rest|Idle|\d+)", re.I)
 
 
 def clean_dsd_line(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "").strip()
 
 
-def parse_dsd_line(text):
-    """Parse one DSD-FME line into a typed event, or None for housekeeping."""
+def parse_dsd_line(text, emit_status=False):
+    """Parse one DSD-FME line into a typed event, or None for housekeeping.
+
+    `emit_status` is enabled only during a discovery probe: it additionally
+    surfaces a positive `sync` event (proto + color code + active slot) from a
+    clean `Sync: +DMR` line and a `channel_status` event (Rest LSN + per-LSN
+    states) from a Capacity Plus Channel Status line. In normal dmr/scan
+    operation `emit_status` stays False, so parsing is byte-for-byte identical
+    to before (those lines return None and never hit the UDP feed)."""
     if not text or not text.strip():
         return None
     text = clean_dsd_line(text)
@@ -135,6 +152,36 @@ def parse_dsd_line(text):
             event["cc"] = int(cc.group("cc"))
         return event
 
+    if emit_status:
+        # Error'd sync lines were already returned as `quality` above, so only
+        # clean sync lines reach here.
+        if _RE_SYNC.search(text):
+            event = {"type": "sync", "proto": "dmr"}
+            cc = _RE_QUALITY_CC.search(text)
+            if cc:
+                event["cc"] = int(cc.group("cc"))
+            slot = _RE_SYNC_SLOT.search(text)
+            if slot:
+                event["slot"] = int(slot.group("slot"))
+            if "|" in text:
+                state = text.rsplit("|", 1)[-1].strip()
+                if state:
+                    event["state"] = state
+            return event
+        match = _RE_CHAN_STATUS.search(text)
+        if match:
+            event = {"type": "channel_status",
+                     "rest_lsn": int(match.group("rest_lsn"))}
+            cc = _RE_QUALITY_CC.search(text)
+            if cc:
+                event["cc"] = int(cc.group("cc"))
+            states = _RE_LSN_STATE.findall(text)
+            if states:
+                event["lsn_states"] = [
+                    {"lsn": int(lsn), "state": state} for lsn, state in states
+                ]
+            return event
+
     return None
 
 
@@ -176,6 +223,11 @@ def build_bridge_command(env):
         "--iq-rate", str(env.get("DSD_IQ_RATE", "240000")),
         "--audio-gain", str(env.get("DSD_AUDIO_GAIN", "4.0")),
     ]
+    if env.get("DSD_SWEEP", "").lower() in ("1", "true", "yes"):
+        command += ["--sweep",
+                    "--nfft", str(env.get("DSD_SWEEP_NFFT", "2048")),
+                    "--sweep-frames", str(env.get("DSD_SWEEP_FRAMES", "64")),
+                    "--gain-index", str(env.get("DSD_SWEEP_GAIN", "14"))]
     return command
 
 
@@ -279,6 +331,8 @@ def _run():  # pragma: no cover - hardware runtime
     target = _udp_target()
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     env = dict(os.environ)
+    sweep = env.get("DSD_SWEEP", "").lower() in ("1", "true", "yes")
+    emit_status = env.get("DSD_EMIT_STATUS", "").lower() in ("1", "true", "yes")
     processes = []
     master = None
     ctrl = None
@@ -299,10 +353,25 @@ def _run():  # pragma: no cover - hardware runtime
 
         audio_host, audio_port = _split_endpoint(env.get("DSD_AUDIO_TCP", AUDIO_TCP_HOST), 7355)
         rig_host, rig_port = _split_endpoint(env.get("DSD_RIGCTL", RIGCTL_HOST), 4532)
-        if not _wait_for_port(audio_host, int(audio_port), bridge):
-            raise RuntimeError("rsp_fm audio port did not become ready")
         if not _wait_for_port(rig_host, int(rig_port), bridge):
             raise RuntimeError("rsp_fm rigctl port did not become ready")
+        if sweep:
+            # Discovery sweep: no DSD-FME. rsp_fm only serves the FFT spectrum +
+            # retune over rigctl; app.py drives the frequency grid. Just keep the
+            # two children alive until stopped (systemctl stop/restart) or a
+            # child dies.
+            sys.stderr.write("dsd_pty: sweep mode (rsp_tcp + rsp_fm only)\n")
+            sys.stderr.flush()
+            while True:
+                if rsp.poll() is not None:
+                    sys.stderr.write(f"dsd_pty: rsp_tcp exited with status {rsp.returncode}\n")
+                    return 1
+                if bridge.poll() is not None:
+                    sys.stderr.write(f"dsd_pty: rsp_fm exited with status {bridge.returncode}\n")
+                    return 1
+                time.sleep(0.5)
+        if not _wait_for_port(audio_host, int(audio_port), bridge):
+            raise RuntimeError("rsp_fm audio port did not become ready")
 
         command = build_command(env)
         sys.stderr.write("dsd_pty: exec %s\n" % " ".join(command))
@@ -359,7 +428,7 @@ def _run():  # pragma: no cover - hardware runtime
                     if text:
                         sys.stderr.write(f"dsd-fme: {text}\n")
                         sys.stderr.flush()
-                    event = parse_dsd_line(text)
+                    event = parse_dsd_line(text, emit_status=emit_status)
                     if event:
                         event["t"] = time.time()
                         try:

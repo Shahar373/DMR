@@ -330,3 +330,56 @@ def test_listener_voice_crc_err_feeds_rf_window(paths, monkeypatch):
     assert snapshot["by_type"][0]["error_type"] == "VOICE_CRC"
     with app._dmr_lock:
         assert len(app._dmr_msgs) == 1
+
+
+def test_emit_status_off_leaves_parsing_unchanged():
+    """ברירת מחדל (emit_status=False): sync/channel_status נקיים => None (כמו קודם)."""
+    assert dsd_pty.parse_dsd_line(
+        "Capacity Plus Channel Status - FL: 1 TS: 1 RS: 0 - Rest LSN: 6 - Final Block"
+    ) is None
+    assert dsd_pty.parse_dsd_line(
+        "Sync: +DMR  [slot1] slot2 | Color Code=01 | IDLE"
+    ) is None
+
+
+def test_emit_status_positive_sync_event():
+    event = dsd_pty.parse_dsd_line(
+        "Sync: +DMR  [slot1] slot2 | Color Code=01 | IDLE", emit_status=True)
+    assert event == {"type": "sync", "proto": "dmr", "cc": 1, "slot": 1, "state": "IDLE"}
+    grant = dsd_pty.parse_dsd_line(
+        "Sync: +DMR  [SLOT1] slot2 | Color Code=00 | CSBK Voice Channel Grant",
+        emit_status=True)
+    assert grant["cc"] == 0 and grant["state"] == "CSBK Voice Channel Grant"
+
+
+def test_emit_status_channel_status_event():
+    event = dsd_pty.parse_dsd_line(
+        "Capacity Plus Channel Status - FL: 1 TS: 1 RS: 0 - Rest LSN: 6 - Final Block",
+        emit_status=True)
+    assert event == {"type": "channel_status", "rest_lsn": 6}
+    with_states = dsd_pty.parse_dsd_line(
+        "Capacity Plus Channel Status - Rest LSN: 1 - LSN 01: Rest; LSN 02: Idle;",
+        emit_status=True)
+    assert with_states["rest_lsn"] == 1
+    assert with_states["lsn_states"] == [
+        {"lsn": 1, "state": "Rest"}, {"lsn": 2, "state": "Idle"}]
+
+
+def test_emit_status_error_sync_stays_quality():
+    """שורת sync עם שגיאה נשארת quality (קדימות) גם עם emit_status."""
+    event = dsd_pty.parse_dsd_line(
+        "21:39:14 Sync: +DMR  [slot1]  slot2  | Color Code=02 | CSBK (CRC ERR)",
+        emit_status=True)
+    assert event == {"type": "quality", "error_type": "CSBK_CRC", "cc": 2}
+
+
+def test_emit_status_replay_reclassifies_channel_status():
+    """עם emit_status, שורות ה-channel_status של הפיקסצ'ר נעשות אירועי channel_status,
+    ושורות ה-quality נשארות quality (שגיאה קודמת ל-sync)."""
+    rows = _load_fixture()
+    for row in rows:
+        event = dsd_pty.parse_dsd_line(row["raw_line"], emit_status=True)
+        if row["orig_type"] == "channel_status":
+            assert event and event["type"] == "channel_status"
+        elif row["orig_type"] == "quality":
+            assert event and event["type"] == "quality"
