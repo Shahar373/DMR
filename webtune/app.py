@@ -31,6 +31,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, send_from_directory, abort
 
 import aliases as aliasdb   # ניהול אליאסים (TG/RID) — טעינת CSV + חנות נערכת-מהטלפון
+import discovery as discmod # גילוי רשתות: ולידציה/גריד/זיהוי-מועמדים/סיכום-בדיקה (טהור)
 import dsd_export           # ייצוא CSV/JSON (BOM ל-Excel)
 import dsd_pty              # build_command וכו', וגם send_gain_nudge (נוד-רווח חי דרך PTY)
 
@@ -62,6 +63,13 @@ DMR_BRIDGE_AUDIO_GAIN = 4.0
 DMR_BUF_MAX = 800                     # שיחות אחרונות בזיכרון (נטענות בעלייה, היום בלבד)
 DMR_LOG_PATH = Path("/var/lib/dmr/dmr.jsonl")
 DMR_LOG_KEEP = 8000                   # retention בדיסק (זנב נשמר; ייצוא לניתוח)
+
+# --- גילוי רשתות (frequency discovery) --------------------------------------
+# מצב 'discover': job חולף בזיכרון (לא מַתמיד ב-state) — סורק ספקטרום FFT (rsp_fm
+# במצב sweep), מזהה תדרים חשודים כ-DMR, ואז בודק כל מועמד עם DSD-FME. ר' CLAUDE.md §2.
+DISCOVERY_PATH = Path("/var/lib/dmr/discovery.json")   # דוח הגילוי האחרון
+DISCOVERY_SETTLE_SEC = 0.25           # המתנת התייצבות אחרי retune לפני קריאת ספקטרום
+DISCOVERY_SPECTRUM_TRIES = 8          # ניסיונות קריאת SPECTRUM לכל מרכז (עד שמתייצב)
 
 # מיפוי אלגוריתם הצפנה (ALG id → שם קריא). DSD-FME מדפיס hex; אנו ממפים בלבד,
 # לעולם *לא* מפענחים בלי מפתח. ערכים נפוצים (RadioReference / קהילת DSD-FME):
@@ -318,25 +326,39 @@ def write_channelmap(channelmap):
 def render_dmr_env(system):
     """בונה את תוכן dmr.env (EnvironmentFile של systemd, KEY=VALUE מנותח בבטחה).
     dsd_pty קורא את המשתנים ובונה מהם את שורת הפקודה של DSD-FME.
-    ⚠ DSD_CONTROL_FREQ ב-Hz (DSD-FME/rigctl); ה-state/UI עובדים ב-MHz — ההמרה כאן."""
+    ⚠ DSD_CONTROL_FREQ ב-Hz (DSD-FME/rigctl); ה-state/UI עובדים ב-MHz — ההמרה כאן.
+    שדות אופציונליים פר-מערכת: trunk (ברירת מחדל 1), sweep (מצב סריקת FFT),
+    emit_status (אירועי sync/channel_status לבדיקת גילוי), no_wav (בלי הקלטה)."""
     control_hz = int(round(float(system["control"]) * 1e6))
     cc = int(system.get("color_code", 1))
+    trunk = "1" if str(system.get("trunk", 1)).lower() in ("1", "true", "yes") else "0"
+    sweep = bool(system.get("sweep"))
+    iq_rate = int(system.get("iq_rate", DMR_BRIDGE_IQ_RATE))
     lines = [
-        '# נכתב אוטומטית ע"י DMR web (מעבר למצב DMR). שינויים ידניים נדרסים.',
+        '# נכתב אוטומטית ע"י DMR web (מעבר מצב). שינויים ידניים נדרסים.',
         f"# מערכת: {system.get('name', system.get('id', ''))}",
-        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — ערוץ הבקרה (CC) של Cap+
+        f"DSD_CONTROL_FREQ={control_hz}",   # Hz — ערוץ הבקרה (CC) של Cap+ / מרכז התחלתי בסריקה
         f"DSD_COLOR_CODE={cc}",
         f"DSD_CHANNELMAP={CHANNELMAP_PATH}",
         f"DSD_UDP={DMR_UDP_HOST}:{DMR_UDP_PORT}",   # יעד פיד ה-JSON (dsd_pty → app.py)
-        f"DSD_WAV_DIR={REC_DIR}",                    # per-call WAV לתיקיית ההקלטות
-        "DSD_TRUNK=1",                               # מעקב טראנקינג (Cap+)
+        f"DSD_TRUNK={trunk}",                        # מעקב טראנקינג (Cap+); 0 בבדיקת גילוי
         f"DSD_RTLTCP={DMR_BRIDGE_RTLTCP}",           # rsp_tcp — IQ גולמי מה-RSP1B
         f"DSD_AUDIO_TCP={DMR_BRIDGE_AUDIO_TCP}",     # rsp_fm.py — PCM 48kHz ל-DSD-FME
-        f"DSD_RIGCTL={DMR_BRIDGE_RIGCTL}",           # rsp_fm.py — rigctl לכיוונון טראנקינג
-        f"DSD_IQ_RATE={DMR_BRIDGE_IQ_RATE}",         # קצב IQ מבוקש מ-rsp_tcp (Hz)
+        f"DSD_RIGCTL={DMR_BRIDGE_RIGCTL}",           # rsp_fm.py — rigctl לכיוונון/סריקה
+        f"DSD_IQ_RATE={iq_rate}",                    # קצב IQ מבוקש מ-rsp_tcp (Hz; גבוה בסריקה)
         f"DSD_AUDIO_GAIN={DMR_BRIDGE_AUDIO_GAIN}",   # מכפיל רווח discriminator ב-rsp_fm.py
-        "",
     ]
+    if not sweep and not system.get("no_wav"):
+        lines.append(f"DSD_WAV_DIR={REC_DIR}")       # per-call WAV לתיקיית ההקלטות
+    if sweep:
+        lines += [
+            "DSD_SWEEP=1",                            # מצב סריקת FFT (בלי DSD-FME/demod)
+            f"DSD_SWEEP_NFFT={int(system.get('nfft', discmod.DEFAULT_NFFT))}",
+            f"DSD_SWEEP_GAIN={int(system.get('gain_index', discmod.DEFAULT_GAIN_INDEX))}",
+        ]
+    if system.get("emit_status"):
+        lines.append("DSD_EMIT_STATUS=1")            # אירועי sync/channel_status לגילוי
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -673,6 +695,9 @@ def _dmr_listener():
         if not isinstance(msg, dict):
             continue
 
+        if _discover_active:   # side-tap: מזין את צובר הגילוי (כולל sync/channel_status)
+            _discover_collect(msg)
+
         mtype = msg.get("type")
         if mtype == "quality":
             _rf_quality_tick(msg.get("error_type") or "UNKNOWN")
@@ -927,6 +952,250 @@ def _scan_activate(plan):
         _scan_thread, _scan_thread_stop = thread, stop_evt
     thread.start()
     return None, None
+
+
+# --- מצב גילוי (discover): סריקת ספקטרום + בדיקת מועמדים -------------------
+# job חולף בזיכרון (לא מַתמיד ב-state, לא משוחזר ב-boot). שלב1: rsp_fm במצב sweep;
+# app.py צועד את הגריד דרך rigctl F וקורא SPECTRUM (בלי TUNE_LOCK). שלב2: בודק כל
+# מועמד ב-DSD-FME (per-step TUNE_LOCK כמו scan). ר' CLAUDE.md §2 ו-discovery.py.
+_discover_lock = threading.Lock()
+_discover_thread = None
+_discover_thread_stop = None
+_discover_active = False        # דגל: api_state/health מדווחים discover; ה-listener מזין collector
+_discover_status = {"stage": "idle", "progress": 0.0, "current_mhz": None,
+                    "candidates": 0, "probed": 0, "results": []}
+_discover_report = None         # דוח אחרון (נשמר גם ל-DISCOVERY_PATH)
+_discover_acc_lock = threading.Lock()
+_discover_epoch = 0
+_discover_acc = []              # [(epoch, msg)] — אירועי UDP גולמיים בזמן בדיקת מועמד
+
+
+def _discover_collect(msg):
+    """side-tap טהור מ-_dmr_listener: כשגילוי פעיל, צובר את ה-msg הגולמי עם ה-epoch
+    הנוכחי (מזהה מועמד) — פריים מאחר לא ישויך למועמד הבא. *לא* נוגע ב-dedup/slot."""
+    with _discover_acc_lock:
+        _discover_acc.append((_discover_epoch, msg))
+        if len(_discover_acc) > 5000:
+            del _discover_acc[:len(_discover_acc) - 5000]
+
+
+def _discover_begin_probe():
+    """מתחיל epoch חדש לבדיקת מועמד ומנקה את הצובר. מחזיר את מספר ה-epoch."""
+    global _discover_epoch
+    with _discover_acc_lock:
+        _discover_epoch += 1
+        _discover_acc.clear()
+        return _discover_epoch
+
+
+def _discover_take_events(epoch):
+    with _discover_acc_lock:
+        return [m for (e, m) in _discover_acc if e == epoch]
+
+
+def _discovery_status_snapshot():
+    with _discover_lock:
+        return dict(_discover_status)
+
+
+def _probe_system(freq_mhz):
+    """מערכת חולפת (לא נשמרת) לבדיקת מועמד: non-trunk (trunk+map ריק מקריס את
+    המפקח), בלי הקלטה, עם emit_status (אירועי sync/channel_status לזיהוי)."""
+    return {"id": "__probe__", "name": "probe", "control": round(float(freq_mhz), 6),
+            "color_code": 0, "channelmap": [], "trunk": 0, "no_wav": True,
+            "emit_status": True}
+
+
+def _sweep_system(plan):
+    """מערכת חולפת לקונפיג-סריקה: sweep=1, קצב IQ רחב, מרכז התחלתי = תחילת הטווח."""
+    return {"id": "__sweep__", "name": "sweep", "control": round(plan["start_mhz"], 6),
+            "color_code": 0, "channelmap": [], "sweep": True,
+            "iq_rate": plan["iq_rate"], "nfft": plan["nfft"],
+            "gain_index": plan["gain_index"], "no_wav": True}
+
+
+def _rigctl_command(command, timeout=3.0):  # pragma: no cover - hardware runtime
+    """שולח פקודת rigctl אחת ל-rsp_fm וקורא שורת תגובה (F לכיוונון, SPECTRUM לספקטרום)."""
+    host, _sep, port = DMR_BRIDGE_RIGCTL.rpartition(":")
+    with socket.create_connection((host or "127.0.0.1", int(port)), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall((command + "\n").encode("ascii"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("utf-8", "replace").strip()
+
+
+def _sweep_read(center_hz):  # pragma: no cover - hardware runtime
+    """מכוונן את הסורק למרכז נתון (rigctl F) וקורא את הספקטרום הממוצע (SPECTRUM),
+    ממתין להתייצבות. מחזיר snapshot {center_hz, bin_hz, power_db} או None."""
+    try:
+        _rigctl_command(f"F {int(center_hz)}")
+    except OSError:
+        return None
+    for _ in range(DISCOVERY_SPECTRUM_TRIES):
+        time.sleep(DISCOVERY_SETTLE_SEC)
+        try:
+            snap = json.loads(_rigctl_command("SPECTRUM"))
+        except (OSError, ValueError):
+            continue
+        if snap.get("power_db") and abs(int(snap.get("center_hz", 0)) - int(center_hz)) < 2000:
+            return snap
+    return None
+
+
+def _save_discovery_report(report):
+    global _discover_report
+    _discover_report = report
+    try:
+        _atomic_write(DISCOVERY_PATH, json.dumps(report, ensure_ascii=False))
+    except Exception:
+        log.exception("discovery report save")
+
+
+def _load_discovery_report():
+    global _discover_report
+    if _discover_report is not None:
+        return _discover_report
+    try:
+        _discover_report = json.loads(DISCOVERY_PATH.read_text())
+    except Exception:
+        _discover_report = None
+    return _discover_report
+
+
+def _probe_candidate(stop_evt, cand, plan):
+    """בודק מועמד יחיד: retune ל-DSD-FME (per-step TUNE_LOCK), dwell עם איסוף
+    אירועי UDP דרך ה-collector, סיכום ל-aggregate_probe. מחזיר רשומה או None."""
+    freq_mhz = cand["freq_mhz"]
+    if not TUNE_LOCK.acquire(timeout=5):
+        return None
+    epoch = None
+    try:
+        err, _detail = _enter_dmr(_probe_system(freq_mhz))
+        if err:
+            log.warning("discover: probe %.4f MHz failed to tune: %s", freq_mhz, err)
+            return None
+        epoch = _discover_begin_probe()
+    finally:
+        TUNE_LOCK.release()
+    if epoch is None or stop_evt.is_set():
+        return None
+    waited = 0.0
+    while waited < plan["probe_sec"] and not stop_evt.is_set():
+        time.sleep(0.25)
+        waited += 0.25
+    events = _discover_take_events(epoch)
+    return discmod.aggregate_probe(freq_mhz, events, min_sync=plan["min_sync"])
+
+
+def _finish_discovery(plan, candidates, results):
+    """סוגר ריצת גילוי: שומר דוח, משחרר את ה-SDR (standby), state=off."""
+    report = {"t": time.time(), "plan": plan, "candidate_count": len(candidates),
+              "candidates": candidates,
+              "networks": [r for r in results if r.get("is_dmr")], "results": results}
+    _save_discovery_report(report)
+    if TUNE_LOCK.acquire(timeout=10):
+        try:
+            _enter_standby()
+        finally:
+            TUNE_LOCK.release()
+    save_state({**load_state(), "app_mode": "off", "prev_mode": "discover"})
+    with _discover_lock:
+        _discover_status.update(stage="done", current_mhz=None, progress=1.0,
+                                results=results)
+
+
+def _discover_loop(stop_evt, plan):
+    """thread הגילוי. שלב1: סריקת ספקטרום על הגריד (בלי TUNE_LOCK, בודק stop_evt
+    תדיר). שלב2: בדיקת כל מועמד (per-step TUNE_LOCK). בסיום: דוח + standby + off.
+    הלולאה עצמה נבדקת e2e (עם `_sweep_read`/`_probe_candidate` ממוקפים); רק הקריאות
+    לחומרה (`_rigctl_command`/`_sweep_read`) הן no-cover."""
+    global _discover_active
+    try:
+        grid = discmod.build_freq_grid(plan["start_mhz"], plan["end_mhz"], plan["iq_rate"])
+        snapshots = []
+        for i, center in enumerate(grid):
+            if stop_evt.is_set():
+                return
+            snap = _sweep_read(center)
+            if snap:
+                snapshots.append(snap)
+            with _discover_lock:
+                _discover_status.update(stage="sweep",
+                                        progress=round((i + 1) / (len(grid) + 1), 3),
+                                        current_mhz=round(center / 1e6, 4))
+        if stop_evt.is_set():
+            return
+        candidates = discmod.detect_candidates(
+            snapshots, threshold_mad=plan["threshold_mad"],
+            max_candidates=plan["max_candidates"])
+        with _discover_lock:
+            _discover_status.update(stage="probe", candidates=len(candidates),
+                                    current_mhz=None, progress=0.0)
+        results = []
+        for i, cand in enumerate(candidates):
+            if stop_evt.is_set():
+                return
+            record = _probe_candidate(stop_evt, cand, plan)
+            if record is not None:
+                record["power_db"] = cand.get("power_db")
+                results.append(record)
+            with _discover_lock:
+                _discover_status.update(
+                    progress=round((i + 1) / (len(candidates) or 1), 3),
+                    probed=i + 1, current_mhz=cand["freq_mhz"], results=list(results))
+        if stop_evt.is_set():
+            return
+        _finish_discovery(plan, candidates, results)
+    except Exception:
+        log.exception("discover loop crashed")
+        if TUNE_LOCK.acquire(timeout=5):
+            try:
+                _enter_standby()
+            finally:
+                TUNE_LOCK.release()
+    finally:
+        _discover_active = False
+
+
+def _discover_activate(plan):
+    """מפעיל גילוי: מרים קונפיג-סריקה (restart ל-sweep) ומתחיל thread. הקורא מחזיק
+    TUNE_LOCK. מחזיר (error, detail)."""
+    global _discover_thread, _discover_thread_stop, _discover_active
+    err, detail = _enter_dmr(_sweep_system(plan))
+    if err:
+        return err, detail
+    stop_evt = threading.Event()
+    thread = threading.Thread(target=_discover_loop, args=(stop_evt, plan), daemon=True)
+    with _discover_lock:
+        _discover_active = True
+        _discover_status.update(stage="sweep", progress=0.0, current_mhz=None,
+                                candidates=0, probed=0, results=[],
+                                started_at=time.time(), plan=plan)
+        _discover_thread, _discover_thread_stop = thread, stop_evt
+    thread.start()
+    return None, None
+
+
+def _discover_stop_thread():
+    """עוצר את thread הגילוי (אם רץ) ומחכה שיסיים. אין-אופ אם לא רץ. הקורא
+    (api_mode) מחזיק TUNE_LOCK — הצרכן ישוחרר מיד אחרי ע"י המעבר עצמו."""
+    global _discover_thread, _discover_thread_stop, _discover_active
+    with _discover_lock:
+        thread, stop_evt = _discover_thread, _discover_thread_stop
+        _discover_thread = _discover_thread_stop = None
+        if stop_evt:
+            stop_evt.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=15)
+    _discover_active = False
+    with _discover_lock:
+        if _discover_status.get("stage") not in ("idle", "done"):
+            _discover_status.update(stage="idle", current_mhz=None)
 
 
 # --- רוסטר רדיו-IDs / talkgroups מאוחד --------------------------------------
@@ -1305,6 +1574,13 @@ def root_asset(fname):
 @app.route("/api/state")
 def api_state():
     st = load_state()
+    if _discover_active:   # job חולף — לא מַתמיד ב-state; מדווח מהזיכרון בלבד
+        st["app_mode"] = "discover"
+        st["mode_ok"] = True
+        st["discover"] = _discovery_status_snapshot()
+        st.update(systems=load_systems(), version=VERSION,
+                  alg_names={f"0x{k:02X}": v for k, v in DMR_ALG_NAMES.items()})
+        return jsonify(st)
     live = _live_mode()
     saved = st.get("app_mode", "off")
     if saved == "scan":
@@ -1351,6 +1627,13 @@ def api_aliases():
 @app.route("/api/health")
 def api_health():
     """סטטוס המערכת — מאפשר ל-UI להבדיל בין "אין תעבורה" ל"משהו נפל"."""
+    if _discover_active:   # במהלך גילוי השירות פעיל (sweep/probe) — לא "dmr"
+        with _dmr_lock:
+            calls_today = len([m for m in _dmr_msgs if (m.get("t") or 0) >= _today_start()])
+            last_call = max((m.get("t") or 0 for m in _dmr_msgs), default=0) or None
+        return jsonify(ok=True, app_mode="discover", services={DMR_SERVICE: "active"},
+                       sdr_present=_sdr_present(), calls_today=calls_today,
+                       last_call_at=last_call, discover=_discovery_status_snapshot())
     services = {}
     for svc in ("sdrplay", DMR_SERVICE):
         try:
@@ -1498,19 +1781,24 @@ def api_mode():
     SDR אחד בהחלפה. כישלון כניסה => off (בלי fallback). POST => עובר דרך _guard."""
     data = request.get_json(silent=True) or {}
     mode = str(data.get("mode", "")).lower()
-    if mode not in ("dmr", "off", "scan"):
-        return jsonify(ok=False, error="mode לא תקין (dmr/off/scan)"), 400
+    if mode not in ("dmr", "off", "scan", "discover"):
+        return jsonify(ok=False, error="mode לא תקין (dmr/off/scan/discover)"), 400
 
     # ולידציה סטטית קודם (לא תלוית-נעילה) — בקשה עם פרמטרים לא-תקינים (400) לא
     # נוגעת בסבב סריקה פעיל (מניעת "scan זומבי"). _scan_stop_thread נקרא רק אחרי
     # שתפסנו את TUNE_LOCK.
     st = load_state()
-    plan = system = None
+    plan = system = sweep_plan = None
     if mode == "scan":
         plan = _validate_scan_plan(data.get("plan") or st.get("scan_plan"))
         if plan is None:
             return jsonify(ok=False, error="לוח סריקה לא תקין (1-8 רגלים, "
                            "כל רגל מערכת+זמן שהייה תקין)", state=st), 400
+    elif mode == "discover":
+        sweep_plan = discmod.validate_sweep_plan(data.get("plan") or {})
+        if sweep_plan is None:
+            return jsonify(ok=False, error="טווח סריקה לא תקין (start<end, בתחום "
+                           "24–1300MHz, רוחב עד 100MHz)", state=st), 400
     elif mode == "dmr":
         sid = data.get("system") or st.get("system")
         systems = load_systems()
@@ -1523,6 +1811,7 @@ def api_mode():
                        state=load_state()), 409
     try:
         _scan_stop_thread()
+        _discover_stop_thread()
         st = load_state()
         if mode == "off":
             log.info("mode -> OFF (standby) (from %s)", request.remote_addr)
@@ -1543,6 +1832,18 @@ def api_mode():
             new_state = {**st, "app_mode": "scan", "scan_plan": plan}
             save_state(new_state)
             return jsonify(ok=True, app_mode="scan", scan_plan=plan)
+
+        if mode == "discover":
+            # ⚠ מצב חולף — לא נשמר ל-state (לא משוחזר ב-boot). ההתקדמות בזיכרון
+            # בלבד דרך _discover_status; api_state/health מדווחים discover כל עוד
+            # _discover_active. בסיום הריצה => standby + app_mode=off.
+            log.info("mode -> DISCOVER %s-%s MHz (from %s)",
+                     sweep_plan["start_mhz"], sweep_plan["end_mhz"], request.remote_addr)
+            err, detail = _discover_activate(sweep_plan)
+            if err:
+                payload, status = _fail_to_off(st, err, detail, "enter discover")
+                return jsonify(payload), status
+            return jsonify(ok=True, app_mode="discover", plan=sweep_plan)
 
         # mode == "dmr"
         log.info("mode -> DMR system=%s (from %s)", system["id"], request.remote_addr)
@@ -1565,6 +1866,51 @@ def api_scan():
         status = dict(_scan_status)
         active = _scan_thread is not None and _scan_thread.is_alive()
     return jsonify(ok=True, active=active, **status)
+
+
+@app.route("/api/discover")
+def api_discover():
+    """סטטוס גילוי חי (שלב, התקדמות, תדר נוכחי, מועמדים/תוצאות) + הדוח האחרון."""
+    with _discover_lock:
+        status = dict(_discover_status)
+        active = _discover_thread is not None and _discover_thread.is_alive()
+    return jsonify(ok=True, active=active, status=status, report=_load_discovery_report())
+
+
+@app.route("/api/discover/save", methods=["POST"])
+def api_discover_save():
+    """שומר רשת מגולה כמערכת DMR (מיזוג ל-systems.json דרך _validate_systems).
+    בוחר רשומה לפי freq_mhz או index מהדוח. דרך _guard (POST)."""
+    data = request.get_json(silent=True) or {}
+    report = _load_discovery_report()
+    if not report:
+        return jsonify(ok=False, error="אין דוח גילוי זמין"), 400
+    records = report.get("results") or []
+    rec = None
+    if data.get("freq_mhz") is not None:
+        try:
+            target = round(float(data["freq_mhz"]), 6)
+        except (TypeError, ValueError):
+            target = None
+        if target is not None:
+            rec = next((r for r in records
+                        if abs(float(r.get("freq_mhz", 0)) - target) < 1e-4), None)
+    elif data.get("index") is not None:
+        try:
+            rec = records[int(data["index"])]
+        except (TypeError, ValueError, IndexError):
+            rec = None
+    if rec is None:
+        return jsonify(ok=False, error="רשומת גילוי לא נמצאה"), 400
+    system = discmod.discovery_to_system(rec, name=data.get("name"))
+    systems = [s for s in load_systems() if s["id"] != system["id"]] + [system]
+    ok, cleaned = _validate_systems(systems)
+    if not ok:
+        return jsonify(ok=False, error="מערכת מגולה לא עברה ולידציה (אולי חריגה מ-30 מערכות)"), 400
+    _atomic_write(SYSTEMS_PATH, json.dumps(cleaned, ensure_ascii=False))
+    log.info("discovery: saved system %s (%.4f MHz, from %s)",
+             system["id"], system["control"], request.remote_addr)
+    return jsonify(ok=True, system=system, systems=cleaned)
 
 
 # --- שחזור מצב באתחול: dmr-web הוא המתזמר -----------------------------------

@@ -60,6 +60,62 @@ def design_lowpass(sample_rate: int, cutoff_hz: float, taps: int = 121) -> np.nd
     return coefficients.astype(np.float32)
 
 
+def compute_power_spectrum(iq, nfft: int) -> Optional[np.ndarray]:
+    """Averaged power spectrum of complex IQ, in dBFS, fftshifted.
+
+    Pure/testable: splits `iq` into consecutive `nfft`-sample frames, applies a
+    Hann window (rectangular leaks strong carriers into neighbours), averages
+    |FFT|^2 across frames (Welch, to knock down variance), and normalises so a
+    full-scale complex tone reads ~0 dBFS. Index 0 is -Fs/2, the centre bin is
+    DC. Returns None when there is not even one full frame. The scale is
+    relative (rsp_tcp only offers 8-bit, gain-limited IQ) -- callers must use an
+    adaptive, noise-floor-relative threshold, never a fixed dBFS constant.
+    """
+    iq = np.asarray(iq, dtype=np.complex64)
+    if nfft < 2 or iq.size < nfft:
+        return None
+    frames = iq.size // nfft
+    window = np.hanning(nfft).astype(np.float64)
+    coherent_gain = float(np.sum(window))  # full-scale tone -> this peak magnitude
+    accum = np.zeros(nfft, dtype=np.float64)
+    for i in range(frames):
+        block = iq[i * nfft:(i + 1) * nfft].astype(np.complex128) * window
+        spectrum = np.fft.fftshift(np.fft.fft(block))
+        accum += np.abs(spectrum) ** 2
+    accum /= frames
+    power_db = 10.0 * np.log10(accum / (coherent_gain ** 2) + 1e-20)
+    return power_db.astype(np.float32)
+
+
+class SpectrumState:
+    """Latest averaged power spectrum for the current tune, shared between the
+    sweep IQ loop (writer) and the rigctl `SPECTRUM` reader thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.center_hz = 0
+        self.bin_hz = 0.0
+        self.power_db: Optional[list] = None
+
+    def update(self, center_hz: int, bin_hz: float, power_db: list) -> None:
+        with self._lock:
+            self.center_hz = int(center_hz)
+            self.bin_hz = float(bin_hz)
+            self.power_db = power_db
+
+    def clear(self) -> None:
+        with self._lock:
+            self.power_db = None
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "center_hz": self.center_hz,
+                "bin_hz": self.bin_hz,
+                "power_db": list(self.power_db) if self.power_db is not None else None,
+            }
+
+
 class NfmDemodulator:
     """Stateful u8 IQ -> signed 16-bit, 48 kHz mono NFM demodulator."""
 
@@ -210,11 +266,17 @@ class RtlTcpClient:
         with self._state_lock:
             return self.frequency
 
-    def nudge_gain(self, direction: int) -> None:
-        self.gain_index = max(0, min(28, self.gain_index + direction))
+    def set_fixed_gain(self, index: int) -> None:
+        """Force manual gain to a fixed index (disables AGC). The sweep needs a
+        stable gain across retunes so power bins are comparable hop-to-hop; with
+        AGC on, each hop settles differently and the map is meaningless."""
+        self.gain_index = max(0, min(28, int(index)))
         self.send_command(RTL_CMD_SET_GAIN_MODE, 1)
         self.send_command(RTL_CMD_SET_GAIN_BY_INDEX, self.gain_index)
         _log(f"manual gain index {self.gain_index}/28")
+
+    def nudge_gain(self, direction: int) -> None:
+        self.set_fixed_gain(self.gain_index + direction)
 
     def recv(self, size: int) -> bytes:
         if self.sock is None:
@@ -346,10 +408,12 @@ class AudioSender:
 
 
 class RigctlServer:
-    def __init__(self, host: str, port: int, tuner: RtlTcpClient) -> None:
+    def __init__(self, host: str, port: int, tuner: RtlTcpClient,
+                 spectrum: "Optional[SpectrumState]" = None) -> None:
         self.host = host
         self.port = port
         self.tuner = tuner
+        self.spectrum = spectrum
         self.listener: Optional[socket.socket] = None
         self.stop_event = threading.Event()
 
@@ -401,6 +465,14 @@ class RigctlServer:
         if verb == "F" and len(parts) >= 2:
             self.tuner.set_frequency(int(parts[1]))
             return "RPRT 0\n"
+        # Discovery sweep extension: the frequency-discovery loop in app.py is
+        # the only client during a sweep (DSD-FME is not running), so a custom
+        # SPECTRUM verb on the same rigctl connection returns the current
+        # averaged power spectrum as one JSON line. Harmless in decode mode --
+        # DSD-FME never sends it.
+        if verb == "SPECTRUM" and self.spectrum is not None:
+            import json
+            return json.dumps(self.spectrum.snapshot()) + "\n"
         if verb == "M":
             return "RPRT 0\n"
         if verb == "m":
@@ -475,6 +547,10 @@ class BridgeConfig:
     iq_rate: int
     audio_rate: int
     audio_gain: float
+    sweep: bool = False
+    nfft: int = 2048
+    sweep_frames: int = 64
+    gain_index: int = 14
 
 
 def run(config: BridgeConfig) -> int:
@@ -536,6 +612,66 @@ def run(config: BridgeConfig) -> int:
     return 0
 
 
+def run_sweep(config: BridgeConfig) -> int:  # pragma: no cover - hardware runtime
+    """Frequency-discovery sweep: hold the SDR, force fixed gain, and publish an
+    averaged power spectrum for the current centre over the rigctl SPECTRUM verb.
+    The NFM demod / audio path is skipped entirely -- only the FFT is needed.
+    app.py drives the frequency grid via rigctl `F` and reads each `SPECTRUM`."""
+    tuner = RtlTcpClient(config.rtl_host, config.rtl_port,
+                         config.frequency, config.iq_rate)
+    spectrum = SpectrumState()
+    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, tuner,
+                          spectrum=spectrum)
+    stop_event = threading.Event()
+
+    def stop(_signum=None, _frame=None) -> None:
+        stop_event.set()
+        tuner.close()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    nfft = max(2, int(config.nfft))
+    frames_per_avg = max(1, int(config.sweep_frames))
+    bytes_needed = nfft * frames_per_avg * 2
+    bin_hz = config.iq_rate / float(nfft)
+    try:
+        tuner.connect()
+        tuner.set_fixed_gain(config.gain_index)
+        rigctl.start()
+        buffer = bytearray()
+        generation = tuner.generation
+        while not stop_event.is_set():
+            data = tuner.recv(max(4096, bytes_needed - len(buffer)))
+            if not data:
+                raise ConnectionError("rsp_tcp closed the IQ connection")
+            if tuner.generation != generation:
+                # A retune happened: drop samples straddling the boundary and
+                # blank the published spectrum so app.py never reads stale bins.
+                generation = tuner.generation
+                buffer.clear()
+                spectrum.clear()
+                continue
+            buffer.extend(data)
+            while len(buffer) >= bytes_needed:
+                block = bytes(buffer[:bytes_needed])
+                del buffer[:bytes_needed]
+                values = np.frombuffer(block, dtype=np.uint8)
+                floats = (values.astype(np.float32) - 127.5) / 128.0
+                iq = floats[0::2] + 1j * floats[1::2]
+                power_db = compute_power_spectrum(iq, nfft)
+                if power_db is not None:
+                    spectrum.update(tuner.get_frequency(), bin_hz, power_db.tolist())
+    except (OSError, RuntimeError, ConnectionError, ValueError) as error:
+        if not stop_event.is_set():
+            _log(f"sweep fatal: {error}")
+            return 1
+        return 0
+    finally:
+        rigctl.close()
+        tuner.close()
+    return 0
+
+
 def parse_endpoint(value: str) -> tuple[str, int]:
     host, separator, port = value.rpartition(":")
     if not separator:
@@ -553,11 +689,16 @@ def main() -> int:
     parser.add_argument("--iq-rate", type=int, default=DEFAULT_IQ_RATE)
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-gain", type=float, default=4.0)
+    parser.add_argument("--sweep", action="store_true",
+                        help="frequency-discovery sweep mode (FFT power, no demod)")
+    parser.add_argument("--nfft", type=int, default=2048)
+    parser.add_argument("--sweep-frames", type=int, default=64)
+    parser.add_argument("--gain-index", type=int, default=14)
     args = parser.parse_args()
     rtl_host, rtl_port = parse_endpoint(args.rtl)
     audio_host, audio_port = parse_endpoint(args.audio)
     rigctl_host, rigctl_port = parse_endpoint(args.rigctl)
-    return run(BridgeConfig(
+    config = BridgeConfig(
         rtl_host=rtl_host,
         rtl_port=rtl_port,
         audio_host=audio_host,
@@ -569,7 +710,12 @@ def main() -> int:
         iq_rate=args.iq_rate,
         audio_rate=args.audio_rate,
         audio_gain=args.audio_gain,
-    ))
+        sweep=args.sweep,
+        nfft=args.nfft,
+        sweep_frames=args.sweep_frames,
+        gain_index=args.gain_index,
+    )
+    return run_sweep(config) if args.sweep else run(config)
 
 
 if __name__ == "__main__":

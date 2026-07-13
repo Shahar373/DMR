@@ -94,10 +94,12 @@ webtune/
   rsp_fm.py                 # ★ הגשר: IQ (מ-rsp_tcp) → דמודולציית NFM ל-PCM 48kHz + שרת
                             #   rigctl לכיוונון טראנקינג. NumPy. ר' §2/§8.
   aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
+  discovery.py              # ★ גילוי רשתות (טהור): ולידציית טווח, גריד, זיהוי מועמדים
+                            #   (סף אדפטיבי FFT), סיכום בדיקה, רשומה→מערכת. ר' §5/§10.
   dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
   static/
-    index.html              # ה-UI כולו (HTML+CSS+JS inline). PWA. 3 תצוגות: 🏠 בית +
-                            #   📻 שיחות + 📊 ניתוח (הצפנה/תעבורה/גרף RID↔TG/מפת LRRP).
+    index.html              # ה-UI כולו (HTML+CSS+JS inline). PWA. 4 תצוגות: 🏠 בית +
+                            #   📻 שיחות + 📊 ניתוח (הצפנה/תעבורה/גרף/LRRP) + 🔎 גילוי.
     manifest.webmanifest · sw.js · icon-*.png · apple-touch-icon.png
     vendor/leaflet/         # Leaflet vendored (למפת LRRP ב-Phase 3; בלי CDN).
 
@@ -112,7 +114,7 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 107 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
 .github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
 ```
@@ -131,6 +133,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 107 ב
 | `/var/lib/dmr/state.json` | מצב אחרון (app_mode: dmr/off/scan, system, scan_plan) | app.py |
 | `/var/lib/dmr/systems.json` | מערכות DMR (נערכות מה-UI) | app.py |
 | `/var/lib/dmr/aliases.json` | עריכות אליאס ידניות | aliases.py |
+| `/var/lib/dmr/discovery.json` | דוח הגילוי האחרון (מועמדים + רשתות שהתגלו) | _discover_loop |
 | `/var/lib/dmr/dmr.jsonl` | היסטוריית שיחות (retention 8000) | _dmr_listener |
 | `/var/lib/dmr/activity.jsonl` | יומן הקלטות | _activity_watcher |
 | `/var/lib/dmr/recordings/` | per-call WAV (400 קבצים / 400MB) | DSD-FME, נמחק ע"י app.py |
@@ -180,6 +183,15 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 107 ב
 - **scan (סבב בין מערכות):** `_validate_scan_plan` (רגל = `{system, dwell_sec, active_from?,
   active_to?}`), `_leg_active_now`, `_scan_enter_leg`, `_scan_loop`/`_scan_activate`/
   `_scan_stop_thread` — thread שמסתובב, נועל TUNE_LOCK רק במעבר; כשל-כל-הרגלים ⇒ off.
+- **גילוי (discover, Phase 6):** מצב חולף בזיכרון (**לא** מַתמיד ב-state, לא משוחזר
+  ב-boot). `_discover_activate` (מרים קונפיג-sweep, מחזיק TUNE_LOCK ל-bring-up),
+  `_discover_loop` (שלב1: `discmod.build_freq_grid`→`_sweep_read` דרך rigctl F+SPECTRUM,
+  **בלי** TUNE_LOCK; שלב2: `_probe_candidate` per-מועמד עם TUNE_LOCK per-step כמו scan,
+  `_enter_dmr(_probe_system)` non-trunk), `_discover_stop_thread`, `_finish_discovery`
+  (דוח→`discovery.json`+standby+off). `_discover_collect` = side-tap ב-`_dmr_listener`
+  (מתויג-epoch, לא נוגע ב-dedup). `_discover_active` נבדק **ראשון** ב-`api_state`/
+  `api_health`. הלוגיקה הטהורה ב-`discovery.py`; שרשרת האותות (`_sweep_read`/rsp_fm
+  sweep) `pragma: no cover` (חומרה). ר' §8 ו-§10 Phase 6.
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
   TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
 - **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
@@ -203,8 +215,10 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 107 ב
 | GET/PUT | `/api/systems` | מערכות DMR (עריכה על הסט המלא) |
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
-| POST | `/api/mode` | **מעבר מצב** dmr/off/scan. דרך `_guard`. כישלון ⇒ off + 500 |
+| POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
+| GET | `/api/discover` | סטטוס גילוי חי (שלב/התקדמות/מועמדים) + הדוח האחרון |
+| POST | `/api/discover/save` | שומר רשת מגולה כמערכת (מיזוג ל-systems דרך `_validate_systems`) |
 | GET | `/api/dmr` | שיחות (היום; `?all=1`; `?day=YYYY-MM-DD` ארכיון; `?since=` cursor) |
 | GET | `/api/dmr/export?format=csv\|json` | ייצוא (CSV עם BOM) |
 | GET | `/api/roster` (·`/api/aircraft`) | רוסטר RID/TG מאוחד — חי בכל מצב |
@@ -226,7 +240,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 107 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (107 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (140 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -243,8 +257,10 @@ argv טהור של `build_command`/`build_rsp_tcp_command`/`build_bridge_command
 (הגשר IQ→PCM: דמודולטור, DC-blocker stateful, timeout על `RtlTcpClient`, `AudioSender`,
 `RigctlServer`), `test_mode`, `test_boot`, `test_scan`, `test_aliases`, `test_recordings`,
 `test_security`, `test_archive`, `test_analytics` (הצפנה/תעבורה/גרף/LRRP), `test_rf_gain`
-(שכבת ה-HTTP של `/api/rf`/`/api/gain`). **הוסף בדיקה לכל שינוי backend.**
-CI: pytest (Python 3.11, כולל NumPy) + `bash -n`.
+(שכבת ה-HTTP של `/api/rf`/`/api/gain`), `test_discovery` (גילוי: `validate_sweep_plan`/
+`build_freq_grid`/`detect_candidates`/`aggregate_probe`/`discovery_to_system` הטהורים +
+שכבת Flask `/api/discover[/save]` + `_discover_loop` e2e ממוקף + collector-via-listener).
+**הוסף בדיקה לכל שינוי backend.** CI: pytest (Python 3.11, כולל NumPy) + `bash -n`.
 
 **UI (`static/index.html`) — ללא סוויטת בדיקות (כמו AIR-AM: אין build step, אין JS
 tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-`<script>` + הרצת השרת
@@ -293,6 +309,19 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   שלא יישארו יתומים אם המפקח עצמו נופל (למשל OOM-kill) — בלעדי זה, תהליך יתום ממשיך
   להחזיק את ה-SDR/פורטים והריצה הבאה (`Restart=always`) נכשלת באותה צורה. אל תפצל
   ל-unit נפרד בלי לעדכן את `_enter_standby`.
+- **⚠ גילוי-אנרגיה = קוד sweep תלוי-חומרה; מיפוי LCN↔תדר לא ניתן לגילוי מלא:**
+  מצב `discover` מוסיף מצב sweep ל-`rsp_fm.py`/`dsd_pty.py` (FFT על ה-IQ הגולמי,
+  gain ידני קבוע, verb `SPECTRUM` ב-rigctl) + לקוח rigctl/spectrum ב-`app.py` —
+  כל אלה `pragma: no cover`, מתאמתים רק על RSP1B אמיתי (כמו הגשר של v0.4.0). רק
+  `discovery.py` (טהור) + `compute_power_spectrum` + שינויי ה-parser נבדקים ב-CI.
+  **הסף בזיהוי מועמדים הוא יחסי בלבד** (median+k·MAD עם מרווח-מינימום מעל רצפת
+  הרעש) — לעולם לא dBFS מוחלט (rsp_tcp נותן dBFS יחסי בלבד). **מיפוי LCN↔תדר מלא
+  אינו בר-גילוי אוטומטי:** Cap+ משדר LSN לוגי (לא תדר), ו-SDR יחיד לא יכול לצפות
+  בבקרה ובקול בו-זמנית — הדוח נותן תדר-בקרה+CC+LSN-ים-שנצפו; מפת הערוצים המלאה ידנית.
+- **⚠ אירועי `sync`/`channel_status` ב-`parse_dsd_line` הם opt-in (`emit_status`):**
+  ברירת המחדל (dmr/scan רגיל) משאירה אותם `None` — שומר על "סינון housekeeping
+  במקור" (§2) ועל ה-fixture replay (68/68). רק בדיקת גילוי (`_probe_system` מגדיר
+  `DSD_EMIT_STATUS=1`) מפעילה אותם. שורת sync **עם שגיאה** נשארת `quality` (קדימות).
 - **⚠ `render_dmr_env`/`write_dmr_env` דורסים את `/etc/dmr/dmr.env` בכל מעבר מצב:**
   כל מפתח env שהגשר (`rsp_tcp`/`rsp_fm.py`) צריך (`DSD_RTLTCP`/`DSD_AUDIO_TCP`/
   `DSD_RIGCTL`/`DSD_IQ_RATE`/`DSD_AUDIO_GAIN`) **חייב** להופיע כקבוע קשיח בתוך
@@ -351,6 +380,16 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   ב-cgroup, ו-DSD-FME מתחבר בהצלחה ל-audio socket ("TCP Connection Success!")
   ומתחיל תהליך פענוח/טראנקינג. איכות הפענוח בפועל מול תעבורה חיה (נעילה על
   ערוץ בקרה, המשך שיחות) ממשיכה להיבדק בשטח.
+- **Phase 6 (v0.5.0, הושלם — CI ירוק; שרשרת הסריקה טרם אומתה על חומרה):** גילוי
+  רשתות (frequency discovery) — מצב `discover` שסורק טווח RF (סריקת ספקטרום FFT
+  ב-`rsp_fm.py` מצב sweep, צעד דרך rigctl F, קריאת `SPECTRUM`), מזהה תדרים חשודים
+  כ-DMR (`discovery.detect_candidates`, סף אדפטיבי), ובודק כל מועמד עם DSD-FME
+  (`_probe_candidate`, non-trunk) לגילוי תדר-בקרה/CC/סוג-ערוץ/LSN/TG. נוסף:
+  `webtune/discovery.py` (טהור), `compute_power_spectrum`, אירועי `sync`/
+  `channel_status` opt-in ב-`parse_dsd_line`, נקודות `/api/discover[/save]`, תצוגת
+  "🔎 גילוי" עם "שמור כמערכת". **מיפוי LCN↔תדר best-effort/ידני** (Cap+ = LSN לוגי,
+  SDR יחיד; ר' §8). הלוגיקה הטהורה + Flask נבדקים ב-CI (140 בדיקות); מצב ה-sweep
+  ולקוח ה-rigctl/spectrum הם `pragma: no cover` — לאימות על Pi 5 + RSP1B.
 - **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
   קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
 - **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —

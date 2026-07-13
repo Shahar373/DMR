@@ -156,3 +156,59 @@ def test_audio_server_accepts_replacement_clients():
         first.close()
         second.close()
         server.close()
+
+
+def test_compute_power_spectrum_peak_and_floor():
+    """טון full-scale מרוכב => peak ~0 dBFS בבין הצפוי, רצפת רעש נמוכה."""
+    nfft = 256
+    k = nfft // 4                       # תדר +Fs/4
+    n = np.arange(nfft * 8)
+    tone = np.exp(2j * np.pi * (k / nfft) * n).astype(np.complex64)
+    power = rsp_fm.compute_power_spectrum(tone, nfft)
+    assert power.shape[0] == nfft
+    assert int(np.argmax(power)) == nfft // 2 + k     # fftshift => מרכז=DC
+    assert abs(float(power.max())) < 1.0              # ~0 dBFS
+    assert float(np.median(power)) < -60.0            # רצפה נמוכה מהשיא
+
+
+def test_compute_power_spectrum_none_when_short():
+    assert rsp_fm.compute_power_spectrum(np.zeros(10, dtype=np.complex64), 256) is None
+
+
+def test_compute_power_spectrum_u8_quantized():
+    """אחרי קוונטיזציה ל-u8 (כמו rsp_tcp) ה-peak עדיין בבין הנכון."""
+    nfft = 256
+    k = -nfft // 8
+    n = np.arange(nfft * 4)
+    tone = np.exp(2j * np.pi * (k / nfft) * n)
+    u8 = np.empty(tone.size * 2, dtype=np.uint8)
+    u8[0::2] = np.clip(np.real(tone) * 127 + 127.5, 0, 255)
+    u8[1::2] = np.clip(np.imag(tone) * 127 + 127.5, 0, 255)
+    floats = (u8.astype(np.float32) - 127.5) / 128.0
+    iq = floats[0::2] + 1j * floats[1::2]
+    power = rsp_fm.compute_power_spectrum(iq, nfft)
+    assert int(np.argmax(power)) == nfft // 2 + k
+
+
+def test_set_fixed_gain_sends_manual_mode(monkeypatch):
+    sent = []
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: sent.append((cmd, val)))
+    tuner.set_fixed_gain(20)
+    assert (rsp_fm.RTL_CMD_SET_GAIN_MODE, 1) in sent
+    assert (rsp_fm.RTL_CMD_SET_GAIN_BY_INDEX, 20) in sent
+    assert tuner.gain_index == 20
+    tuner.set_fixed_gain(999)               # נחתך ל-28
+    assert tuner.gain_index == 28
+
+
+def test_rigctl_spectrum_verb():
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    spectrum = rsp_fm.SpectrumState()
+    spectrum.update(461_000_000, 976.5, [-100.0, -50.0, -110.0])
+    server = rsp_fm.RigctlServer("127.0.0.1", 0, tuner, spectrum=spectrum)
+    import json
+    resp = json.loads(server.handle_command("SPECTRUM"))
+    assert resp["center_hz"] == 461_000_000 and resp["power_db"][1] == -50.0
+    # בלי spectrum => לא נתמך
+    assert rsp_fm.RigctlServer("127.0.0.1", 0, tuner).handle_command("SPECTRUM") == "RPRT 1\n"

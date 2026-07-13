@@ -143,6 +143,7 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     <button data-v="home" class="on">🏠 בית</button>
     <button data-v="calls">📻 שיחות</button>
     <button data-v="analytics">📊 ניתוח</button>
+    <button data-v="discovery">🔎 גילוי</button>
   </div>
 </div>
 
@@ -326,6 +327,56 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       <div class="muted" id="lrrpNote" style="margin-top:6px">מוצג רק כשהרשת שולחת LRRP סטנדרטי (לא Motorola proprietary).</div>
     </div>
   </div>
+
+  <!-- ============ DISCOVERY (Phase 6) ============ -->
+  <div id="discoveryView" class="hidden">
+    <div class="card">
+      <h2>🔎 גילוי רשתות DMR</h2>
+      <div class="muted" style="margin-bottom:var(--sp-3)">
+        סורק את הטווח (סריקת ספקטרום FFT), מזהה תדרים חשודים כ-DMR, ואז בודק כל
+        מועמד ומגלה color code, סוג ערוץ, LSN-ים ו-TG-ים פעילים. תופס את ה-SDR
+        לכל משך הריצה — אפשר לעצור בכל רגע.
+      </div>
+      <div class="row">
+        <div style="width:150px">
+          <label>מתדר (MHz)</label>
+          <input class="mono" id="discStart" inputmode="decimal" value="450">
+        </div>
+        <div style="width:150px">
+          <label>עד תדר (MHz)</label>
+          <input class="mono" id="discEnd" inputmode="decimal" value="470">
+        </div>
+        <div style="width:140px">
+          <label>בדיקה/מועמד (ש')</label>
+          <input class="mono" id="discProbe" inputmode="numeric" value="6">
+        </div>
+      </div>
+      <div class="row" style="margin-top:var(--sp-3)">
+        <button class="btn" id="discStartBtn">▶ התחל גילוי</button>
+        <button class="btn danger hidden" id="discStopBtn">■ עצור</button>
+        <span class="muted" id="discMsg"></span>
+      </div>
+      <div id="discProgress" class="hidden" style="margin-top:var(--sp-3)">
+        <div class="row" style="justify-content:space-between">
+          <span class="muted" id="discStage">…</span>
+          <span class="muted mono" id="discPct"></span>
+        </div>
+        <div style="height:8px;background:var(--panel-2);border-radius:4px;overflow:hidden;margin-top:6px">
+          <div id="discBar" style="height:100%;width:0;background:var(--accent);transition:width .3s"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>רשתות שהתגלו <span class="count" id="discCount"></span></h2>
+      <div id="discResults"><div class="muted">עדיין לא בוצע גילוי. הגדר טווח ולחץ "התחל גילוי".</div></div>
+      <div class="muted" style="margin-top:var(--sp-3);font-size:12px">
+        ⚠ מיפוי הערוצים (LCN↔תדר) מתגלה חלקית בלבד — Cap+ משדר ערוץ לוגי (LSN), לא
+        תדר, ו-SDR יחיד לא יכול לצפות בבקרה ובקול בו-זמנית. "שמור כמערכת" יוצר
+        מערכת עם תדר הבקרה ו-CC; השלם את מפת הערוצים ידנית במסך הבית.
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -341,8 +392,10 @@ function showView(v){
   $("homeView").classList.toggle("hidden", v!=="home");
   $("callsView").classList.toggle("hidden", v!=="calls");
   $("analyticsView").classList.toggle("hidden", v!=="analytics");
+  $("discoveryView").classList.toggle("hidden", v!=="discovery");
   document.querySelectorAll("#seg button").forEach(b=>b.classList.toggle("on", b.dataset.v===v));
   if(v==="analytics") pollAnalytics();
+  if(v==="discovery") pollDiscover();
   if(v==="calls"){ renderFeed(); pollFeed(); }   // אל תמתין לטיק polling הבא (feedMsgs עשוי כבר להיות מלא)
 }
 $("seg").addEventListener("click", e=>{ if(e.target.dataset.v) showView(e.target.dataset.v); });
@@ -381,7 +434,7 @@ async function refreshState(){
   $("ver").textContent = "v"+(r.body.version||"");
   renderHome(); renderSystems(); renderScanEditor();
 }
-function modeLabel(m){ return {dmr:"📻 DMR פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה"}[m]||m; }
+function modeLabel(m){ return {dmr:"📻 DMR פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה", discover:"🔎 גילוי רשתות"}[m]||m; }
 function renderHome(){
   const m = STATE.app_mode||"off";
   $("homeState").textContent = modeLabel(m);
@@ -455,6 +508,70 @@ function renderScanEditor(){
   });
 }
 $("scanAdd").onclick=()=>{ if(SYSTEMS[0]) scanLegs.push({system:SYSTEMS[0].id,dwell_sec:120}); renderScanEditor(); };
+
+// ---------- discovery (Phase 6) ----------
+const CHAN_TYPE = {control:"ערוץ בקרה", voice:"ערוץ קול", conventional:"קונבנציונלי"};
+$("discStartBtn").onclick = async ()=>{
+  const plan = {
+    start_mhz: parseFloat($("discStart").value),
+    end_mhz: parseFloat($("discEnd").value),
+    probe_sec: parseInt($("discProbe").value)||6,
+  };
+  $("discMsg").textContent = "מתחיל…";
+  const r = await post("/api/mode", {mode:"discover", plan});
+  if(!r.ok || r.body.ok===false){ $("discMsg").textContent = "שגיאה: "+(r.body.error||""); return; }
+  $("discMsg").textContent = "";
+  pollDiscover();
+};
+$("discStopBtn").onclick = async ()=>{ await post("/api/mode",{mode:"off"}); pollDiscover(); };
+
+async function pollDiscover(){
+  if(appView!=="discovery") return;
+  const r = await api("/api/discover"); if(!r.ok) return;
+  const active = r.body.active, st = r.body.status||{}, report = r.body.report;
+  $("discStopBtn").classList.toggle("hidden", !active);
+  $("discStartBtn").classList.toggle("hidden", active);
+  $("discProgress").classList.toggle("hidden", !active && st.stage!=="done");
+  if(active || st.stage==="done"){
+    const stageTxt = {sweep:"סורק ספקטרום…", probe:"בודק מועמדים…", done:"הסתיים", idle:""}[st.stage]||st.stage||"";
+    $("discStage").textContent = stageTxt + (st.current_mhz?` · ${st.current_mhz} MHz`:"") +
+      (st.stage==="probe"?` · ${st.probed||0}/${st.candidates||0}`:"");
+    const pct = Math.round((st.progress||0)*100);
+    $("discPct").textContent = pct+"%"; $("discBar").style.width = pct+"%";
+  }
+  renderDiscoverResults(active ? {results: st.results||[]} : report);
+}
+
+function renderDiscoverResults(report){
+  const results = (report && report.results) || [];
+  const nets = results.filter(x=>x.is_dmr);
+  $("discCount").textContent = nets.length?`(${nets.length})`:"";
+  if(!results.length){ $("discResults").innerHTML = `<div class="muted">עדיין אין תוצאות.</div>`; return; }
+  $("discResults").innerHTML = results.map(x=>{
+    const conf = Math.round((x.confidence||0)*100);
+    const badge = x.is_dmr ? `<span class="tag" style="background:var(--st-good);color:#fff">DMR</span>`
+                           : `<span class="tag muted">לא DMR</span>`;
+    const ct = CHAN_TYPE[x.channel_type]||"";
+    const cc = (x.cc!=null)?`CC ${x.cc}`:"CC ?";
+    const tgs = (x.talkgroups&&x.talkgroups.length)?` · TG: ${esc(x.talkgroups.slice(0,8).join(", "))}`:"";
+    const lsns = (x.rest_lsns&&x.rest_lsns.length)?` · LSN: ${esc(x.rest_lsns.join(", "))}`:"";
+    const enc = x.encrypted?' <span class="tag enc">🔒</span>':"";
+    const save = x.is_dmr ? `<button class="btn ghost" data-savefreq="${esc(x.freq_mhz)}">שמור כמערכת</button>` : "";
+    return `<div class="roster-row" style="flex-wrap:wrap;gap:6px">
+      <span><b class=mono>${esc(x.freq_mhz)} MHz</b> ${badge} <span class=muted>${esc(cc)} · ${esc(ct)} · ${conf}%</span>${enc}
+        <div class=muted style="font-size:12px">${tgs}${lsns}</div></span>
+      ${save}</div>`;
+  }).join("");
+  $("discResults").querySelectorAll("[data-savefreq]").forEach(b=>b.onclick=()=>saveDiscover(parseFloat(b.dataset.savefreq)));
+}
+
+async function saveDiscover(freq){
+  const name = prompt("שם למערכת:", `גילוי ${freq} MHz`);
+  if(name===null) return;
+  const r = await post("/api/discover/save", {freq_mhz:freq, name});
+  if(r.ok && r.body.ok){ $("discMsg").textContent="נשמר כמערכת ✓"; SYSTEMS=r.body.systems||SYSTEMS; setTimeout(()=>$("discMsg").textContent="",2500); }
+  else $("discMsg").textContent = "שגיאה: "+((r.body&&r.body.error)||"");
+}
 
 // ---------- aliases ----------
 $("aliasAdd").onclick=async()=>{
@@ -738,6 +855,7 @@ async function init(){
   setInterval(pollFeed, 3000); pollFeed();
   setInterval(refreshState, 12000);
   setInterval(pollAnalytics, 15000);   // no-op כשלא בתצוגת אנליטיקה (guard בפנים)
+  setInterval(pollDiscover, 2500);     // no-op כשלא בתצוגת גילוי (guard בפנים)
 }
 if("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
 init();
