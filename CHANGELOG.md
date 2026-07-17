@@ -6,6 +6,23 @@
 
 ## [Unreleased]
 
+## [0.6.1] - סקר-שדה אמיתי + בעלות פורטים סופית (8080/8081)
+
+### Added
+- **`config/systems.survey.json`** — 19 מערכות DMR אמיתיות ממדידת-שדה עצמאית
+  (17.07.2026, VHF 162–167MHz): 16 ערוצים מאומתים (SoapySDR+SDRconnect,
+  decoder+SQLite עם `integrity_check` תקין) + 3 מערכות-אשכול ל-`multi` mode.
+  אומת בפועל מול `_validate_systems`/`_validate_multi_feasible`. לא נטען
+  אוטומטית — `cp` ידני אל `/var/lib/dmr/systems.json`. ר' CLAUDE.md §3/§10.
+
+### Fixed
+- **בעלות פורט 8080 סוכמה סופית** בין שני הריפואים שרצים על אותו Pi:
+  `dmr-web.service` נשאר 8080 (קבוע, `app.run(port=8080)` — אין מה לשנות, זה
+  משטח-הבקרה שעולה תמיד ב-boot). `DMR-DECREP-SHAHAR` (ריפו-רפרנס למיזוג הזה)
+  שינה את ברירת-המחדל שלו מ-8080 ל-**8081** ב-`backend/cli.py`/
+  `scripts/dmr-monitor.service`/`README.md` (שם, v0.26.4) — כך שהרצה שלו לעולם
+  לא תתנגש עם DMR גם בלי `--port` מפורש.
+
 ## [0.6.0] - מצב `multi`: פענוח רב-ערוצי בו-זמנית (מיזוג עם DMR-DECREP-SHAHAR)
 
 ### Added — מצב `multi`: כל ערוצי ה-channelmap בבת אחת, לא רק תדר-בקרה

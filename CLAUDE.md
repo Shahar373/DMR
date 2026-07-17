@@ -106,6 +106,11 @@ webtune/
 config/
   dmr.env                   # ברירת-מחדל ל-DSD-FME (EnvironmentFile). ⚠ נדרס ע"י app.py.
   channelmap.csv            # מפת LCN→תדר (Hz) לדוגמה. ⚠ נדרס ע"י app.py בכל מעבר.
+  systems.survey.json       # 19 מערכות אמיתיות ממדידת-שדה עצמאית (IQ Surveyor,
+                            #   17.07.2026, VHF 162–167MHz): 16 ערוצים בודדים +
+                            #   3 אשכולות ל-multi (162/164/165MHz). *לא* נטען
+                            #   אוטומטית — הפעלה: cp אל /var/lib/dmr/systems.json
+                            #   בפי. ר' §10 Phase 7 להקשר.
 
 systemd/
   sdrplay.service           # שירות SDRplay API. enabled.
@@ -433,6 +438,23 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   `parse_channelmap_hz`, `tag_event`, בוני-פקודות `dsd_pty`, `_validate_multi_feasible`)
   נבדקת מלאה ב-CI (177 בדיקות); `dsd_pty._run_multi`/`rsp_fm.run_multi` הם
   `pragma: no cover` — דורשים אימות על Pi 5 + RSP1B אמיתי לפני שהמצב ייחשב מוכן-לשטח.
+  **בעלות פורטים (שני הריפואים על אותו Pi):** `dmr-web.service` הוא **8080 קבוע**
+  (`app.run(..., port=8080)`, `webtune/app.py`) — זה משטח-הבקרה היחיד שעולה
+  תמיד ב-boot, ואסור שיזוז. `DMR-DECREP-SHAHAR` (שהפך לריפו-רפרנס/מקור-מנוע
+  למיזוג הזה) שינה את ברירת-המחדל של `--port` מ-8080 ל-**8081** (`backend/cli.py`
+  v0.26.4) — כדי שהרצה מקומית שלו (למשל `scripts/spike_multichannel.sh`, או
+  `python -m backend.cli --serve` ידני) לעולם לא תתנגש עם dmr-web גם בלי
+  `--port` מפורש.
+- **`config/systems.survey.json` — 19 מערכות אמיתיות ממדידת-שדה (17.07.2026):**
+  ייבוא מ-inventory Excel של סקר IQ עצמאי (SoapySDR+SDRconnect, decoder+SQLite,
+  `integrity_check` תקין). 16 ערוצי DMR מאומתים (VHF 162.14–167.14MHz, כל אחד
+  color-code משלו — **לא** אתר Cap+ טראנקינג אחיד, אשכול מקלטים עצמאיים) +
+  3 מערכות-אשכול ל-multi mode (162MHz/7 ערוצים, 164MHz/6 ערוצים — כולל שני
+  הערוצים עם ראיות TG/Radio ID החזקות ביותר בסקר, 165MHz/2 ערוצים), כל אחת
+  אומתה בפועל מול `_validate_systems`/`_validate_multi_feasible`. **לא נטען
+  אוטומטית** — `cp config/systems.survey.json /var/lib/dmr/systems.json` בפי
+  כדי להפעיל. מועמד-הספייק הראשון המומלץ ל-Phase 7: `multi_164cluster` (תעבורה
+  אמיתית מאומתת, לא תדרים בדויים).
 - **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
   קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
 - **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —
