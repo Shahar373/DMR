@@ -184,6 +184,35 @@ def test_compute_wideband_plan_rejects_span_too_wide():
         raise AssertionError("expected ValueError for span exceeding max_rate")
 
 
+def test_compute_wideband_plan_rejects_when_rounding_exceeds_ceiling():
+    """Bug #3: a span+guard just under max_rate (1.99MHz < 2.0MHz) that rounds
+    UP past it (2.016MHz) must be rejected — the ceiling check is on the
+    ROUNDED iq_rate, not the raw span, so the value actually fed to rsp_tcp
+    can never exceed max_rate."""
+    lo = 100_000_000
+    hi = lo + 1_940_000   # span+2*25k guard = 1.99MHz (passes a naive pre-round check)
+    try:
+        dsd_pty.compute_wideband_plan([lo, hi], guard_hz=25_000, max_rate=2_000_000)
+    except ValueError as error:
+        assert "MHz" in str(error)
+    else:
+        raise AssertionError("expected ValueError: rounded iq_rate exceeds max_rate")
+
+
+def test_compute_wideband_plan_return_rate_never_exceeds_max():
+    """Whatever it returns must be <= max_rate (the contract the ceiling
+    guards). Sweep a range of spans near the boundary."""
+    for extra in range(0, 60_000, 7_000):
+        lo = 100_000_000
+        hi = lo + (2_000_000 - 2 * 25_000 - extra)
+        try:
+            _c, rate = dsd_pty.compute_wideband_plan([lo, hi], guard_hz=25_000,
+                                                     max_rate=2_000_000)
+        except ValueError:
+            continue   # rejected is fine
+        assert rate <= 2_000_000, f"returned {rate} > max_rate for span extra={extra}"
+
+
 def test_compute_wideband_plan_matches_rsp_fm_copy():
     """dsd_pty and rsp_fm each carry their own copy of this pure function
     (dsd_pty stays stdlib-only, rsp_fm needs numpy for other things) -- they

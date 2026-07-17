@@ -401,6 +401,14 @@ def _validate_multi_feasible(system):
         return False, "מצב רב-ערוצי דורש לפחות 2 ערוצים במפת המערכת"
     if len(cmap) > MULTI_CHANNELS_MAX:
         return False, f"מצב רב-ערוצי תומך עד {MULTI_CHANNELS_MAX} ערוצים"
+    # ⚠ LCN חייב להיות ייחודי ב-multi: dsd_pty מריץ מפענח + פורט-אודיו לכל
+    # רשומה, אבל rsp_fm.MultiChannelBridge ממפתח לפי LCN — LCN כפול היה
+    # מפיל דמודלטור בשקט וגורם ל-bring-up להיכשל אטומית. נכשל כאן ב-400 עם
+    # הודעה ברורה במקום כקריסה מאוחרת (לא מהדק את _validate_systems הגלובלי
+    # כדי לא לדחות בשקט מערכות קיימות — הבעיה רלוונטית רק ל-multi).
+    lcns = [int(ch["lcn"]) for ch in cmap]
+    if len(set(lcns)) != len(lcns):
+        return False, "מצב רב-ערוצי דורש LCN ייחודי לכל ערוץ (יש LCN כפול במפה)"
     chan_hz = [int(round(float(ch["freq"]) * 1e6)) for ch in cmap]
     try:
         dsd_pty.compute_wideband_plan(chan_hz, guard_hz=MULTI_GUARD_HZ,
@@ -845,7 +853,7 @@ def _dmr_listener():
             _dmr_msgs.append(rec)
         if is_voice and rec.get("slot") is not None:
             _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, rec)
-            if len(_slot_open_call) > 8:   # רק 2 slots לכל ערוץ בפועל — הגנה בכל זאת
+            if len(_slot_open_call) > 2 * MULTI_CHANNELS_MAX:   # עד 2 slots × N ערוצים ב-multi
                 cutoff = ts - 15
                 for k in [k for k, (t0, _) in _slot_open_call.items() if t0 < cutoff]:
                     del _slot_open_call[k]
@@ -1575,7 +1583,7 @@ def _transcribe_worker():
     log.info("transcription worker started (model=%s)", WHISPER_MODEL)
     while True:
         try:
-            recs = sorted(REC_DIR.glob("*.wav"),
+            recs = sorted(REC_DIR.rglob("*.wav"),
                           key=lambda p: p.stat().st_mtime, reverse=True)
             for wav in recs:
                 txt = _transcript_path(wav)
@@ -1589,9 +1597,11 @@ def _transcribe_worker():
 
 def _sweep_recordings():
     """retention: עד REC_MAX_FILES / REC_MAX_BYTES (חדש=>ישן). קובץ-צד תמלול
-    (.txt) נמחק יחד עם ההקלטה."""
+    (.txt) נמחק יחד עם ההקלטה. rglob (לא glob) => תופס גם הקלטות multi בתת-
+    תיקיות פר-ערוץ (recordings/lcnN/), אחרת ה-retention לא רואה אותן והדיסק
+    מתמלא בלי גבול (ר' CLAUDE.md §5 multi)."""
     try:
-        recs = sorted(REC_DIR.glob("*.wav"),
+        recs = sorted(REC_DIR.rglob("*.wav"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return
@@ -1610,7 +1620,7 @@ def _scan_new_recordings(last_seen):
     """(rows, newest) - הקלטות WAV חדשות מ-last_seen (חדש=>ישן לפי mtime)."""
     rows, newest = [], last_seen
     try:
-        recs = sorted(REC_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        recs = sorted(REC_DIR.rglob("*.wav"), key=lambda p: p.stat().st_mtime)
     except OSError:
         recs = []
     for p in recs:
@@ -1620,7 +1630,11 @@ def _scan_new_recordings(last_seen):
             continue
         ts = round(stat.st_mtime, 1)
         if ts > last_seen:
-            rows.append({"ts": ts, "file": p.name, "bytes": stat.st_size})
+            # נתיב יחסי ל-REC_DIR: בחד-ערוצי זהה ל-p.name (קובץ שטוח); ב-multi
+            # שומר את תת-התיקייה הפר-ערוצית (lcnN/foo.wav) כדי ש-/recordings
+            # וקישור התמלול ימצאו את הקובץ.
+            rows.append({"ts": ts, "file": str(p.relative_to(REC_DIR)),
+                         "bytes": stat.st_size})
             newest = max(newest, ts)
     return rows, newest
 
@@ -1831,8 +1845,10 @@ def api_activity():
     return jsonify(ok=True, events=events)
 
 
-@app.route("/recordings/<name>")
+@app.route("/recordings/<path:name>")
 def recordings(name):
+    # <path:> (לא <name>) => מגיש גם הקלטות multi בתת-תיקיות (lcnN/foo.wav).
+    # send_from_directory מונע directory-traversal מעבר ל-REC_DIR.
     return send_from_directory(str(REC_DIR), name)
 
 

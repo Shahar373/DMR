@@ -196,6 +196,28 @@ def test_validate_multi_feasible_accepts_tight_channelmap():
     assert ok is True and err is None
 
 
+def test_validate_multi_feasible_rejects_duplicate_lcn():
+    """Bug #4: MultiChannelBridge keys demodulators by LCN, so a duplicate LCN
+    would silently drop a decoder and hang bring-up. Reject at multi entry with
+    a clear error instead of an opaque hardware failure."""
+    import app
+    sys = {"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
+           "channelmap": [{"lcn": 1, "freq": 461.0375},
+                          {"lcn": 1, "freq": 461.0625}]}   # duplicate LCN 1
+    ok, err = app._validate_multi_feasible(sys)
+    assert ok is False and "LCN" in err
+
+
+def test_api_mode_multi_rejects_duplicate_lcn(paths, sysctl, no_sleep):
+    app = paths
+    _seed_systems(app, [{"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
+                         "channelmap": [{"lcn": 1, "freq": 461.0375},
+                                        {"lcn": 1, "freq": 461.0625}]}])
+    r = _client(app).post("/api/mode", json={"mode": "multi", "system": "s1"})
+    assert r.status_code == 400
+    assert ("restart", app.DMR_SERVICE) not in sysctl.calls   # never touched the SDR
+
+
 def test_api_mode_multi_enters_and_renders_multi_env(paths, sysctl, no_sleep):
     app = paths
     _seed_systems(app, [_multi_system()])

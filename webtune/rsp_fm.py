@@ -107,14 +107,18 @@ def compute_wideband_plan(channelmap_hz, guard_hz: int = 25_000,
         raise ValueError("multi-channel plan needs at least one channel")
     lo, hi = min(channelmap_hz), max(channelmap_hz)
     span = hi - lo
-    if span + 2 * guard_hz > max_rate:
-        raise ValueError(
-            f"channel plan spans {span / 1e6:.4f} MHz + guard "
-            f"({2 * guard_hz / 1e6:.4f} MHz) -- exceeds {max_rate / 1e6:.1f} "
-            "MHz max; narrow the plan or use fewer channels")
     center_hz = (hi + lo) // 2
     floor_hz = max(span + 2 * guard_hz, audio_rate)
     iq_rate = -(-int(floor_hz) // audio_rate) * audio_rate  # ceil to multiple of audio_rate
+    # Ceiling check on the ROUNDED iq_rate (not raw span+guard): a span that
+    # just fits (e.g. 1.99MHz) could round up past 2MHz and slip through if
+    # checked before rounding. Must match dsd_pty's copy exactly.
+    if iq_rate > max_rate:
+        raise ValueError(
+            f"channel plan needs {iq_rate / 1e6:.4f} MHz IQ rate (span "
+            f"{span / 1e6:.4f} MHz + guard, rounded to {audio_rate / 1e3:.0f}kHz) "
+            f"-- exceeds {max_rate / 1e6:.1f} MHz max; narrow the plan or use "
+            "fewer channels")
     return int(center_hz), int(iq_rate)
 
 

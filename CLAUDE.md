@@ -434,10 +434,18 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   אחרי שהמנוע יאומת על חומרה. **קליטת ה-IQ הרחבה-פס (`rsp_tcp` בקצב מעל
   240kHz הקיים) היא הסיכון הטכני המרכזי הפתוח** — לא אומתה על RSP1B אמיתי;
   אם רוחב-הפס לא יציב שם, החלופה היא Soapy-direct כמו ב-DECREP (ר' spike
-  script בריפו DMR-DECREP-SHAHAR). הלוגיקה הטהורה (`compute_wideband_plan`,
+  script בריפו DMR-DECREP-SHAHAR). ⚠ **הספייק של DECREP בודק את ה-channelizer
+  שלו, לא את `rsp_fm.run_multi` של DMR** — נתיב DSP שונה. לאימות מנוע ה-DMR
+  עצמו יש `scripts/spike-dmr-multi` (v0.6.2): מריץ ישירות את `dsd_pty._run_multi`
+  (rsp_tcp רחב-פס + rsp_fm + N×dsd-fme) ומודד שרידות rsp_tcp + נעילת-sync
+  פר-ערוץ (phys_lcn ב-UDP) + CPU. הלוגיקה הטהורה (`compute_wideband_plan`,
   `parse_channelmap_hz`, `tag_event`, בוני-פקודות `dsd_pty`, `_validate_multi_feasible`)
-  נבדקת מלאה ב-CI (177 בדיקות); `dsd_pty._run_multi`/`rsp_fm.run_multi` הם
+  נבדקת מלאה ב-CI (184 בדיקות); `dsd_pty._run_multi`/`rsp_fm.run_multi` הם
   `pragma: no cover` — דורשים אימות על Pi 5 + RSP1B אמיתי לפני שהמצב ייחשב מוכן-לשטח.
+  **תיקוני v0.6.2 (code review לפני חומרה):** הקלטות multi ב-תת-תיקיות
+  (`recordings/lcnN/`) נתפסות ע"י `rglob` (אחרת retention עיוור→דיסק מתמלא);
+  `/api/gain` עובד ב-multi (ctrl-sock ב-`_run_multi`); `compute_wideband_plan`
+  בודק תקרה אחרי עיגול-48kHz; `_validate_multi_feasible` דוחה LCN כפול.
   **בעלות פורטים (שני הריפואים על אותו Pi):** `dmr-web.service` הוא **8080 קבוע**
   (`app.run(..., port=8080)`, `webtune/app.py`) — זה משטח-הבקרה היחיד שעולה
   תמיד ב-boot, ואסור שיזוז. `DMR-DECREP-SHAHAR` (שהפך לריפו-רפרנס/מקור-מנוע
