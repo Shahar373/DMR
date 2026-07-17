@@ -6,6 +6,44 @@
 
 ## [Unreleased]
 
+## [0.6.2] - תיקוני מצב multi (לפני אימות חומרה) + ספייק ייעודי ל-DMR
+
+מ-code review מעמיק (3 סוכנים) לפני ההרצה הראשונה של multi על חומרה. כל
+התיקונים נוגעים אך ורק במצב multi — חד-ערוצי (dmr/scan/discover) לא נגע.
+
+### Fixed
+- **#1 (גבוה) — הקלטות multi גרמו למילוי-דיסק בלי גבול והיו בלתי-נראות ב-UI.**
+  DSD-FME כותב per-call WAV לתת-תיקיות פר-ערוץ (`recordings/lcnN/`), אבל כל
+  ניהול-ההקלטות השתמש ב-`glob("*.wav")` לא-רקורסיבי → ה-retention (400 קבצים)
+  לא ראה אותן, הן לא הופיעו ב-`/api/activity`, ולא ניתנו להגשה. תוקן: `rglob`
+  בשלושת המקומות (retention/activity/תמלול), `_scan_new_recordings` שומר נתיב
+  יחסי (`lcnN/foo.wav`), ו-`/recordings/<path:name>` מגיש תת-נתיבים.
+- **#2 (בינוני) — `/api/gain` (נוד-רווח חי) היה מת ב-multi.** `_run_multi` לא
+  פתח את `dsd-ctrl.sock` שה-`_run` החד-ערוצי פותח, אז הבקשה החזירה 500. נוסף
+  ערוץ הבקרה (bind + select + forward ל-`DSD_BRIDGE_CTRL_SOCK`), זהה ל-`_run`.
+- **#3 (נמוך) — `compute_wideband_plan` יכל להחזיר `iq_rate` מעל תקרת ה-2MHz.**
+  בדיקת-התקרה הייתה על `span+guard` הגולמי *לפני* העיגול לכפולה של 48kHz, אז
+  span שנכנס בקושי (1.99MHz) עוגל מעל התקרה (2.016MHz) ועבר בטעות. תוקן בשני
+  העותקים (dsd_pty + rsp_fm): הבדיקה עכשיו על ה-iq_rate המעוגל.
+- **#4 (נמוך) — LCN כפול ב-channelmap גרם לכשל bring-up אטום ב-multi.**
+  `MultiChannelBridge` ממפתח מדמודלטורים לפי LCN → LCN כפול היה מפיל דמודלטור
+  בשקט. `_validate_multi_feasible` דוחה עכשיו LCN כפול ב-400 עם הודעה ברורה
+  (ממוקד ל-multi בלבד — לא מהדק את `_validate_systems` הגלובלי).
+- **#5 (קוסמטי) — סף ניקוי `_slot_open_call`** הוגדל מ-8 ל-`2×MULTI_CHANNELS_MAX`
+  (עד 2 slots × N ערוצים ב-multi), עם תיקון ההערה המטעה.
+
+### Added
+- **`scripts/spike-dmr-multi`** — ספייק חומרה שבודק את מנוע ה-multi של **DMR
+  עצמו** (`dsd_pty._run_multi` + `rsp_fm.run_multi` + `rsp_tcp` רחב-פס), **לא**
+  את ה-channelizer של DECREP (ש-`spike_multichannel.sh` בריפו DECREP בודק —
+  נתיב DSP שונה לגמרי). מריץ את השרשרת ש-`/api/mode {"mode":"multi"}` מרים,
+  ישירות ובמבודד, ומודד: שרידות `rsp_tcp` ברוחב-פס (הסיכון #1), נעילת-sync
+  פר-ערוץ (אירועים מתויגי-`phys_lcn` ב-UDP), ו-CPU. זה האימות שהיה חסר.
+
+### בדיקות
+- 184 בדיקות ירוקות (177→184): הקלטות בתת-תיקיות, גבול תקרת wideband-plan,
+  ו-LCN כפול. 68/68 fixture replay נשאר ירוק ללא שינוי.
+
 ## [0.6.1] - סקר-שדה אמיתי + בעלות פורטים סופית (8080/8081)
 
 ### Added

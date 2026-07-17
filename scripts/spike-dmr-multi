@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# ============================================================================
+# spike-dmr-multi — ספייק חומרה למצב multi של DMR (Phase 7).
+#
+# ⚠ זה בודק את מנוע ה-multi של **DMR עצמו** (dsd_pty._run_multi + rsp_fm.run_multi
+#   + rsp_tcp רחב-פס), *לא* את ה-channelizer של DMR-DECREP. זה ההבדל הקריטי:
+#   scripts/spike_multichannel.sh בריפו DECREP מודד נתיב-DSP אחר לגמרי
+#   (SoapySDR-direct). כאן מריצים בדיוק את השרשרת ש-/api/mode {"mode":"multi"}
+#   מרים בפועל — רק ישירות (בלי dmr-web/systemd), כדי לבודד ולמדוד.
+#
+# מה זה מוכיח (השאלה הפתוחה מ-CLAUDE.md §10 Phase 7):
+#   1. האם rsp_tcp שורד קליטת IQ רחבת-פס (מעל 240kHz) על RSP1B בלי לקרוס
+#      (כמו שקרס ב-Phase 5 מול לקוח לא-תואם) — הסיכון הטכני המרכזי.
+#   2. האם ≥2 מפענחי DSD-FME במקביל מגיעים ל-sync-lock (אירועים מתויגי-
+#      phys_lcn מגיעים ב-UDP) — כלומר הפענוח הרב-ערוצי בכלל עובד.
+#   3. עלות CPU בפועל על Pi 5 (rsp_tcp + rsp_fm + N×dsd-fme).
+#
+# הרצה:
+#   ⚠ עצור קודם את dmr-dsdfme כדי לפנות את ה-SDR:
+#       sudo systemctl stop dmr-dsdfme
+#   sudo bash scripts/spike-dmr-multi                    # ברירת מחדל: 164cluster מ-systems.json, 90ש'
+#   sudo bash scripts/spike-dmr-multi multi_164cluster 120
+#   SYSTEMS=/path/to/systems.json bash scripts/spike-dmr-multi multi_162cluster
+# ============================================================================
+set -uo pipefail
+
+SYSTEM_ID="${1:-multi_164cluster}"
+DURATION="${2:-90}"
+SYSTEMS="${SYSTEMS:-/var/lib/dmr/systems.json}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WEBTUNE="$REPO_ROOT/webtune"
+[[ -d /opt/dmr/webtune ]] && WEBTUNE="/opt/dmr/webtune"   # בפי הפרוס
+OUT_DIR="$(mktemp -d /tmp/dmr_multi_spike.XXXXXX)"
+UDP_PORT="${UDP_PORT:-5599}"                  # לא 5555 — לא מתנגש ב-listener של dmr-web
+SAMPLE_INTERVAL=1
+NPROC="$(nproc 2>/dev/null || echo 4)"
+export DSD_BIN="${DSD_BIN:-dsd-fme}"
+export RSP_TCP_BIN="${RSP_TCP_BIN:-rsp_tcp}"
+
+echo "════════════════════════════════════════════════════════════════"
+echo "  ספייק multi — מנוע ה-DMR האמיתי (rsp_fm.run_multi)"
+echo "  מערכת: $SYSTEM_ID   משך: ${DURATION}s   ליבות: $NPROC   פלט: $OUT_DIR"
+echo "  webtune: $WEBTUNE   systems: $SYSTEMS"
+echo "════════════════════════════════════════════════════════════════"
+
+# ── 1. Preflight ────────────────────────────────────────────────────────────
+fail=0
+check() { printf "  %-26s " "$1"; if eval "$2" >/dev/null 2>&1; then echo "✓"; else echo "✗ ($3)"; fail=1; fi; }
+echo; echo "── בדיקות מקדימות ──"
+check "python3 + numpy"    "python3 -c 'import numpy'"            "sudo apt install python3-numpy"
+check "dsd-fme בנתיב"      "command -v $DSD_BIN"                  "בנה מ-lwvmobile/dsd-fme (install.sh)"
+check "rsp_tcp בנתיב"      "command -v $RSP_TCP_BIN"              "התקן rsp_tcp (install.sh)"
+check "rsp_fm.py"          "[ -f '$WEBTUNE/rsp_fm.py' ]"         "webtune לא נמצא"
+check "dsd_pty.py"         "[ -f '$WEBTUNE/dsd_pty.py' ]"        "webtune לא נמצא"
+check "systems.json"       "[ -f '$SYSTEMS' ]"                    "cp config/systems.survey.json ל-$SYSTEMS"
+check "SDR פנוי (dsd-dsdfme עצור)" "! systemctl is-active --quiet dmr-dsdfme" "sudo systemctl stop dmr-dsdfme"
+if [ "$fail" -ne 0 ]; then echo; echo "❌ preflight נכשל — תקן את ה-✗ למעלה."; exit 1; fi
+
+# ── 2. בונים channelmap CSV (LCN,FREQ_HZ) מהמערכת הנבחרת ────────────────────
+CHANMAP="$OUT_DIR/channelmap.csv"
+python3 - "$SYSTEMS" "$SYSTEM_ID" "$CHANMAP" <<'PY' || { echo "❌ בניית channelmap נכשלה"; exit 1; }
+import json, sys
+systems_path, sid, out = sys.argv[1], sys.argv[2], sys.argv[3]
+systems = json.load(open(systems_path, encoding="utf-8"))
+sysd = next((s for s in systems if s.get("id") == sid), None)
+if sysd is None:
+    print(f"מערכת '{sid}' לא נמצאה. זמינות: {[s['id'] for s in systems]}", file=sys.stderr); sys.exit(1)
+cmap = sysd.get("channelmap") or []
+if len(cmap) < 2:
+    print(f"'{sid}' אינה רב-ערוצית ({len(cmap)} ערוצים)", file=sys.stderr); sys.exit(1)
+with open(out, "w") as f:
+    for ch in cmap:
+        f.write(f"{int(ch['lcn'])},{int(round(float(ch['freq'])*1e6))}\n")
+print(f"{len(cmap)} ערוצים: " + ", ".join(f"lcn{ch['lcn']}={ch['freq']}MHz" for ch in cmap))
+PY
+NCH=$(grep -c . "$CHANMAP")
+echo; echo "channelmap ($NCH ערוצים): $CHANMAP"
+
+# ── 3. מריצים את מנוע ה-multi של DMR ישירות (dsd_pty → _run_multi) ──────────
+# בדיוק המשתנים ש-render_dmr_env(multi=True) כותב ל-dmr.env — כאן ידנית.
+export DSD_MULTI=1
+export DSD_CHANNELMAP="$CHANMAP"
+export DSD_UDP="127.0.0.1:$UDP_PORT"
+export DSD_RTLTCP="127.0.0.1:1234"
+export DSD_AUDIO_TCP_BASE="127.0.0.1:7355"
+export DSD_RIGCTL="127.0.0.1:4532"
+export DSD_AUDIO_GAIN="4.0"
+export DSD_MULTI_GUARD_HZ="25000"
+export DSD_MULTI_MAX_RATE_HZ="2000000"
+export DSD_WAV_DIR="$OUT_DIR/recordings"
+export RSP_FM_BIN="$WEBTUNE/rsp_fm.py"
+mkdir -p "$DSD_WAV_DIR"
+
+echo; echo "── מריץ dsd_pty._run_multi (rsp_tcp רחב-פס + rsp_fm + ${NCH}×dsd-fme) ──"
+python3 -u "$WEBTUNE/dsd_pty.py" > "$OUT_DIR/dsd_pty.log" 2>&1 &
+ENGINE=$!
+sleep 6   # bring-up: rsp_tcp פותח SDR, rsp_fm עולה, dsd-fme מתחברים
+if ! kill -0 "$ENGINE" 2>/dev/null; then
+  echo "❌ המנוע קרס תוך שניות. 25 שורות אחרונות:"; tail -n 25 "$OUT_DIR/dsd_pty.log" | sed 's/^/    /'
+  echo; echo "  (זה הסיכון #1 — rsp_tcp לא שרד קליטה רחבת-פס. ר' fallback ל-SoapySDR ב-§10.)"
+  exit 1
+fi
+
+# ── 4. מאזין ל-UDP וסופר אירועים מתויגי-phys_lcn (עדות sync-lock פר-ערוץ) ───
+python3 - "$UDP_PORT" "$DURATION" "$ENGINE" "$OUT_DIR" <<'PY' &
+import socket, sys, json, time, collections
+port, dur, engine_pid, outdir = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.settimeout(1.0)
+per_ch = collections.Counter(); per_type = collections.Counter(); total = 0
+deadline = time.time() + dur
+while time.time() < deadline:
+    try:
+        data, _ = s.recvfrom(65535)
+    except socket.timeout:
+        continue
+    try:
+        m = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        continue
+    total += 1
+    per_type[m.get("type", "?")] += 1
+    if m.get("phys_lcn") is not None:
+        per_ch[m["phys_lcn"]] += 1
+open(f"{outdir}/udp_summary.json", "w").write(json.dumps({
+    "total": total, "per_channel": dict(per_ch), "per_type": dict(per_type),
+    "channels_with_events": len(per_ch)}))
+print(f"\n  אירועי UDP: {total} סה\"כ, {len(per_ch)} ערוצים עם אירועים")
+print(f"  פר-ערוץ (phys_lcn): {dict(per_ch)}")
+print(f"  פר-סוג: {dict(per_type)}")
+PY
+LISTENER=$!
+
+# ── 5. דוגם CPU של עץ-התהליכים תוך כדי ─────────────────────────────────────
+HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
+tree_jiffies() {
+  local root=$1 total=0 p st
+  local pids="$root $(pgrep -P "$root" 2>/dev/null)"
+  for c in $(pgrep -P "$root" 2>/dev/null); do pids="$pids $(pgrep -P "$c" 2>/dev/null)"; done
+  for p in $pids; do
+    st=$(cut -d' ' -f14,15 "/proc/$p/stat" 2>/dev/null) || continue
+    total=$(( total + ${st% *} + ${st#* } ))
+  done
+  echo "$total"
+}
+prev=$(tree_jiffies "$ENGINE"); peak_cpu=0; sum_cpu=0; samples=0
+printf "  %-6s %-9s %s\n" "t(s)" "CPU%" "dsd-fme חיים"
+for ((t=SAMPLE_INTERVAL; t<=DURATION; t+=SAMPLE_INTERVAL)); do
+  sleep "$SAMPLE_INTERVAL"
+  kill -0 "$ENGINE" 2>/dev/null || { echo "  ❌ המנוע מת ב-t=${t}s"; break; }
+  now=$(tree_jiffies "$ENGINE"); dj=$(( now - prev )); prev=$now
+  cpu=$(( dj * 100 / (SAMPLE_INTERVAL * HZ) )); ndsd=$(pgrep -c -x "$DSD_BIN" 2>/dev/null || echo 0)
+  [ $(( t % 10 )) -eq 0 ] && printf "  %-6s %-9s %s\n" "$t" "${cpu}%" "$ndsd"
+  samples=$((samples+1)); sum_cpu=$((sum_cpu+cpu)); [ "$cpu" -gt "$peak_cpu" ] && peak_cpu=$cpu
+done
+
+wait "$LISTENER" 2>/dev/null
+kill -INT "$ENGINE" 2>/dev/null; sleep 2; kill -KILL "$ENGINE" 2>/dev/null; wait "$ENGINE" 2>/dev/null
+pkill -x "$DSD_BIN" 2>/dev/null; pkill -x "$RSP_TCP_BIN" 2>/dev/null
+
+# ── 6. Verdict ──────────────────────────────────────────────────────────────
+avg_cpu=0; [ "$samples" -gt 0 ] && avg_cpu=$(( sum_cpu / samples ))
+CH_HIT=$(python3 -c "import json;print(json.load(open('$OUT_DIR/udp_summary.json'))['channels_with_events'])" 2>/dev/null || echo 0)
+TOTAL_EV=$(python3 -c "import json;print(json.load(open('$OUT_DIR/udp_summary.json'))['total'])" 2>/dev/null || echo 0)
+echo; echo "════════════════════════════════════════════════════════════════"
+echo "  VERDICT — מנוע ה-multi של DMR על החומרה הזו"
+echo "════════════════════════════════════════════════════════════════"
+echo "  ערוצים שהוזנו: $NCH   |   ערוצים עם אירועים: $CH_HIT   |   אירועים: $TOTAL_EV"
+echo "  CPU: ממוצע ${avg_cpu}%, שיא ${peak_cpu}% (מתוך $((NPROC*100))%)"
+echo
+if [ "${TOTAL_EV:-0}" -eq 0 ]; then
+  echo "  ⚠ אפס אירועים — rsp_tcp/rsp_fm אולי עלו אבל dsd-fme לא נעל sync."
+  echo "    בדוק $OUT_DIR/dsd_pty.log (מחפשים 'TCP Connection Success' לכל ערוץ,"
+  echo "    ושורות DMR מפוענחות). ייתכן gain/תדרים/רוחב-פס. הליבה עוד לא הוכחה."
+elif [ "${CH_HIT:-0}" -lt 2 ]; then
+  echo "  🟡 רק $CH_HIT ערוץ נעל — פענוח רב-ערוצי בו-זמנית עוד לא הוכח."
+  echo "    (ערוץ יחיד עובד, אבל זה לא מטרת ה-multi. בדוק אם השאר שקטים או נכשלים.)"
+elif [ "${peak_cpu:-999}" -ge "$((NPROC*100 - 30))" ]; then
+  echo "  🔴 $CH_HIT ערוצים נעלו אבל CPU רווי (${peak_cpu}%) — לא יציב ל-$NCH ערוצים."
+  echo "    שקול פחות ערוצים או --follow-traffic (Phase עתידי)."
+else
+  echo "  🟢 מנוע ה-multi של DMR עובד! $CH_HIT/$NCH ערוצים נעלו ב-${peak_cpu}% CPU."
+  echo "    rsp_tcp שרד רוחב-פס, ≥2 dsd-fme במקביל נעלו. Phase 7 אומת על חומרה →"
+  echo "    אפשר להסיר את ה-pragma no cover מהתיעוד ולסמן multi כמוכן-לשטח."
+fi
+echo; echo "  לוגים: $OUT_DIR/dsd_pty.log , $OUT_DIR/udp_summary.json"
+echo "  (צרף אותם כשתדווח לי תוצאות)"
+echo "════════════════════════════════════════════════════════════════"

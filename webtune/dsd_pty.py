@@ -251,14 +251,18 @@ def compute_wideband_plan(channelmap_hz, guard_hz=25_000, max_rate=2_000_000,
         raise ValueError("multi-channel plan needs at least one channel")
     lo, hi = min(channelmap_hz), max(channelmap_hz)
     span = hi - lo
-    if span + 2 * guard_hz > max_rate:
-        raise ValueError(
-            f"channel plan spans {span / 1e6:.4f} MHz + guard "
-            f"({2 * guard_hz / 1e6:.4f} MHz) -- exceeds {max_rate / 1e6:.1f} "
-            "MHz max; narrow the plan or use fewer channels")
     center_hz = (hi + lo) // 2
     floor_hz = max(span + 2 * guard_hz, audio_rate)
     iq_rate = -(-int(floor_hz) // audio_rate) * audio_rate  # ceil to multiple of audio_rate
+    # ⚠ בודקים את התקרה על ה-iq_rate *אחרי* העיגול — לא על span+guard הגולמי.
+    # אחרת span שנכנס בקושי (למשל 1.99MHz) עוגל כלפי מעלה מעל 2MHz (2.016MHz)
+    # ועבר את הבדיקה בטעות, בעוד הערך שבאמת מוזן ל-rsp_tcp/הקליטה חורג מהתקרה.
+    if iq_rate > max_rate:
+        raise ValueError(
+            f"channel plan needs {iq_rate / 1e6:.4f} MHz IQ rate (span "
+            f"{span / 1e6:.4f} MHz + guard, rounded to {audio_rate / 1e3:.0f}kHz) "
+            f"-- exceeds {max_rate / 1e6:.1f} MHz max; narrow the plan or use "
+            "fewer channels")
     return int(center_hz), int(iq_rate)
 
 
@@ -612,6 +616,7 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
     wav_dir = env.get("DSD_WAV_DIR")
     processes = []
     dsd_procs = {}   # lcn -> {"proc":, "master":, "buffer": bytes, "freq_hz": int}
+    ctrl = None
 
     try:
         rsp_command = build_multi_rsp_tcp_command(env, center_hz, iq_rate)
@@ -647,6 +652,23 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
             dsd_procs[ch["lcn"]] = {"proc": proc, "master": master, "buffer": b"",
                                     "freq_hz": ch["freq_hz"]}
 
+        # ערוץ נוד-הרווח החי (g/G מ-app.py דרך send_gain_nudge → DSD_CTRL_SOCK).
+        # זהה ל-_run: מקבל מ-app.py ומעביר לגשר (rsp_fm.GainControlServer על
+        # DSD_BRIDGE_CTRL_SOCK), ששולח פקודות rtl_tcp אמיתיות ל-rsp_tcp. הרווח
+        # פועל על ה-front-end הרחב-פס => משפיע על כל הערוצים יחד (אין gain
+        # פר-ערוץ — יש front-end אחד). בלי זה /api/gain מחזיר 500 ב-multi.
+        try:
+            if os.path.exists(CTRL_SOCK_PATH):
+                os.unlink(CTRL_SOCK_PATH)
+            os.makedirs(os.path.dirname(CTRL_SOCK_PATH), exist_ok=True)
+            ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            ctrl.bind(CTRL_SOCK_PATH)
+            ctrl.setblocking(False)
+        except OSError as exc:
+            sys.stderr.write(f"dsd_pty: control socket unavailable: {exc}\n")
+            sys.stderr.flush()
+            ctrl = None
+
         while True:
             if rsp.poll() is not None:
                 sys.stderr.write(f"dsd_pty: rsp_tcp exited with status {rsp.returncode}\n")
@@ -658,8 +680,14 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
             if dead:
                 sys.stderr.write(f"dsd_pty: dsd-fme for lcn={dead} exited\n")
                 break
-            readers = [c["master"] for c in dsd_procs.values()]
+            readers = [c["master"] for c in dsd_procs.values()] + ([ctrl] if ctrl else [])
             ready, _, _ = select.select(readers, [], [], 1.0)
+            if ctrl in ready:
+                try:
+                    keys, _ = ctrl.recvfrom(64)
+                    _send_bridge_control(keys, env.get("DSD_BRIDGE_CTRL_SOCK", BRIDGE_CTRL_SOCK))
+                except OSError:
+                    pass
             for lcn, c in dsd_procs.items():
                 if c["master"] not in ready:
                     continue
@@ -696,6 +724,12 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
             try:
                 os.close(c["master"])
             except OSError:
+                pass
+        if ctrl is not None:
+            ctrl.close()
+            try:
+                os.unlink(CTRL_SOCK_PATH)
+            except FileNotFoundError:
                 pass
         udp.close()
 
