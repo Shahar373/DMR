@@ -28,6 +28,29 @@ def test_api_rf_reports_ticks(paths):
     assert by_type == {"CSBK_CRC": 2, "SLCO_CRC": 1}
 
 
+def test_api_rf_by_channel_empty_in_single_channel_mode(paths):
+    """חד-ערוצי: כל הטיקים phys_lcn=None => by_channel ריק (לא נספר פעמיים —
+    הצובר הגלובלי כבר כולל אותם דרך _rf_quality_snapshot(None))."""
+    app = paths
+    app._rf_ticks.clear()
+    app._rf_quality_tick("CSBK_CRC")
+    body = _c(app).get("/api/rf").get_json()
+    assert body["total_errors"] == 1
+    assert body["by_channel"] == []
+
+
+def test_api_rf_by_channel_breaks_down_multi_mode(paths):
+    app = paths
+    app._rf_ticks.clear()
+    app._rf_quality_tick("CSBK_CRC", phys_lcn=1)
+    app._rf_quality_tick("CSBK_CRC", phys_lcn=1)
+    app._rf_quality_tick("SLCO_CRC", phys_lcn=2)
+    body = _c(app).get("/api/rf").get_json()
+    assert body["total_errors"] == 3   # הצובר הגלובלי כולל את כל הערוצים יחד
+    by_lcn = {d["phys_lcn"]: d["total_errors"] for d in body["by_channel"]}
+    assert by_lcn == {1: 2, 2: 1}
+
+
 def test_api_gain_sends_and_tracks(paths, monkeypatch):
     app = paths
     sent = []

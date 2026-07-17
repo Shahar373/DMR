@@ -6,6 +6,91 @@
 
 ## [Unreleased]
 
+## [0.6.1] - סקר-שדה אמיתי + בעלות פורטים סופית (8080/8081)
+
+### Added
+- **`config/systems.survey.json`** — 19 מערכות DMR אמיתיות ממדידת-שדה עצמאית
+  (17.07.2026, VHF 162–167MHz): 16 ערוצים מאומתים (SoapySDR+SDRconnect,
+  decoder+SQLite עם `integrity_check` תקין) + 3 מערכות-אשכול ל-`multi` mode.
+  אומת בפועל מול `_validate_systems`/`_validate_multi_feasible`. לא נטען
+  אוטומטית — `cp` ידני אל `/var/lib/dmr/systems.json`. ר' CLAUDE.md §3/§10.
+
+### Fixed
+- **בעלות פורט 8080 סוכמה סופית** בין שני הריפואים שרצים על אותו Pi:
+  `dmr-web.service` נשאר 8080 (קבוע, `app.run(port=8080)` — אין מה לשנות, זה
+  משטח-הבקרה שעולה תמיד ב-boot). `DMR-DECREP-SHAHAR` (ריפו-רפרנס למיזוג הזה)
+  שינה את ברירת-המחדל שלו מ-8080 ל-**8081** ב-`backend/cli.py`/
+  `scripts/dmr-monitor.service`/`README.md` (שם, v0.26.4) — כך שהרצה שלו לעולם
+  לא תתנגש עם DMR גם בלי `--port` מפורש.
+
+## [0.6.0] - מצב `multi`: פענוח רב-ערוצי בו-זמנית (מיזוג עם DMR-DECREP-SHAHAR)
+
+### Added — מצב `multi`: כל ערוצי ה-channelmap בבת אחת, לא רק תדר-בקרה
+מצב `app_mode` חדש (`dmr`/`off`/`scan`/`discover`/**`multi`**) שמפענח **את כל
+ערוצי ה-channelmap של מערכת בו-זמנית** — לא רק את ערוץ הבקרה עם מעקב-טראנקינג
+כמו `dmr`. תוצאה של מיזוג ארכיטקטורה עם `DMR-DECREP-SHAHAR` (שני פרויקטים
+שוכפלו מאותו scaffold): המנוע הרב-ערוצי (channelizer דיגיטלי על קליטת IQ
+רחבת-פס אחת) נשאב משם ונשתל לתוך המודל החד-SDR/PWA-עברי המוקשח של DMR.
+
+- **`webtune/rsp_fm.py`:** `NfmDemodulator` קיבל `offset_hz` (ברירת מחדל 0.0,
+  זהה byte-for-byte להתנהגות הקודמת) — מיקסר מרוכב שמסיט ערוץ מוסט מהמרכז
+  המכוון חזרה ל-DC לפני שרשרת הפילטר/דצימציה/דיסקרימינטור-FM/DC-blocker
+  הקיימת, בלי שינוי. `compute_wideband_plan` (טהורה): מרכז+קצב-IQ לקליטה
+  רחבת-פס אחת שמכסה כל הערוצים, מעוגל **כלפי מעלה לכפולה של 48kHz** (אילוץ
+  `NfmDemodulator`, לא היה מובטח בנוסחה נאיבית). `parse_channelmap_hz`,
+  `MultiChannelConfig`/`MultiChannelBridge`/`run_multi` (N מדמודלטורים על
+  קריאת-IQ אחת, N שרתי-אודיו). CLI: `--multi-channelmap`/`--audio-tcp-base`.
+- **`webtune/dsd_pty.py`:** עותק stdlib-בלבד של `compute_wideband_plan`/
+  `parse_channelmap_hz` (dsd_pty נשאר בלי תלות ב-numpy) — **חישוב יחיד** לפני
+  spawn, מוזרם במפורש (`--frequency`/`--iq-rate`) גם ל-`rsp_tcp` וגם ל-
+  `rsp_fm.py` (שני תהליכי-בן נפרדים שחייבים להסכים על אותו center/rate; לא
+  נסמכים על שני חישובים עצמאיים). `build_multi_rsp_tcp_command`/
+  `build_multi_bridge_command`/`build_channel_dsd_command` (בלי `-T`/`-U` —
+  אין retune פר-ערוץ, LO משותף יחיד), `tag_event` (מתייג כל אירוע עם
+  `phys_lcn`/`phys_freq_hz` אמיתיים — ground-truth מ-spawn, לא ניחוש טקסט),
+  `_run_multi` (N מפענחי DSD-FME תחת PTY, כשל בכל אחד ⇒ כשל כל השירות, כמו
+  חד-ערוצי; רסטרט חלקי פר-ערוץ נדחה). `_run()` מפצל ל-`_run_multi` לפי
+  `DSD_MULTI=1`.
+- **`webtune/app.py`:** `MULTI_GUARD_HZ`/`MULTI_MAX_SPAN_HZ`/`MULTI_CHANNELS_MAX`,
+  `_validate_multi_feasible` (≥2 ערוצים, נכנס ברוחב-פס, נבדק **לפני**
+  `TUNE_LOCK`). `render_dmr_env(system, multi=True)` מוסיף `DSD_MULTI=1` +
+  `DSD_MULTI_GUARD_HZ`/`DSD_MULTI_MAX_RATE_HZ` (מהקבועים ש-
+  `_validate_multi_feasible` כבר אימת מולם) + `DSD_AUDIO_TCP_BASE`
+  (בלתי-תלוי-מצב, נכתב תמיד). `MODE_SERVICE["multi"]` = אותה יחידת systemd
+  כמו `dmr` (**לא** unit נפרד — "SDR אחד בהחלפה" נשמר); `_live_mode` מבדיל
+  dmr/multi לפי `state.json` (systemctl לא יכול). `api_mode`/`_boot_restore`
+  מטפלים ב-`multi` באותה תבנית כמו `dmr`. `_normalize_dsd` מעדיף
+  `phys_freq_hz`/`phys_lcn` (כשקיימים) על `_channelmap_freq(lcn)` — ground-truth
+  לא ניחוש. `_dmr_listener`: מפתחות ה-dedup וה-`_slot_open_call` (קורלציית
+  הצפנה) מורחבים ל-`(phys_lcn, ...)` — **בלי זה** שתי שיחות בו-זמנית על שני
+  ערוצים שונים עם אותו slot היו מתמזגות/מקבלות תג-הצפנה בטעות מערוץ אחר.
+  `_rf_ticks`/`_rf_quality_tick`/`_rf_quality_snapshot` מורחבים עם ממד
+  `phys_lcn`; `/api/rf` מחזיר גם `by_channel` (החלטת-מוצר: פר-ערוץ **מיום-1**,
+  לא נדחה). כל השדות/מפתחות החדשים `None`/ריקים בחד-ערוצי ⇒ **אפס שינוי
+  התנהגות** לקוד הקיים.
+- **בדיקות:** 37 בדיקות חדשות (140→177): offset-demod + wideband-plan +
+  channelmap-parsing ב-`test_rsp_fm.py`; בוני-פקודות + `tag_event` ב-
+  `test_dsd_normalize.py`; `render_dmr_env`/`_validate_multi_feasible`/
+  `/api/mode multi`/`_live_mode` ב-`test_mode.py`; `phys_lcn` tagging/dedup/
+  encryption-per-channel ב-`test_dsd_normalize.py`; `by_channel` RF ב-
+  `test_rf_gain.py`. **68/68 ה-fixture replay של `parse_dsd_line` נשאר ירוק
+  ללא שינוי אחד** — הפרסור עצמו לא נגע, התיוג קורה אחריו ב-`dsd_pty`.
+
+### ⚠ טרם אומת על חומרה (חסימת-שטח לפני production)
+שרשרת האותות הרב-ערוצית (`dsd_pty._run_multi`, `rsp_fm.run_multi`,
+`RtlTcpClient`/`rsp_tcp` בקצב-IQ מעל 240kHz הקיים) היא `pragma: no cover` —
+לא אומתה על RSP1B אמיתי. הסיכון הטכני המרכזי: קליטת IQ רחבת-פס (עד 2MHz)
+מעל `rsp_tcp` (rtl_tcp emulation) לא נבדקה מעולם ביציבות ב-DMR (רק 240kHz
+אומת, ר' Phase 5/CHANGELOG). ספייק-מדידה (`scripts/spike_multichannel.sh`
+בריפו `DMR-DECREP-SHAHAR`) נכתב לבדיקה על חומרה אמיתית; אם `rsp_tcp` לא יציב
+ברוחב-פס הזה, החלופה היא Soapy-direct (`rf/capture.py` ב-DECREP). ר' §5/§10
+Phase 7.
+
+### נדחה במכוון ל-Phase הבא
+בחירת-ערוצים חלקית (`channel_ids`/`--follow-traffic` — יום-1 מפעיל את **כל**
+ה-channelmap של המערכת), ושכבת ה-UI/`channels.json` (טבלת קונפיגורציה + live
+status פר-ערוץ) — נדחו עד שהמנוע יאומת על חומרה אמיתית.
+
 ## [0.5.0] - גילוי רשתות DMR (frequency discovery)
 ### Added — מצב `discover`: סריקת תדרים חכמה + גילוי פרמטרים
 מצב חדש שסורק טווח RF, מזהה תדרים חשודים כ-DMR (גילוי אנרגיה FFT), ואז בודק כל

@@ -1,0 +1,278 @@
+[
+  {
+    "id": "vhf162_1375",
+    "name": "סקר IQ 162.13750 CC7 (בינוני-גבוה)",
+    "control": 162.1375,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.1375
+      }
+    ]
+  },
+  {
+    "id": "vhf162_2625",
+    "name": "סקר IQ 162.26250 CC6 (גבוה)",
+    "control": 162.2625,
+    "color_code": 6,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.2625
+      }
+    ]
+  },
+  {
+    "id": "vhf162_475",
+    "name": "סקר IQ 162.47500 CC1 (גבוה)",
+    "control": 162.475,
+    "color_code": 1,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.475
+      }
+    ]
+  },
+  {
+    "id": "vhf162_525",
+    "name": "סקר IQ 162.52500 CC8 (גבוה מאוד)",
+    "control": 162.525,
+    "color_code": 8,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.525
+      }
+    ]
+  },
+  {
+    "id": "vhf162_5875",
+    "name": "סקר IQ 162.58750 CC5 (גבוה מאוד)",
+    "control": 162.5875,
+    "color_code": 5,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.5875
+      }
+    ]
+  },
+  {
+    "id": "vhf162_675",
+    "name": "סקר IQ 162.67500 CC7 (גבוה)",
+    "control": 162.675,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.675
+      }
+    ]
+  },
+  {
+    "id": "vhf163_06875",
+    "name": "סקר IQ 163.06875 CC10 (גבוה)",
+    "control": 163.06875,
+    "color_code": 10,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 163.06875
+      }
+    ]
+  },
+  {
+    "id": "vhf164_10625",
+    "name": "סקר IQ 164.10625 CC10 (גבוה)",
+    "control": 164.10625,
+    "color_code": 10,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.10625
+      }
+    ]
+  },
+  {
+    "id": "vhf164_3",
+    "name": "סקר IQ 164.30000 CC7 (גבוה מאוד)",
+    "control": 164.3,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.3
+      }
+    ]
+  },
+  {
+    "id": "vhf164_325",
+    "name": "סקר IQ 164.32500 CC6 (גבוה מאוד)",
+    "control": 164.325,
+    "color_code": 6,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.325
+      }
+    ]
+  },
+  {
+    "id": "vhf164_5375",
+    "name": "סקר IQ 164.53750 CC8 (גבוה מאוד)",
+    "control": 164.5375,
+    "color_code": 8,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.5375
+      }
+    ]
+  },
+  {
+    "id": "vhf164_6375",
+    "name": "סקר IQ 164.63750 CC7 (בינוני-גבוה)",
+    "control": 164.6375,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.6375
+      }
+    ]
+  },
+  {
+    "id": "vhf164_725",
+    "name": "סקר IQ 164.72500 CC7 (גבוה מאוד)",
+    "control": 164.725,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.725
+      }
+    ]
+  },
+  {
+    "id": "vhf165_6",
+    "name": "סקר IQ 165.60000 CC7 (בינוני-גבוה)",
+    "control": 165.6,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 165.6
+      }
+    ]
+  },
+  {
+    "id": "vhf165_625",
+    "name": "סקר IQ 165.62500 CC6 (גבוה מאוד)",
+    "control": 165.625,
+    "color_code": 6,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 165.625
+      }
+    ]
+  },
+  {
+    "id": "vhf167_1375",
+    "name": "סקר IQ 167.13750 CC7 (גבוה מאוד)",
+    "control": 167.1375,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 167.1375
+      }
+    ]
+  },
+  {
+    "id": "multi_162cluster",
+    "name": "רב-ערוצי — אשכול 162MHz (7 ערוצים מאומתים)",
+    "control": 162.1375,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 162.1375
+      },
+      {
+        "lcn": 2,
+        "freq": 162.2625
+      },
+      {
+        "lcn": 3,
+        "freq": 162.475
+      },
+      {
+        "lcn": 4,
+        "freq": 162.525
+      },
+      {
+        "lcn": 5,
+        "freq": 162.5875
+      },
+      {
+        "lcn": 6,
+        "freq": 162.675
+      },
+      {
+        "lcn": 7,
+        "freq": 163.06875
+      }
+    ]
+  },
+  {
+    "id": "multi_164cluster",
+    "name": "רב-ערוצי — אשכול 164MHz (הכי פעיל + ראיות ID)",
+    "control": 164.10625,
+    "color_code": 8,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 164.10625
+      },
+      {
+        "lcn": 2,
+        "freq": 164.3
+      },
+      {
+        "lcn": 3,
+        "freq": 164.325
+      },
+      {
+        "lcn": 4,
+        "freq": 164.5375
+      },
+      {
+        "lcn": 5,
+        "freq": 164.6375
+      },
+      {
+        "lcn": 6,
+        "freq": 164.725
+      }
+    ]
+  },
+  {
+    "id": "multi_165cluster",
+    "name": "רב-ערוצי — אשכול 165MHz (2 ערוצים)",
+    "control": 165.6,
+    "color_code": 7,
+    "channelmap": [
+      {
+        "lcn": 1,
+        "freq": 165.6
+      },
+      {
+        "lcn": 2,
+        "freq": 165.625
+      }
+    ]
+  }
+]
