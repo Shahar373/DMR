@@ -57,9 +57,17 @@ DMR_UDP_PORT = 5555                   # חייב להתאים ל-DMR_UDP ב-dmr.
 # מעבר מצב, אז חובה לכלול אותם כאן — אחרת הם נעלמים מהקובץ החי בכל מעבר.
 DMR_BRIDGE_RTLTCP = "127.0.0.1:1234"
 DMR_BRIDGE_AUDIO_TCP = "127.0.0.1:7355"
+DMR_BRIDGE_AUDIO_TCP_BASE = "127.0.0.1:7355"   # multi mode: instance i gets base_port+i
 DMR_BRIDGE_RIGCTL = "127.0.0.1:4532"
 DMR_BRIDGE_IQ_RATE = 240000
 DMR_BRIDGE_AUDIO_GAIN = 4.0
+
+# --- מצב 'multi' (Phase 2): פענוח כל ערוצי ה-channelmap בו-זמנית -----------
+# קליטה רחבת-פס אחת (rsp_tcp) + N מדמודלטורים NFM מוסטים (rsp_fm.py) + N
+# מפענחי DSD-FME, אחד לכל ערוץ פיזי. ר' dsd_pty._run_multi/compute_wideband_plan.
+MULTI_GUARD_HZ = 25_000          # מרווח-שוליים בכל צד הטווח (Hz)
+MULTI_MAX_SPAN_HZ = 2_000_000    # תקרת רוחב-פס לקליטה רחבת-פס אחת (RSP1B)
+MULTI_CHANNELS_MAX = 8           # תקרה שמרנית עד מדידת CPU בפועל על Pi 5 (ר' CLAUDE.md)
 DMR_BUF_MAX = 800                     # שיחות אחרונות בזיכרון (נטענות בעלייה, היום בלבד)
 DMR_LOG_PATH = Path("/var/lib/dmr/dmr.jsonl")
 DMR_LOG_KEEP = 8000                   # retention בדיסק (זנב נשמר; ייצוא לניתוח)
@@ -323,12 +331,22 @@ def write_channelmap(channelmap):
     _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap))
 
 
-def render_dmr_env(system):
+def render_dmr_env(system, multi=False):
     """בונה את תוכן dmr.env (EnvironmentFile של systemd, KEY=VALUE מנותח בבטחה).
     dsd_pty קורא את המשתנים ובונה מהם את שורת הפקודה של DSD-FME.
     ⚠ DSD_CONTROL_FREQ ב-Hz (DSD-FME/rigctl); ה-state/UI עובדים ב-MHz — ההמרה כאן.
     שדות אופציונליים פר-מערכת: trunk (ברירת מחדל 1), sweep (מצב סריקת FFT),
-    emit_status (אירועי sync/channel_status לבדיקת גילוי), no_wav (בלי הקלטה)."""
+    emit_status (אירועי sync/channel_status לבדיקת גילוי), no_wav (בלי הקלטה).
+
+    multi=True (Phase 2, app_mode='multi'): מפענח את כל ערוצי ה-channelmap
+    בו-זמנית (dsd_pty._run_multi) במקום מעקב-טראנקינג -T של DSD-FME על תדר
+    יחיד. DSD_IQ_RATE נשאר ברירת-המחדל החד-ערוצית (לא בשימוש ב-_run_multi —
+    הוא גוזר קצב-IQ רחב-פס משלו מ-DSD_CHANNELMAP + DSD_MULTI_GUARD_HZ/
+    DSD_MULTI_MAX_RATE_HZ, שני המפתחות האחרונים נכתבים כאן מהקבועים
+    MULTI_GUARD_HZ/MULTI_MAX_SPAN_HZ של המודול הזה — **אותם קבועים** ש-
+    _validate_multi_feasible אימת מולם; אחרת חישוב ה-compute_wideband_plan
+    העצמאי של dsd_pty (הכרחי כדי להזין בדיוק אותם center/rate גם ל-rsp_tcp
+    וגם ל-rsp_fm.py — שני תהליכי-בן נפרדים) עלול לסטות מברירות-מחדל אחרות)."""
     control_hz = int(round(float(system["control"]) * 1e6))
     cc = int(system.get("color_code", 1))
     trunk = "1" if str(system.get("trunk", 1)).lower() in ("1", "true", "yes") else "0"
@@ -343,11 +361,18 @@ def render_dmr_env(system):
         f"DSD_UDP={DMR_UDP_HOST}:{DMR_UDP_PORT}",   # יעד פיד ה-JSON (dsd_pty → app.py)
         f"DSD_TRUNK={trunk}",                        # מעקב טראנקינג (Cap+); 0 בבדיקת גילוי
         f"DSD_RTLTCP={DMR_BRIDGE_RTLTCP}",           # rsp_tcp — IQ גולמי מה-RSP1B
-        f"DSD_AUDIO_TCP={DMR_BRIDGE_AUDIO_TCP}",     # rsp_fm.py — PCM 48kHz ל-DSD-FME
+        f"DSD_AUDIO_TCP={DMR_BRIDGE_AUDIO_TCP}",     # rsp_fm.py — PCM 48kHz ל-DSD-FME (חד-ערוצי)
+        f"DSD_AUDIO_TCP_BASE={DMR_BRIDGE_AUDIO_TCP_BASE}",  # rsp_fm.py — בסיס-פורטים ל-multi (base+i)
         f"DSD_RIGCTL={DMR_BRIDGE_RIGCTL}",           # rsp_fm.py — rigctl לכיוונון/סריקה
         f"DSD_IQ_RATE={iq_rate}",                    # קצב IQ מבוקש מ-rsp_tcp (Hz; גבוה בסריקה)
         f"DSD_AUDIO_GAIN={DMR_BRIDGE_AUDIO_GAIN}",   # מכפיל רווח discriminator ב-rsp_fm.py
     ]
+    if multi:
+        lines += [
+            "DSD_MULTI=1",                            # dsd_pty._run() -> _run_multi()
+            f"DSD_MULTI_GUARD_HZ={MULTI_GUARD_HZ}",
+            f"DSD_MULTI_MAX_RATE_HZ={MULTI_MAX_SPAN_HZ}",
+        ]
     if not sweep and not system.get("no_wav"):
         lines.append(f"DSD_WAV_DIR={REC_DIR}")       # per-call WAV לתיקיית ההקלטות
     if sweep:
@@ -362,17 +387,37 @@ def render_dmr_env(system):
     return "\n".join(lines)
 
 
-def write_dmr_env(system):
-    _atomic_write(DMR_ENV_PATH, render_dmr_env(system))
+def write_dmr_env(system, multi=False):
+    _atomic_write(DMR_ENV_PATH, render_dmr_env(system, multi=multi))
+
+
+def _validate_multi_feasible(system):
+    """(ok, error) — מערכת נכנסת ל-multi רק אם יש לה >=2 ערוצי channelmap
+    והם נכנסים בקליטה רחבת-פס אחת (RSP1B, עד MULTI_MAX_SPAN_HZ). טהורה —
+    נבדקת בלי חומרה, ומראה אותה שגיאה שדחיית compute_wideband_plan הייתה
+    נותנת, אבל ב-/api/mode (400) ולא כקריסת dsd_pty מאוחרת יותר."""
+    cmap = system.get("channelmap") or []
+    if len(cmap) < 2:
+        return False, "מצב רב-ערוצי דורש לפחות 2 ערוצים במפת המערכת"
+    if len(cmap) > MULTI_CHANNELS_MAX:
+        return False, f"מצב רב-ערוצי תומך עד {MULTI_CHANNELS_MAX} ערוצים"
+    chan_hz = [int(round(float(ch["freq"]) * 1e6)) for ch in cmap]
+    try:
+        dsd_pty.compute_wideband_plan(chan_hz, guard_hz=MULTI_GUARD_HZ,
+                                      max_rate=MULTI_MAX_SPAN_HZ)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, None
 
 
 # --- מצב DMR: כניסה + standby ----------------------------------------------
-def _enter_dmr(system):
+def _enter_dmr(system, multi=False):
     """כותב env + channelmap ומריץ את dmr-dsdfme (DSD-FME תחת PTY). מחזיר
     (error, detail). מבנה זהה ל-_enter_acars ב-AIR-AM: write-env → restart → poll
-    לקריסה מאוחרת (השירות יכול לעלות ואז לקרוס על תדר/מפה רעים ~2ש' אחר-כך)."""
+    לקריסה מאוחרת (השירות יכול לעלות ואז לקרוס על תדר/מפה רעים ~2ש' אחר-כך).
+    multi=True: מצב רב-ערוצי (Phase 2) — ר' render_dmr_env."""
     write_channelmap(system.get("channelmap"))
-    write_dmr_env(system)
+    write_dmr_env(system, multi=multi)
     try:
         r = _sysctl("restart", DMR_SERVICE, timeout=45)
     except subprocess.TimeoutExpired:
@@ -423,12 +468,17 @@ def _fail_to_off(st, err, detail, log_prefix):
             "app_mode": "off", "state": new_state}, 500
 
 
-MODE_SERVICE = {"dmr": DMR_SERVICE}
+MODE_SERVICE = {"dmr": DMR_SERVICE, "multi": DMR_SERVICE}   # שתיהן אותה יחידת systemd (§0)
 
 
 def _live_mode():
-    """המצב שרץ בפועל (לפי השירות), או None כשהצרכן לא פעיל."""
-    return "dmr" if _is_active(DMR_SERVICE) else None
+    """המצב שרץ בפועל (לפי השירות), או None כשהצרכן לא פעיל. dmr/multi חולקות
+    את אותה יחידת systemd (dmr-dsdfme) — systemctl לא יכול להבדיל ביניהן,
+    אז נעזרים במצב השמור (state.json) כדי לדווח את המצב הנכון."""
+    if not _is_active(DMR_SERVICE):
+        return None
+    saved = load_state().get("app_mode")
+    return saved if saved in MODE_SERVICE else "dmr"
 
 
 # --- פיד השיחות: נרמול, התמדה, listener ------------------------------------
@@ -482,7 +532,15 @@ def _normalize_dsd(m):
     ל-slot ע"י ה-listener (_dmr_correlate_encryption). מחזיר None לכל type
     אחר (כולל housekeeping — אך dsd_pty כבר לא שולח אותם כלל).
     לעולם *לא* ממציא מדד: ber/level נשארים None כי DSD-FME לא מדפיס אותם
-    בקליטה אמיתית שנבדקה (אין "לרמות" למספר — ר' CLAUDE.md §8)."""
+    בקליטה אמיתית שנבדקה (אין "לרמות" למספר — ר' CLAUDE.md §8).
+
+    ★ Phase 2 (multi mode): dsd_pty._run_multi מתייג כל אירוע עם phys_lcn/
+    phys_freq_hz — זהות-ערוץ ודאית (נקבעת בזמן spawn, לא ניחוש מטקסט DSD-FME)
+    כי dsd_pty הוא היחיד שיודע בוודאות לאיזה תהליך dsd-fme (מחובר ל-audio
+    port_i, שהוסט ל-freq_hz_i) שייכת שורה נתונה. כשקיים — הוא **מחליף** את
+    _channelmap_freq(lcn) (חיפוש-ניחוש לפי Rest-LSN, רלוונטי רק ל-trunking
+    חד-ערוצי) ולא רק משלים אותו. בחד-ערוצי (dmr/scan) phys_lcn/phys_freq_hz
+    תמיד None => אותה התנהגות בדיוק כמו לפני Phase 2."""
     if not isinstance(m, dict) or m.get("type") not in _CARD_EVENT_TYPES:
         return None
     typ = m["type"]
@@ -493,6 +551,14 @@ def _normalize_dsd(m):
     src = _int_or_none(m.get("src"))
     tgt = _int_or_none(m.get("tgt"))
     lcn = _int_or_none(m.get("lcn"))
+    phys_lcn = _int_or_none(m.get("phys_lcn"))
+    phys_freq_hz = _int_or_none(m.get("phys_freq_hz"))
+    if phys_freq_hz is not None:
+        freq = round(phys_freq_hz / 1e6, 6)
+        card_lcn = phys_lcn if phys_lcn is not None else lcn
+    else:
+        freq = _channelmap_freq(lcn)
+        card_lcn = lcn
     ct = str(m.get("call_type") or "data").strip().lower()
     if ct not in DMR_CALL_TYPES:
         ct = "data"
@@ -508,7 +574,8 @@ def _normalize_dsd(m):
 
     card = {
         "t": round(t, 3), "proto": "DMR",
-        "freq": _channelmap_freq(lcn), "slot": slot, "cc": None, "lcn": lcn,
+        "freq": freq, "slot": slot, "cc": None, "lcn": card_lcn,
+        "phys_lcn": phys_lcn,   # None בחד-ערוצי; ערוץ-אמת ב-multi (dedup/RF פר-ערוץ)
         "tg": tg, "tg_alias": aliasdb.tg_name(tg),
         "src": src, "src_alias": aliasdb.rid_name(src),
         "tgt": tgt, "tgt_alias": aliasdb.rid_name(tgt),
@@ -560,32 +627,51 @@ def _trim_dmr_log():
 # מד dBFS עצמאי מה-SDR עצמו נדחה במכוון (דורש פטצ' rsp_tcp; ר' CLAUDE.md §8).
 RF_WINDOW_SEC = 60.0
 _rf_lock = threading.Lock()
-_rf_ticks = collections.deque()   # (t, error_type) — נגזם לחלון RF_WINDOW_SEC
+_rf_ticks = collections.deque()   # (t, phys_lcn, error_type) — נגזם לחלון RF_WINDOW_SEC
 
 
-def _rf_quality_tick(error_type):
+def _rf_quality_tick(error_type, phys_lcn=None):
+    """phys_lcn=None בחד-ערוצי (dmr/scan) — כמו לפני Phase 2. ב-multi mode
+    dsd_pty מתייג כל אירוע UDP עם phys_lcn אמיתי (ר' _dmr_listener)."""
     now = time.time()
     with _rf_lock:
-        _rf_ticks.append((now, error_type))
+        _rf_ticks.append((now, phys_lcn, error_type))
         cutoff = now - RF_WINDOW_SEC
         while _rf_ticks and _rf_ticks[0][0] < cutoff:
             _rf_ticks.popleft()
 
 
-def _rf_quality_snapshot():
+def _rf_quality_snapshot(phys_lcn=None):
     """תדירות שגיאות CRC/FEC אמיתית ב-RF_WINDOW_SEC האחרונות. פונקציה טהורה
-    (קוראת מהחלון הנגלל בלבד) => נבדקת בלי חומרה."""
+    (קוראת מהחלון הנגלל בלבד) => נבדקת בלי חומרה. phys_lcn=None (ברירת
+    מחדל) => צובר גלובלי על פני כל הטיקים (חד-ערוצי: תמיד None => זהה
+    להתנהגות המקורית). phys_lcn=<int> => מסונן לערוץ בודד (multi mode)."""
     now = time.time()
     with _rf_lock:
         cutoff = now - RF_WINDOW_SEC
         while _rf_ticks and _rf_ticks[0][0] < cutoff:
             _rf_ticks.popleft()
         ticks = list(_rf_ticks)
-    by_type = collections.Counter(t for _, t in ticks)
+    if phys_lcn is not None:
+        ticks = [t for t in ticks if t[1] == phys_lcn]
+    by_type = collections.Counter(t[2] for t in ticks)
     total = len(ticks)
     return {"window_sec": RF_WINDOW_SEC, "total_errors": total,
             "errors_per_min": round(total * 60.0 / RF_WINDOW_SEC, 1),
             "by_type": [{"error_type": k, "count": v} for k, v in by_type.most_common()]}
+
+
+def _rf_quality_by_channel():
+    """פירוט איכות-RF פר-ערוץ (multi mode, Phase 2). ריק בחד-ערוצי — שם כל
+    הטיקים נושאים phys_lcn=None ואף ערוץ לא נספר כאן (הם כלולים בצובר
+    הגלובלי של _rf_quality_snapshot()/None, לא כפולים)."""
+    with _rf_lock:
+        now = time.time()
+        cutoff = now - RF_WINDOW_SEC
+        while _rf_ticks and _rf_ticks[0][0] < cutoff:
+            _rf_ticks.popleft()
+        channels = sorted({t[1] for t in _rf_ticks if t[1] is not None})
+    return [{"phys_lcn": lcn, **_rf_quality_snapshot(lcn)} for lcn in channels]
 
 
 # נוד-רווח חי: g/G דרך dsd_pty.send_gain_nudge (הקשה ל-DSD-FME, בלי לעצור אותו).
@@ -672,7 +758,13 @@ def _dmr_listener():
     dedup: אירועי המשך של אותה שיחה (voice frames) מתאחדים לכרטיס אחד (8ש').
     quality/encryption *לא* הופכים לכרטיס: quality מוזן ל-_rf_quality_tick
     (מד תדירות-שגיאות), encryption מתואם לשיחה הפתוחה באותו slot (_slot_open_call,
-    חלון 15ש' — best-effort; אם אין שיחה פתוחה מתאימה, מדולג בשקט)."""
+    חלון 15ש' — best-effort; אם אין שיחה פתוחה מתאימה, מדולג בשקט).
+
+    ★ Phase 2 (multi mode): מפתחות ה-dedup/_slot_open_call/RF מורחבים עם ממד
+    phys_lcn (תמיד None בחד-ערוצי => מתנוון בדיוק לאותה התנהגות כמו לפני
+    Phase 2). בלי זה, שתי שיחות בו-זמנית על שני ערוצים שונים עם אותו slot
+    (1/2 — יש רק 2 אפשריים לכל ערוץ) היו מתמזגות/מקבלות תג-הצפנה בטעות
+    מערוץ אחר — לא רק קוסמטי, שחיתות-נתונים בין-ערוצית אמיתית."""
     global _dmr_seq
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -681,8 +773,8 @@ def _dmr_listener():
         log.warning("DMR listener: port %d busy - /api/dmr יחזיר ריק", DMR_UDP_PORT)
         return
     seen = 0
-    _dedup: dict = {}           # (tg, src, slot, call_type) → (timestamp, rec) — איחוד המשך-שיחה
-    _slot_open_call: dict = {}  # slot → (timestamp, rec) — לקורלציית encryption
+    _dedup: dict = {}           # (phys_lcn, tg, src, slot, call_type) → (timestamp, rec)
+    _slot_open_call: dict = {}  # (phys_lcn, slot) → (timestamp, rec) — לקורלציית encryption
     while True:
         try:
             data, _ = sock.recvfrom(65535)
@@ -699,11 +791,12 @@ def _dmr_listener():
             _discover_collect(msg)
 
         mtype = msg.get("type")
+        msg_phys_lcn = _int_or_none(msg.get("phys_lcn"))
         if mtype == "quality":
-            _rf_quality_tick(msg.get("error_type") or "UNKNOWN")
+            _rf_quality_tick(msg.get("error_type") or "UNKNOWN", phys_lcn=msg_phys_lcn)
             continue
         if mtype == "encryption":
-            entry = _slot_open_call.get(msg.get("slot"))
+            entry = _slot_open_call.get((msg_phys_lcn, msg.get("slot")))
             ts = msg.get("t") or time.time()
             if entry is not None and ts - entry[0] < 15:
                 with _dmr_lock:   # open_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
@@ -717,13 +810,13 @@ def _dmr_listener():
             log.exception("DMR: נרמול נכשל על דאטהגרם — מדולג")
             continue
         if mtype == "voice_call" and msg.get("crc_err"):
-            _rf_quality_tick("VOICE_CRC")   # פריים קול שנכשל => גם מד ה-RF, גם (אם יש) הכרטיס
+            _rf_quality_tick("VOICE_CRC", phys_lcn=msg_phys_lcn)   # פריים קול שנכשל => גם מד ה-RF, גם (אם יש) הכרטיס
         if rec is None:
             continue
 
-        # dedup: אותה שיחה (tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים (משך/wav),
-        # לא כרטיס חדש. שיחות voice ב-DMR משדרות מסגרות רבות לאורך השיחה.
-        key = (rec.get("tg"), rec.get("src"), rec.get("slot"), rec.get("call_type"))
+        # dedup: אותה שיחה (ערוץ+tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים
+        # (משך/wav), לא כרטיס חדש. שיחות voice ב-DMR משדרות מסגרות רבות.
+        key = (rec.get("phys_lcn"), rec.get("tg"), rec.get("src"), rec.get("slot"), rec.get("call_type"))
         ts = rec.get("t") or time.time()
         is_voice = rec.get("call_type") in ("group", "private") and (rec.get("tg") or rec.get("src"))
         if is_voice:
@@ -736,7 +829,7 @@ def _dmr_listener():
                     prev_rec["frames"] = prev_rec.get("frames", 1) + 1
                 _dedup[key] = (ts, prev_rec)
                 if rec.get("slot") is not None:
-                    _slot_open_call[rec["slot"]] = (ts, prev_rec)
+                    _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, prev_rec)
                 continue
             rec["_start"] = ts
             _dedup[key] = (ts, rec)
@@ -751,8 +844,8 @@ def _dmr_listener():
             rec["id"] = _dmr_seq
             _dmr_msgs.append(rec)
         if is_voice and rec.get("slot") is not None:
-            _slot_open_call[rec["slot"]] = (ts, rec)
-            if len(_slot_open_call) > 8:   # רק 2 slots אפשריים בפועל — הגנה בכל זאת
+            _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, rec)
+            if len(_slot_open_call) > 8:   # רק 2 slots לכל ערוץ בפועל — הגנה בכל זאת
                 cutoff = ts - 15
                 for k in [k for k, (t0, _) in _slot_open_call.items() if t0 < cutoff]:
                     del _slot_open_call[k]
@@ -1411,9 +1504,11 @@ def api_positions():
 @app.route("/api/rf")
 def api_rf():
     """איכות RF: תדירות שגיאות CRC/FEC אמיתית מ-DSD-FME (חלון RF_WINDOW_SEC).
-    **אין dBFS/SNR** — נדחה במכוון (ר' CLAUDE.md §8: דורש פטצ' rsp_tcp)."""
+    **אין dBFS/SNR** — נדחה במכוון (ר' CLAUDE.md §8: דורש פטצ' rsp_tcp).
+    by_channel: פירוט פר-ערוץ ב-multi mode (Phase 2) — [] בחד-ערוצי."""
     st = load_state()
-    return jsonify(ok=True, gain_nudge=int(st.get("gain_nudge", 0)), **_rf_quality_snapshot())
+    return jsonify(ok=True, gain_nudge=int(st.get("gain_nudge", 0)),
+                   by_channel=_rf_quality_by_channel(), **_rf_quality_snapshot())
 
 
 @app.route("/api/gain", methods=["POST"])
@@ -1781,8 +1876,8 @@ def api_mode():
     SDR אחד בהחלפה. כישלון כניסה => off (בלי fallback). POST => עובר דרך _guard."""
     data = request.get_json(silent=True) or {}
     mode = str(data.get("mode", "")).lower()
-    if mode not in ("dmr", "off", "scan", "discover"):
-        return jsonify(ok=False, error="mode לא תקין (dmr/off/scan/discover)"), 400
+    if mode not in ("dmr", "off", "scan", "discover", "multi"):
+        return jsonify(ok=False, error="mode לא תקין (dmr/off/scan/discover/multi)"), 400
 
     # ולידציה סטטית קודם (לא תלוית-נעילה) — בקשה עם פרמטרים לא-תקינים (400) לא
     # נוגעת בסבב סריקה פעיל (מניעת "scan זומבי"). _scan_stop_thread נקרא רק אחרי
@@ -1805,6 +1900,15 @@ def api_mode():
         system = _find_system(systems, sid) if sid else (systems[0] if systems else None)
         if system is None:
             return jsonify(ok=False, error="לא נבחרה מערכת DMR תקינה", state=st), 400
+    elif mode == "multi":
+        sid = data.get("system") or st.get("system")
+        systems = load_systems()
+        system = _find_system(systems, sid) if sid else (systems[0] if systems else None)
+        if system is None:
+            return jsonify(ok=False, error="לא נבחרה מערכת DMR תקינה", state=st), 400
+        ok, err = _validate_multi_feasible(system)
+        if not ok:
+            return jsonify(ok=False, error=err, state=st), 400
 
     if not TUNE_LOCK.acquire(timeout=0.5):
         return jsonify(ok=False, error="פעולה אחרת מתבצעת — נסה שוב",
@@ -1844,6 +1948,16 @@ def api_mode():
                 payload, status = _fail_to_off(st, err, detail, "enter discover")
                 return jsonify(payload), status
             return jsonify(ok=True, app_mode="discover", plan=sweep_plan)
+
+        if mode == "multi":
+            log.info("mode -> MULTI system=%s (from %s)", system["id"], request.remote_addr)
+            err, detail = _enter_dmr(system, multi=True)
+            if err:
+                payload, status = _fail_to_off(st, err, detail, "enter multi")
+                return jsonify(payload), status
+            new_state = {**load_state(), "app_mode": "multi", "system": system["id"]}
+            save_state(new_state)
+            return jsonify(ok=True, app_mode="multi", system=system["id"])
 
         # mode == "dmr"
         log.info("mode -> DMR system=%s (from %s)", system["id"], request.remote_addr)
@@ -1950,6 +2064,16 @@ def _boot_restore():
                     err, _detail = "אין מערכת DMR שמורה", None
                 else:
                     err, _detail = _enter_dmr(system)
+            elif mode == "multi":
+                systems = load_systems()
+                system = _find_system(systems, st.get("system")) or (systems[0] if systems else None)
+                if system is None:
+                    err, _detail = "אין מערכת DMR שמורה", None
+                else:
+                    ok, verr = _validate_multi_feasible(system)
+                    err, _detail = (None, None) if ok else (verr, None)
+                    if ok:
+                        err, _detail = _enter_dmr(system, multi=True)
             else:   # scan
                 plan = _validate_scan_plan(st.get("scan_plan"))
                 if plan is None:

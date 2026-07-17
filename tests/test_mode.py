@@ -142,3 +142,108 @@ def test_render_channelmap(paths):
     assert "1,461037500" in txt and "2,461062500" in txt
 
 
+# --- multi mode (Phase 2) ----------------------------------------------------
+def _multi_system():
+    return {"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
+            "channelmap": [
+                {"lcn": 1, "freq": 461.0375},
+                {"lcn": 2, "freq": 461.0625},
+                {"lcn": 3, "freq": 461.0875},
+            ]}
+
+
+def test_render_dmr_env_multi_adds_flags_and_keeps_base_keys():
+    """multi=True מוסיף DSD_MULTI + DSD_MULTI_GUARD_HZ/MAX_RATE_HZ בלי לאבד
+    אף מפתח-גשר בסיסי (render_dmr_env דורס את כל הקובץ בכל מעבר — §8)."""
+    import app
+    system = _multi_system()
+    env = app.render_dmr_env(system, multi=True)
+    assert "DSD_MULTI=1" in env
+    assert f"DSD_MULTI_GUARD_HZ={app.MULTI_GUARD_HZ}" in env
+    assert f"DSD_MULTI_MAX_RATE_HZ={app.MULTI_MAX_SPAN_HZ}" in env
+    for key in ("DSD_RTLTCP", "DSD_AUDIO_TCP", "DSD_AUDIO_TCP_BASE", "DSD_RIGCTL",
+                "DSD_IQ_RATE", "DSD_AUDIO_GAIN", "DSD_CHANNELMAP"):
+        assert f"{key}=" in env, f"missing {key} in rendered multi dmr.env"
+    # dmr/scan (multi=False, ברירת מחדל) לא כוללים בכלל את הדגלים האלה
+    single = app.render_dmr_env(system)
+    assert "DSD_MULTI" not in single
+
+
+def test_validate_multi_feasible_requires_two_channels():
+    import app
+    ok, err = app._validate_multi_feasible(
+        {"channelmap": [{"lcn": 1, "freq": 461.0}]})
+    assert ok is False and "2" in err
+
+
+def test_validate_multi_feasible_rejects_too_many_channels():
+    import app
+    cmap = [{"lcn": i, "freq": 461.0 + i * 0.0125} for i in range(1, app.MULTI_CHANNELS_MAX + 2)]
+    ok, err = app._validate_multi_feasible({"channelmap": cmap})
+    assert ok is False and str(app.MULTI_CHANNELS_MAX) in err
+
+
+def test_validate_multi_feasible_rejects_span_too_wide():
+    import app
+    ok, err = app._validate_multi_feasible(
+        {"channelmap": [{"lcn": 1, "freq": 461.0}, {"lcn": 2, "freq": 465.0}]})
+    assert ok is False and "MHz" in err
+
+
+def test_validate_multi_feasible_accepts_tight_channelmap():
+    import app
+    ok, err = app._validate_multi_feasible(_multi_system())
+    assert ok is True and err is None
+
+
+def test_api_mode_multi_enters_and_renders_multi_env(paths, sysctl, no_sleep):
+    app = paths
+    _seed_systems(app, [_multi_system()])
+    r = _client(app).post("/api/mode", json={"mode": "multi", "system": "s1"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert r.get_json()["app_mode"] == "multi"
+    st = json.loads(app.STATE_PATH.read_text())
+    assert st["app_mode"] == "multi" and st["system"] == "s1"
+    assert "DSD_MULTI=1" in app.DMR_ENV_PATH.read_text()
+    assert ("restart", app.DMR_SERVICE) in sysctl.calls
+
+
+def test_api_mode_multi_rejects_single_channel_system(paths, sysctl, no_sleep):
+    app = paths
+    _seed_systems(app, [{"id": "s1", "name": "T", "control": 461.0, "color_code": 1,
+                         "channelmap": [{"lcn": 1, "freq": 461.0}]}])
+    r = _client(app).post("/api/mode", json={"mode": "multi", "system": "s1"})
+    assert r.status_code == 400
+    assert ("restart", app.DMR_SERVICE) not in sysctl.calls   # לא נגע ב-SDR בכלל
+
+
+def test_api_mode_multi_rejects_span_too_wide(paths, sysctl, no_sleep):
+    app = paths
+    _seed_systems(app, [{"id": "s1", "name": "T", "control": 461.0, "color_code": 1,
+                         "channelmap": [{"lcn": 1, "freq": 461.0}, {"lcn": 2, "freq": 465.0}]}])
+    r = _client(app).post("/api/mode", json={"mode": "multi", "system": "s1"})
+    assert r.status_code == 400
+    assert "MHz" in r.get_json()["error"]
+
+
+def test_api_mode_multi_no_system(paths, sysctl, no_sleep):
+    app = paths
+    _seed_systems(app, [])
+    r = _client(app).post("/api/mode", json={"mode": "multi"})
+    assert r.status_code == 400
+
+
+def test_live_mode_distinguishes_multi_from_dmr(paths, sysctl, no_sleep):
+    """dmr/multi חולקות את אותה יחידת systemd — _live_mode צריך להבדיל
+    ביניהן לפי המצב השמור, לא רק systemctl is-active."""
+    app = paths
+    _seed_systems(app, [_multi_system()])
+    _client(app).post("/api/mode", json={"mode": "multi", "system": "s1"})
+    assert app._live_mode() == "multi"
+
+    _seed_systems(app, [{"id": "s2", "name": "T2", "control": 461.0, "color_code": 1,
+                         "channelmap": [{"lcn": 1, "freq": 461.0}]}])
+    _client(app).post("/api/mode", json={"mode": "dmr", "system": "s2"})
+    assert app._live_mode() == "dmr"
+
+

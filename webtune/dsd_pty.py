@@ -20,6 +20,7 @@ import signal
 import socket
 import sys
 import time
+from pathlib import Path
 
 DEFAULT_UDP = "127.0.0.1:5555"
 DSD_BIN = os.environ.get("DSD_BIN", "dsd-fme")
@@ -27,6 +28,7 @@ CTRL_SOCK_PATH = os.environ.get("DSD_CTRL_SOCK", "/run/dmr/dsd-ctrl.sock")
 BRIDGE_CTRL_SOCK = os.environ.get("DSD_BRIDGE_CTRL_SOCK", "/run/dmr/rsp-fm.sock")
 RSP_TCP_HOST = os.environ.get("DSD_RTLTCP", "127.0.0.1:1234")
 AUDIO_TCP_HOST = os.environ.get("DSD_AUDIO_TCP", "127.0.0.1:7355")
+AUDIO_TCP_BASE_HOST = os.environ.get("DSD_AUDIO_TCP_BASE", "127.0.0.1:7355")
 RIGCTL_HOST = os.environ.get("DSD_RIGCTL", "127.0.0.1:4532")
 RSP_FM_BIN = os.environ.get(
     "RSP_FM_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rsp_fm.py")
@@ -231,6 +233,113 @@ def build_bridge_command(env):
     return command
 
 
+def compute_wideband_plan(channelmap_hz, guard_hz=25_000, max_rate=2_000_000,
+                          audio_rate=48_000):
+    """(center_hz, iq_rate) for one wideband capture covering every channel.
+    Pure -- stdlib only, no numpy dependency (unlike rsp_fm's copy, which
+    exists for that module's own standalone-CLI convenience). This is the
+    ONE authoritative computation for multi mode: rsp_tcp and rsp_fm.py are
+    two independent subprocesses (see _run_multi) that must tune to the
+    exact same center/rate, so dsd_pty computes it once here and passes the
+    result explicitly to both build_multi_rsp_tcp_command and
+    build_multi_bridge_command -- never recomputed downstream.
+
+    iq_rate is rounded UP to the nearest multiple of audio_rate (rsp_fm's
+    NfmDemodulator requires iq_rate % audio_rate == 0 for integer decimation)."""
+    channelmap_hz = list(channelmap_hz)
+    if not channelmap_hz:
+        raise ValueError("multi-channel plan needs at least one channel")
+    lo, hi = min(channelmap_hz), max(channelmap_hz)
+    span = hi - lo
+    if span + 2 * guard_hz > max_rate:
+        raise ValueError(
+            f"channel plan spans {span / 1e6:.4f} MHz + guard "
+            f"({2 * guard_hz / 1e6:.4f} MHz) -- exceeds {max_rate / 1e6:.1f} "
+            "MHz max; narrow the plan or use fewer channels")
+    center_hz = (hi + lo) // 2
+    floor_hz = max(span + 2 * guard_hz, audio_rate)
+    iq_rate = -(-int(floor_hz) // audio_rate) * audio_rate  # ceil to multiple of audio_rate
+    return int(center_hz), int(iq_rate)
+
+
+def parse_channelmap_hz(path):
+    """[{'lcn': int, 'freq_hz': int}, ...] from the LCN,FREQ_HZ CSV app.py's
+    render_channelmap() writes for DSD-FME's -C flag -- multi mode reuses
+    that exact file/format (dsd_pty already reads DSD_CHANNELMAP for -C in
+    build_command; this just needs it structured for orchestration)."""
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lcn_s, _, hz_s = line.partition(",")
+            try:
+                out.append({"lcn": int(lcn_s), "freq_hz": int(hz_s)})
+            except ValueError:
+                continue
+    return out
+
+
+def build_multi_rsp_tcp_command(env, center_hz, iq_rate):
+    """rsp_tcp tuned to the wideband centre (not DSD_CONTROL_FREQ -- that key
+    is unused in multi mode, see app.py's render_dmr_env multi branch)."""
+    host, port = _split_endpoint(env.get("DSD_RTLTCP", RSP_TCP_HOST), 1234)
+    return [
+        os.environ.get("RSP_TCP_BIN", "rsp_tcp"),
+        "-a", host,
+        "-p", port,
+        "-s", str(int(iq_rate)),
+        "-f", str(int(center_hz)),
+    ]
+
+
+def build_multi_bridge_command(env, center_hz, iq_rate):
+    channel_map = env.get("DSD_CHANNELMAP")
+    if not channel_map:
+        raise ValueError("DSD_CHANNELMAP is required for multi mode")
+    return [
+        sys.executable,
+        "-u",
+        os.environ.get("RSP_FM_BIN", RSP_FM_BIN),
+        "--rtl", env.get("DSD_RTLTCP", RSP_TCP_HOST),
+        "--audio-tcp-base", env.get("DSD_AUDIO_TCP_BASE", AUDIO_TCP_BASE_HOST),
+        "--rigctl", env.get("DSD_RIGCTL", RIGCTL_HOST),
+        "--control-socket", env.get("DSD_BRIDGE_CTRL_SOCK", BRIDGE_CTRL_SOCK),
+        "--multi-channelmap", str(channel_map),
+        "--frequency", str(int(center_hz)),
+        "--iq-rate", str(int(iq_rate)),
+        "--audio-gain", str(env.get("DSD_AUDIO_GAIN", "4.0")),
+    ]
+
+
+def build_channel_dsd_command(env, lcn, audio_port, wav_root=None):
+    """One dsd-fme instance for one physical channel: fixed-frequency, no
+    -T/-U (no per-channel retuning -- Cap+ TDMA carries both logical slots
+    on one physical frequency, and there is only one shared LO; see
+    compute_wideband_plan). -7 before -P is required by DSD-FME's argv
+    parser (same order as the single-channel build_command)."""
+    audio_host, _ = _split_endpoint(env.get("DSD_AUDIO_TCP_BASE", AUDIO_TCP_BASE_HOST), 7355)
+    command = [DSD_BIN, "-i", f"tcp:{audio_host}:{int(audio_port)}", "-o", "null", "-fs"]
+    if wav_root:
+        command += ["-7", str(Path(wav_root) / f"lcn{lcn}"), "-P"]
+    return command
+
+
+def tag_event(event, lcn, freq_hz):
+    """Stamp a parse_dsd_line() result with ground-truth channel identity.
+    Pulled out as a pure helper (rather than inlined in _run_multi, which is
+    pragma: no cover hardware runtime) so this specific step -- the one that
+    fixes the "which physical channel did this line come from" problem -- is
+    unit-testable without pty/subprocess machinery. Only ever called on a
+    non-None parse_dsd_line() result. phys_lcn/phys_freq_hz are additive:
+    single-channel dmr/scan events never carry them, so
+    _normalize_dsd/_dmr_listener treat their absence as today's behavior."""
+    event["phys_lcn"] = int(lcn)
+    event["phys_freq_hz"] = int(freq_hz)
+    return event
+
+
 def build_command(env):
     """Build a DSD-FME argv using supported PCM TCP input and rigctl tuning."""
     audio_host, audio_port = _split_endpoint(env.get("DSD_AUDIO_TCP", AUDIO_TCP_HOST), 7355)
@@ -328,9 +437,12 @@ def _run():  # pragma: no cover - hardware runtime
     import pty
     import subprocess
 
+    env = dict(os.environ)
+    if env.get("DSD_MULTI", "").lower() in ("1", "true", "yes"):
+        return _run_multi(env)
+
     target = _udp_target()
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    env = dict(os.environ)
     sweep = env.get("DSD_SWEEP", "").lower() in ("1", "true", "yes")
     emit_status = env.get("DSD_EMIT_STATUS", "").lower() in ("1", "true", "yes")
     processes = []
@@ -459,6 +571,130 @@ def _run():  # pragma: no cover - hardware runtime
         if master is not None:
             try:
                 os.close(master)
+            except OSError:
+                pass
+        udp.close()
+
+
+def _run_multi(env):  # pragma: no cover - hardware runtime
+    """N-decoder counterpart of _run(): one wideband rsp_tcp + one rsp_fm.py
+    bridge (N offset-aware demodulators, N audio ports) + N dsd-fme instances,
+    one per physical channel in DSD_CHANNELMAP. Every parsed event is tagged
+    with (phys_lcn, phys_freq_hz) via tag_event() before going out on UDP --
+    ground truth app.py needs to disambiguate N simultaneous channels (see
+    app.py's _normalize_dsd/_dmr_listener phys_lcn handling). Any single
+    dsd-fme instance dying takes the whole service down (matches
+    single-channel _run()'s Restart=always semantics -- partial per-channel
+    respawn is a deliberate day-one simplification, not yet implemented)."""
+    import pty
+    import subprocess
+
+    channel_map_path = env.get("DSD_CHANNELMAP")
+    if not channel_map_path:
+        sys.stderr.write("dsd_pty: DSD_MULTI=1 but DSD_CHANNELMAP is not set\n")
+        return 1
+    channels = parse_channelmap_hz(channel_map_path)
+    if not channels:
+        sys.stderr.write(f"dsd_pty: DSD_CHANNELMAP {channel_map_path!r} has no channels\n")
+        return 1
+    try:
+        center_hz, iq_rate = compute_wideband_plan(
+            [c["freq_hz"] for c in channels],
+            guard_hz=int(env.get("DSD_MULTI_GUARD_HZ", "25000")),
+            max_rate=int(env.get("DSD_MULTI_MAX_RATE_HZ", "2000000")))
+    except ValueError as exc:
+        sys.stderr.write(f"dsd_pty: multi channel plan invalid: {exc}\n")
+        return 1
+
+    target = _udp_target()
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    emit_status = env.get("DSD_EMIT_STATUS", "").lower() in ("1", "true", "yes")
+    wav_dir = env.get("DSD_WAV_DIR")
+    processes = []
+    dsd_procs = {}   # lcn -> {"proc":, "master":, "buffer": bytes, "freq_hz": int}
+
+    try:
+        rsp_command = build_multi_rsp_tcp_command(env, center_hz, iq_rate)
+        sys.stderr.write("dsd_pty: exec (IQ server, multi) %s\n" % " ".join(rsp_command))
+        sys.stderr.flush()
+        rsp = subprocess.Popen(rsp_command, preexec_fn=_pdeathsig_term)
+        processes.append(rsp)
+
+        bridge_command = build_multi_bridge_command(env, center_hz, iq_rate)
+        sys.stderr.write("dsd_pty: exec (FM bridge, multi) %s\n" % " ".join(bridge_command))
+        sys.stderr.flush()
+        bridge = subprocess.Popen(bridge_command, preexec_fn=_pdeathsig_term)
+        processes.append(bridge)
+
+        rig_host, rig_port = _split_endpoint(env.get("DSD_RIGCTL", RIGCTL_HOST), 4532)
+        if not _wait_for_port(rig_host, int(rig_port), bridge):
+            raise RuntimeError("rsp_fm rigctl port did not become ready")
+
+        audio_host, base_port = _split_endpoint(
+            env.get("DSD_AUDIO_TCP_BASE", AUDIO_TCP_BASE_HOST), 7355)
+        for i, ch in enumerate(channels):
+            port = int(base_port) + i
+            if not _wait_for_port(audio_host, port, bridge):
+                raise RuntimeError(f"rsp_fm audio port for lcn={ch['lcn']} did not become ready")
+            command = build_channel_dsd_command(env, ch["lcn"], port, wav_dir)
+            sys.stderr.write("dsd_pty: exec (lcn=%s) %s\n" % (ch["lcn"], " ".join(command)))
+            sys.stderr.flush()
+            master, slave = pty.openpty()
+            proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                                    close_fds=True, preexec_fn=_pdeathsig_term)
+            os.close(slave)
+            processes.insert(0, proc)
+            dsd_procs[ch["lcn"]] = {"proc": proc, "master": master, "buffer": b"",
+                                    "freq_hz": ch["freq_hz"]}
+
+        while True:
+            if rsp.poll() is not None:
+                sys.stderr.write(f"dsd_pty: rsp_tcp exited with status {rsp.returncode}\n")
+                break
+            if bridge.poll() is not None:
+                sys.stderr.write(f"dsd_pty: rsp_fm exited with status {bridge.returncode}\n")
+                break
+            dead = [lcn for lcn, c in dsd_procs.items() if c["proc"].poll() is not None]
+            if dead:
+                sys.stderr.write(f"dsd_pty: dsd-fme for lcn={dead} exited\n")
+                break
+            readers = [c["master"] for c in dsd_procs.values()]
+            ready, _, _ = select.select(readers, [], [], 1.0)
+            for lcn, c in dsd_procs.items():
+                if c["master"] not in ready:
+                    continue
+                try:
+                    chunk = os.read(c["master"], 4096)
+                except OSError:
+                    continue
+                if not chunk:
+                    continue
+                c["buffer"] += chunk
+                while b"\n" in c["buffer"]:
+                    raw_line, c["buffer"] = c["buffer"].split(b"\n", 1)
+                    text = clean_dsd_line(raw_line.decode("utf-8", "replace"))
+                    if text:
+                        sys.stderr.write(f"dsd-fme[lcn={lcn}]: {text}\n")
+                        sys.stderr.flush()
+                    event = parse_dsd_line(text, emit_status=emit_status)
+                    if event:
+                        event["t"] = time.time()
+                        tag_event(event, lcn, c["freq_hz"])
+                        try:
+                            udp.sendto(json.dumps(event).encode("utf-8"), target)
+                        except OSError:
+                            pass
+        return 1
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.stderr.write(f"dsd_pty: multi fatal: {exc}\n")
+        sys.stderr.flush()
+        return 1
+    finally:
+        for process in processes:
+            _terminate(process)
+        for c in dsd_procs.values():
+            try:
+                os.close(c["master"])
             except OSError:
                 pass
         udp.close()

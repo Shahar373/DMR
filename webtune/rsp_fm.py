@@ -87,6 +87,55 @@ def compute_power_spectrum(iq, nfft: int) -> Optional[np.ndarray]:
     return power_db.astype(np.float32)
 
 
+def compute_wideband_plan(channelmap_hz, guard_hz: int = 25_000,
+                           max_rate: int = 2_000_000,
+                           audio_rate: int = DEFAULT_AUDIO_RATE) -> tuple:
+    """(center_hz, iq_rate) for one wideband capture covering every frequency
+    in `channelmap_hz` (Hz). Pure -- no hardware, testable without an RSP1B.
+    Multi-channel decode (Phase 2): a single RtlTcpClient is tuned once to
+    center_hz/iq_rate, and each physical channel gets its own offset-aware
+    NfmDemodulator (offset_hz = freq_hz - center_hz) instead of retuning the
+    one shared LO per channel (there is only one LO -- see CLAUDE.md §8).
+
+    iq_rate is rounded UP to the nearest multiple of `audio_rate`:
+    NfmDemodulator requires iq_rate % audio_rate == 0 for integer decimation,
+    so this is computed once here rather than risking a ValueError at every
+    one of the N per-channel NfmDemodulator construction sites.
+    """
+    channelmap_hz = list(channelmap_hz)
+    if not channelmap_hz:
+        raise ValueError("multi-channel plan needs at least one channel")
+    lo, hi = min(channelmap_hz), max(channelmap_hz)
+    span = hi - lo
+    if span + 2 * guard_hz > max_rate:
+        raise ValueError(
+            f"channel plan spans {span / 1e6:.4f} MHz + guard "
+            f"({2 * guard_hz / 1e6:.4f} MHz) -- exceeds {max_rate / 1e6:.1f} "
+            "MHz max; narrow the plan or use fewer channels")
+    center_hz = (hi + lo) // 2
+    floor_hz = max(span + 2 * guard_hz, audio_rate)
+    iq_rate = -(-int(floor_hz) // audio_rate) * audio_rate  # ceil to multiple of audio_rate
+    return int(center_hz), int(iq_rate)
+
+
+def parse_channelmap_hz(path) -> list:
+    """[{'lcn': int, 'freq_hz': int}, ...] from the LCN,FREQ_HZ CSV that
+    app.py's render_channelmap() already writes for DSD-FME's -C flag.
+    Multi mode reuses that exact file/format -- no separate schema."""
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lcn_s, _, hz_s = line.partition(",")
+            try:
+                out.append({"lcn": int(lcn_s), "freq_hz": int(hz_s)})
+            except ValueError:
+                continue
+    return out
+
+
 class SpectrumState:
     """Latest averaged power spectrum for the current tune, shared between the
     sweep IQ loop (writer) and the rigctl `SPECTRUM` reader thread."""
@@ -117,13 +166,24 @@ class SpectrumState:
 
 
 class NfmDemodulator:
-    """Stateful u8 IQ -> signed 16-bit, 48 kHz mono NFM demodulator."""
+    """Stateful u8 IQ -> signed 16-bit, 48 kHz mono NFM demodulator.
+
+    `offset_hz` (default 0.0, byte-for-byte identical to the original
+    single-channel behaviour) lets one wideband IQ stream be decoded at a
+    frequency other than its tuned centre: a per-sample complex mixer shifts
+    the target channel down to baseband before the existing filter/decimate/
+    FM-discriminator/DC-block chain runs unchanged. This is the multi-channel
+    (Phase 2) building block -- N of these, one per physical Cap+ channel,
+    share one RtlTcpClient tuned once to a wideband centre (see
+    MultiChannelBridge) instead of each retuning the single shared LO.
+    """
 
     def __init__(self, iq_rate: int = DEFAULT_IQ_RATE,
                  audio_rate: int = DEFAULT_AUDIO_RATE,
                  cutoff_hz: float = 10_000.0,
                  audio_gain: float = 4.0,
-                 taps: int = 121) -> None:
+                 taps: int = 121,
+                 offset_hz: float = 0.0) -> None:
         if iq_rate % audio_rate:
             raise ValueError("iq_rate must be an integer multiple of audio_rate")
         self.iq_rate = iq_rate
@@ -140,12 +200,18 @@ class NfmDemodulator:
         self._dc_r = 0.999
         self._dc_x_prev = 0.0
         self._dc_y_prev = 0.0
+        self.offset_hz = float(offset_hz)
+        # Running mixer phase (in samples), carried across process() calls for
+        # the same reason `overlap`/DC-blocker state is: a fresh phase=0 every
+        # chunk would insert an audible discontinuity at each chunk boundary.
+        self._mix_phase = 0.0
 
     def reset(self) -> None:
         self.overlap.fill(0)
         self.previous = np.complex64(1.0 + 0.0j)
         self._dc_x_prev = 0.0
         self._dc_y_prev = 0.0
+        self._mix_phase = 0.0
 
     def _dc_block(self, fm: np.ndarray) -> np.ndarray:
         """Remove DC/slow drift with a stateful one-pole filter (~8 Hz cutoff
@@ -173,6 +239,14 @@ class NfmDemodulator:
             values = values[:-1]
         floats = (values.astype(np.float32) - 127.5) / 128.0
         iq = (floats[0::2] + 1j * floats[1::2]).astype(np.complex64, copy=False)
+
+        if self.offset_hz:
+            n = np.arange(iq.size, dtype=np.float64)
+            mixer = np.exp(-2j * np.pi * self.offset_hz / self.iq_rate
+                           * (n + self._mix_phase))
+            iq = (iq * mixer).astype(np.complex64)
+            self._mix_phase = (self._mix_phase + iq.size) % (
+                self.iq_rate / max(abs(self.offset_hz), 1e-9))
 
         extended = np.concatenate((self.overlap, iq))
         filtered = np.convolve(extended, self.taps, mode="valid")
@@ -672,6 +746,121 @@ def run_sweep(config: BridgeConfig) -> int:  # pragma: no cover - hardware runti
     return 0
 
 
+@dataclass
+class MultiChannelConfig:
+    """N-channel counterpart of BridgeConfig. One wideband RtlTcpClient tuned
+    to center_hz/iq_rate feeds N offset-aware NfmDemodulator instances (one
+    per `channels` entry), each serving its own AudioServer/AudioSender pair
+    on `audio_host:audio_base_port + i`. rigctl/gain stay single and shared
+    (there is one physical tuner regardless of how many channels are later
+    demodulated in software -- see compute_wideband_plan)."""
+    rtl_host: str
+    rtl_port: int
+    channels: list            # [{"lcn": int, "freq_hz": int}, ...]
+    center_hz: int
+    iq_rate: int
+    audio_host: str
+    audio_base_port: int
+    rigctl_host: str
+    rigctl_port: int
+    control_socket: str
+    audio_rate: int = DEFAULT_AUDIO_RATE
+    audio_gain: float = 4.0
+
+
+class MultiChannelBridge:
+    """Owns one wideband RtlTcpClient + N (demod, AudioServer, AudioSender)
+    triples, one per physical channel. `process_chunk` feeds the same raw IQ
+    chunk through every channel's demodulator -- the wideband capture is read
+    once per chunk regardless of N."""
+
+    def __init__(self, config: MultiChannelConfig) -> None:
+        self.config = config
+        self.tuner = RtlTcpClient(config.rtl_host, config.rtl_port,
+                                  config.center_hz, config.iq_rate)
+        self.channels: "dict[int, dict]" = {}   # lcn -> {"demod":, "audio":, "sender":}
+        for i, ch in enumerate(config.channels):
+            demod = NfmDemodulator(iq_rate=config.iq_rate, audio_rate=config.audio_rate,
+                                   audio_gain=config.audio_gain,
+                                   offset_hz=ch["freq_hz"] - config.center_hz)
+            audio = AudioServer(config.audio_host, config.audio_base_port + i)
+            sender = AudioSender(audio)
+            self.channels[int(ch["lcn"])] = {"demod": demod, "audio": audio,
+                                             "sender": sender, "freq_hz": int(ch["freq_hz"])}
+
+    def start(self) -> None:
+        self.tuner.connect()
+        for ch in self.channels.values():
+            ch["audio"].start()
+            ch["sender"].start()
+
+    def process_chunk(self, raw: bytes) -> None:
+        for ch in self.channels.values():
+            pcm = ch["demod"].process(raw)
+            ch["sender"].submit(pcm)
+
+    def reset(self) -> None:
+        for ch in self.channels.values():
+            ch["demod"].reset()
+
+    def close(self) -> None:
+        for ch in self.channels.values():
+            ch["sender"].close()
+            ch["audio"].close()
+        self.tuner.close()
+
+
+def run_multi(config: MultiChannelConfig) -> int:  # pragma: no cover - hardware runtime
+    """Multi-channel counterpart of run(): one wideband IQ read per chunk,
+    fanned out to N channel demodulators via MultiChannelBridge. Same
+    read/reconnect/generation-discard skeleton as run()/run_sweep()."""
+    bridge = MultiChannelBridge(config)
+    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, bridge.tuner)
+    gain = GainControlServer(config.control_socket, bridge.tuner)
+    stop_event = threading.Event()
+
+    def stop(_signum=None, _frame=None) -> None:
+        stop_event.set()
+        bridge.tuner.close()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        bridge.start()
+        rigctl.start()
+        gain.start()
+        bytes_per_chunk = DEFAULT_CHUNK_SAMPLES * 2
+        buffer = bytearray()
+        generation = bridge.tuner.generation
+        discard_chunks = 0
+        while not stop_event.is_set():
+            data = bridge.tuner.recv(max(4096, bytes_per_chunk - len(buffer)))
+            if not data:
+                raise ConnectionError("rsp_tcp closed the IQ connection")
+            buffer.extend(data)
+            while len(buffer) >= bytes_per_chunk:
+                chunk = bytes(buffer[:bytes_per_chunk])
+                del buffer[:bytes_per_chunk]
+                if bridge.tuner.generation != generation:
+                    generation = bridge.tuner.generation
+                    bridge.reset()
+                    discard_chunks = 2
+                if discard_chunks:
+                    discard_chunks -= 1
+                else:
+                    bridge.process_chunk(chunk)
+    except (OSError, RuntimeError, ConnectionError, ValueError) as error:
+        if not stop_event.is_set():
+            _log(f"multi fatal: {error}")
+            return 1
+        return 0
+    finally:
+        gain.close()
+        rigctl.close()
+        bridge.close()
+    return 0
+
+
 def parse_endpoint(value: str) -> tuple[str, int]:
     host, separator, port = value.rpartition(":")
     if not separator:
@@ -685,7 +874,8 @@ def main() -> int:
     parser.add_argument("--audio", default="127.0.0.1:7355")
     parser.add_argument("--rigctl", default="127.0.0.1:4532")
     parser.add_argument("--control-socket", default="/run/dmr/rsp-fm.sock")
-    parser.add_argument("--frequency", type=int, required=True)
+    parser.add_argument("--frequency", type=int, default=None,
+                        help="required unless --multi-channelmap is given")
     parser.add_argument("--iq-rate", type=int, default=DEFAULT_IQ_RATE)
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-gain", type=float, default=4.0)
@@ -694,10 +884,46 @@ def main() -> int:
     parser.add_argument("--nfft", type=int, default=2048)
     parser.add_argument("--sweep-frames", type=int, default=64)
     parser.add_argument("--gain-index", type=int, default=14)
+    parser.add_argument("--multi-channelmap", default=None,
+                        help="LCN,FREQ_HZ CSV path -> multi-channel decode mode "
+                             "(one wideband capture, N offset-aware demodulators)")
+    parser.add_argument("--audio-tcp-base", default=None,
+                        help="HOST:PORT base for multi-channel mode; channel i "
+                             "gets base_port + i (default: --audio's port)")
     args = parser.parse_args()
     rtl_host, rtl_port = parse_endpoint(args.rtl)
     audio_host, audio_port = parse_endpoint(args.audio)
     rigctl_host, rigctl_port = parse_endpoint(args.rigctl)
+
+    if args.multi_channelmap:
+        # center_hz/iq_rate are NOT recomputed here: rsp_tcp (a separate
+        # process, driven by dsd_pty's own build_multi_rsp_tcp_command) must
+        # tune to the *exact* same center/rate this bridge assumes, so the
+        # orchestrator (dsd_pty._run_multi) computes both ONCE via
+        # compute_wideband_plan and passes them explicitly as --frequency/
+        # --iq-rate -- two independent computations from possibly-diverging
+        # default constants would risk the two processes silently disagreeing.
+        if args.frequency is None:
+            parser.error("--frequency (wideband center Hz) is required with "
+                         "--multi-channelmap -- compute it once with "
+                         "compute_wideband_plan() and pass it explicitly")
+        channels = parse_channelmap_hz(args.multi_channelmap)
+        if not channels:
+            parser.error(f"--multi-channelmap {args.multi_channelmap!r} has no channels")
+        base_host, base_port = (parse_endpoint(args.audio_tcp_base)
+                                if args.audio_tcp_base else (audio_host, audio_port))
+        config = MultiChannelConfig(
+            rtl_host=rtl_host, rtl_port=rtl_port,
+            channels=channels, center_hz=args.frequency, iq_rate=args.iq_rate,
+            audio_host=base_host, audio_base_port=base_port,
+            rigctl_host=rigctl_host, rigctl_port=rigctl_port,
+            control_socket=args.control_socket,
+            audio_rate=args.audio_rate, audio_gain=args.audio_gain,
+        )
+        return run_multi(config)
+
+    if args.frequency is None:
+        parser.error("--frequency is required unless --multi-channelmap is given")
     config = BridgeConfig(
         rtl_host=rtl_host,
         rtl_port=rtl_port,

@@ -166,6 +166,99 @@ def test_trunking_configuration_is_validated():
         raise AssertionError("missing channel map was accepted")
 
 
+def test_compute_wideband_plan_center_and_rate():
+    center_hz, iq_rate = dsd_pty.compute_wideband_plan(
+        [461_037_500, 461_062_500, 461_087_500, 461_112_500], guard_hz=25_000)
+    assert center_hz == (461_037_500 + 461_112_500) // 2
+    span = 461_112_500 - 461_037_500
+    assert iq_rate >= span + 2 * 25_000
+    assert iq_rate % 48_000 == 0   # rsp_fm's NfmDemodulator requirement
+
+
+def test_compute_wideband_plan_rejects_span_too_wide():
+    try:
+        dsd_pty.compute_wideband_plan([100_000_000, 105_000_000], max_rate=2_000_000)
+    except ValueError as error:
+        assert "MHz" in str(error)
+    else:
+        raise AssertionError("expected ValueError for span exceeding max_rate")
+
+
+def test_compute_wideband_plan_matches_rsp_fm_copy():
+    """dsd_pty and rsp_fm each carry their own copy of this pure function
+    (dsd_pty stays stdlib-only, rsp_fm needs numpy for other things) -- they
+    must agree bit-for-bit on the same input, since rsp_tcp and rsp_fm.py are
+    two independent subprocesses that both need the exact same center/rate."""
+    import rsp_fm
+    channelmap = [461_037_500, 461_062_500, 461_087_500, 461_112_500]
+    assert dsd_pty.compute_wideband_plan(channelmap) == rsp_fm.compute_wideband_plan(channelmap)
+
+
+def test_parse_channelmap_hz(tmp_path):
+    path = tmp_path / "channelmap.csv"
+    path.write_text("1,461037500\n2,461062500\n\n3,461087500\n")
+    assert dsd_pty.parse_channelmap_hz(str(path)) == [
+        {"lcn": 1, "freq_hz": 461037500},
+        {"lcn": 2, "freq_hz": 461062500},
+        {"lcn": 3, "freq_hz": 461087500},
+    ]
+
+
+def test_build_multi_rsp_tcp_command_argv():
+    command = dsd_pty.build_multi_rsp_tcp_command(_runtime_env(), 461_075_000, 336_000)
+    assert command[0].endswith("rsp_tcp")
+    assert command[command.index("-s") + 1] == "336000"
+    assert command[command.index("-f") + 1] == "461075000"
+
+
+def test_build_multi_bridge_command_argv():
+    command = dsd_pty.build_multi_bridge_command(_runtime_env(), 461_075_000, 336_000)
+    assert command[1] == "-u"
+    assert command[command.index("--rtl") + 1] == "127.0.0.1:1234"
+    assert command[command.index("--rigctl") + 1] == "127.0.0.1:4532"
+    assert command[command.index("--multi-channelmap") + 1] == "/etc/dmr/channelmap.csv"
+    assert command[command.index("--frequency") + 1] == "461075000"
+    assert command[command.index("--iq-rate") + 1] == "336000"
+    assert "--audio-tcp-base" in command
+
+
+def test_build_multi_bridge_command_requires_channelmap():
+    env = dict(_runtime_env())
+    del env["DSD_CHANNELMAP"]
+    try:
+        dsd_pty.build_multi_bridge_command(env, 461_075_000, 336_000)
+    except ValueError as error:
+        assert "DSD_CHANNELMAP" in str(error)
+    else:
+        raise AssertionError("missing channel map was accepted")
+
+
+def test_build_channel_dsd_command_no_trunk_flags():
+    """Fixed-frequency per-channel decode: no -T/-U (no per-channel retuning
+    -- there is only one shared LO, see compute_wideband_plan). -7 must
+    precede -P, matching DSD-FME's argv parser (same order as build_command's
+    single-channel per-call recording)."""
+    command = dsd_pty.build_channel_dsd_command(
+        _runtime_env(), lcn=2, audio_port=17356, wav_root="/var/lib/dmr/recordings")
+    assert command[:5] == [dsd_pty.DSD_BIN, "-i", "tcp:127.0.0.1:17356", "-o", "null"]
+    assert "-T" not in command and "-U" not in command and "-C" not in command
+    assert command.index("-7") + 1 == command.index("-P") - 1
+    assert command[command.index("-7") + 1] == "/var/lib/dmr/recordings/lcn2"
+
+
+def test_build_channel_dsd_command_no_wav_root():
+    command = dsd_pty.build_channel_dsd_command(_runtime_env(), lcn=1, audio_port=7355)
+    assert "-7" not in command and "-P" not in command
+
+
+def test_tag_event_stamps_phys_lcn_and_freq():
+    event = {"type": "voice_call", "tg": 3, "src": 2120}
+    tagged = dsd_pty.tag_event(event, lcn=2, freq_hz=461_062_500)
+    assert tagged is event   # mutates in place, returns same dict
+    assert tagged["phys_lcn"] == 2
+    assert tagged["phys_freq_hz"] == 461_062_500
+
+
 def test_send_gain_nudge(tmp_path):
     socket_path = str(tmp_path / "ctrl.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -265,6 +358,49 @@ def test_normalize_freq_none_when_lcn_unknown(paths):
     assert card["freq"] is None
 
 
+def test_normalize_dsd_uses_phys_freq_hz_when_present(paths):
+    """dsd_pty._run_multi תגית ground-truth (phys_lcn/phys_freq_hz, נקבעת
+    ב-spawn) — כשקיימת, מחליפה את _channelmap_freq(lcn) (ניחוש מטקסט/
+    מערכת-פעילה יחידה), לא רק משלימה אותה."""
+    card = paths._normalize_dsd({
+        "type": "voice_call", "tg": 3, "src": 1, "call_type": "group",
+        "lcn": 99, "phys_lcn": 2, "phys_freq_hz": 461_062_500,
+    })
+    assert card["freq"] == 461.0625
+    assert card["lcn"] == 2          # phys_lcn גובר על ה-lcn המנוחש (99)
+    assert card["phys_lcn"] == 2
+
+
+def test_normalize_dsd_phys_lcn_none_preserves_existing_behavior(paths):
+    """אירועי חד-ערוצי (dmr/scan) לעולם לא נושאים phys_lcn/phys_freq_hz —
+    ההתנהגות זהה בדיוק ל-Phase 2 (fallback ל-_channelmap_freq)."""
+    paths.SYSTEMS_PATH.write_text(
+        '[{"id":"s1","name":"T","control":461.0,"color_code":1,'
+        '"channelmap":[{"lcn":5,"freq":461.0625}]}]'
+    )
+    paths.save_state({"app_mode": "dmr", "system": "s1"})
+    card = paths._normalize_dsd({
+        "type": "voice_call", "tg": 3, "src": 1, "call_type": "group", "lcn": 5,
+    })
+    assert card["freq"] == 461.0625
+    assert card["lcn"] == 5
+    assert card["phys_lcn"] is None
+
+
+def test_rf_quality_snapshot_per_channel_filters_correctly(paths):
+    app = paths
+    app._rf_ticks.clear()
+    app._rf_quality_tick("CSBK_CRC", phys_lcn=1)
+    app._rf_quality_tick("SLCO_CRC", phys_lcn=2)
+    app._rf_quality_tick("CSBK_CRC", phys_lcn=1)
+    assert app._rf_quality_snapshot()["total_errors"] == 3        # גלובלי — כל הערוצים
+    assert app._rf_quality_snapshot(phys_lcn=1)["total_errors"] == 2
+    assert app._rf_quality_snapshot(phys_lcn=2)["total_errors"] == 1
+    assert app._rf_quality_snapshot(phys_lcn=3)["total_errors"] == 0
+    by_channel = {d["phys_lcn"]: d["total_errors"] for d in app._rf_quality_by_channel()}
+    assert by_channel == {1: 2, 2: 1}
+
+
 def _send_udp(port, obj):
     import json
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -330,6 +466,62 @@ def test_listener_voice_crc_err_feeds_rf_window(paths, monkeypatch):
     assert snapshot["by_type"][0]["error_type"] == "VOICE_CRC"
     with app._dmr_lock:
         assert len(app._dmr_msgs) == 1
+
+
+def test_listener_dedup_keys_on_phys_lcn(paths, monkeypatch):
+    """שתי שיחות בו-זמנית, אותם tg+src+slot, על שני ערוצים פיזיים שונים
+    (multi mode) => שני כרטיסים נפרדים, לא ממוזגים לאחד (בלי phys_lcn
+    ב-dedup key זה היה מתמזג בטעות — ר' CLAUDE.md §8 סיכון בין-ערוצי)."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15561)
+    with app._dmr_lock:
+        app._dmr_msgs.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    now = time.time()
+    _send_udp(15561, {
+        "type": "voice_call", "slot": 1, "tg": 3, "src": 2120, "call_type": "group",
+        "phys_lcn": 1, "phys_freq_hz": 461_037_500, "t": now,
+    })
+    time.sleep(0.1)
+    _send_udp(15561, {
+        "type": "voice_call", "slot": 1, "tg": 3, "src": 2120, "call_type": "group",
+        "phys_lcn": 2, "phys_freq_hz": 461_062_500, "t": now + 0.2,
+    })
+    time.sleep(0.3)
+    with app._dmr_lock:
+        messages = list(app._dmr_msgs)
+    assert len(messages) == 2
+    freqs = {m["freq"] for m in messages}
+    assert freqs == {461.0375, 461.0625}
+
+
+def test_listener_encryption_correlates_per_channel(paths, monkeypatch):
+    """תג הצפנה על ערוץ אחד לא נדבק בטעות לשיחה הפתוחה על ערוץ אחר, גם אם
+    שתיהן פתוחות באותו slot בו-זמנית (multi mode)."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15562)
+    with app._dmr_lock:
+        app._dmr_msgs.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    now = time.time()
+    _send_udp(15562, {
+        "type": "voice_call", "slot": 1, "tg": 3, "src": 111, "call_type": "group",
+        "phys_lcn": 1, "phys_freq_hz": 461_037_500, "t": now,
+    })
+    _send_udp(15562, {
+        "type": "voice_call", "slot": 1, "tg": 5, "src": 222, "call_type": "group",
+        "phys_lcn": 2, "phys_freq_hz": 461_062_500, "t": now,
+    })
+    time.sleep(0.2)
+    # הצפנה מגיעה מ-phys_lcn=2 בלבד -- חייבת להישאר על השיחה של ערוץ 2
+    _send_udp(15562, {"type": "encryption", "slot": 1, "phys_lcn": 2, "t": now + 0.3})
+    time.sleep(0.3)
+    with app._dmr_lock:
+        messages = {(m["phys_lcn"]): m for m in app._dmr_msgs}
+    assert messages[1]["encrypted"] is False   # ערוץ 1: לא נגע בו
+    assert messages[2]["encrypted"] is True    # ערוץ 2: תואם
 
 
 def test_emit_status_off_leaves_parsing_unchanged():

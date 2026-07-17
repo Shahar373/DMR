@@ -202,6 +202,141 @@ def test_set_fixed_gain_sends_manual_mode(monkeypatch):
     assert tuner.gain_index == 28
 
 
+def test_nfm_demodulator_offset_zero_matches_baseline():
+    """offset_hz=0.0 (the default) must be byte-for-byte identical to the
+    pre-multi-channel behavior -- zero risk to the existing dmr/scan path."""
+    sample_rate = 240_000
+    sample_count = 24_000
+    time_axis = np.arange(sample_count) / sample_rate
+    deviation = 2_500 * np.sin(2 * np.pi * 1_000 * time_axis)
+    phase = np.cumsum(2 * np.pi * deviation / sample_rate)
+    iq = np.exp(1j * phase)
+    raw = np.empty(sample_count * 2, dtype=np.uint8)
+    raw[0::2] = np.clip(np.real(iq) * 127 + 128, 0, 255)
+    raw[1::2] = np.clip(np.imag(iq) * 127 + 128, 0, 255)
+    raw_bytes = raw.tobytes()
+
+    baseline = rsp_fm.NfmDemodulator().process(raw_bytes)
+    explicit_zero = rsp_fm.NfmDemodulator(offset_hz=0.0).process(raw_bytes)
+    assert baseline == explicit_zero
+
+
+def test_nfm_demodulator_offset_recovers_shifted_tone():
+    """A channel sitting offset_hz away from a wideband capture's tuned
+    centre must demodulate to (approximately) the same audio as if it had
+    been captured at DC -- proves the mixer stage is correct, the core of
+    multi-channel decode (N offset-aware demodulators sharing one capture)."""
+    sample_rate = 240_000
+    sample_count = 24_000
+    offset_hz = 40_000.0
+    time_axis = np.arange(sample_count) / sample_rate
+    deviation = 2_500 * np.sin(2 * np.pi * 1_000 * time_axis)
+    phase = np.cumsum(2 * np.pi * deviation / sample_rate)
+    baseband = np.exp(1j * phase)
+    shifted = baseband * np.exp(2j * np.pi * offset_hz / sample_rate * np.arange(sample_count))
+
+    def to_u8(iq):
+        raw = np.empty(iq.size * 2, dtype=np.uint8)
+        raw[0::2] = np.clip(np.real(iq) * 127 + 128, 0, 255)
+        raw[1::2] = np.clip(np.imag(iq) * 127 + 128, 0, 255)
+        return raw.tobytes()
+
+    baseline_pcm = np.frombuffer(
+        rsp_fm.NfmDemodulator(offset_hz=0.0).process(to_u8(baseband)), dtype="<i2")
+    recovered_pcm = np.frombuffer(
+        rsp_fm.NfmDemodulator(offset_hz=offset_hz).process(to_u8(shifted)), dtype="<i2")
+
+    assert recovered_pcm.size == baseline_pcm.size
+    assert recovered_pcm.std() > 1_000
+    assert np.corrcoef(baseline_pcm.astype(float), recovered_pcm.astype(float))[0, 1] > 0.95
+
+
+def test_nfm_demodulator_offset_reset_clears_mix_phase():
+    demod = rsp_fm.NfmDemodulator(offset_hz=30_000.0)
+    demod._mix_phase = 12345.0
+    demod.reset()
+    assert demod._mix_phase == 0.0
+
+
+def test_compute_wideband_plan_center_and_rate():
+    center_hz, iq_rate = rsp_fm.compute_wideband_plan(
+        [461_037_500, 461_062_500, 461_087_500, 461_112_500], guard_hz=25_000)
+    assert center_hz == (461_037_500 + 461_112_500) // 2
+    span = 461_112_500 - 461_037_500
+    assert iq_rate >= span + 2 * 25_000
+    assert iq_rate % rsp_fm.DEFAULT_AUDIO_RATE == 0
+
+
+def test_compute_wideband_plan_rounds_to_audio_rate_multiple():
+    """A naive max(span+guard, floor) is not guaranteed to be a multiple of
+    audio_rate -- NfmDemodulator requires iq_rate % audio_rate == 0 and
+    raises ValueError otherwise. compute_wideband_plan must round up so no
+    per-channel demodulator construction can ever hit that error."""
+    center_hz, iq_rate = rsp_fm.compute_wideband_plan(
+        [100_000_000, 100_037_000], guard_hz=1_000, audio_rate=48_000)
+    assert iq_rate % 48_000 == 0
+    assert iq_rate >= 37_000 + 2_000
+
+
+def test_compute_wideband_plan_rejects_span_too_wide():
+    try:
+        rsp_fm.compute_wideband_plan([100_000_000, 105_000_000], max_rate=2_000_000)
+    except ValueError as exc:
+        assert "MHz" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for span exceeding max_rate")
+
+
+def test_compute_wideband_plan_rejects_empty():
+    try:
+        rsp_fm.compute_wideband_plan([])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for empty channelmap")
+
+
+def test_parse_channelmap_hz_roundtrips_render_channelmap(tmp_path):
+    path = tmp_path / "channelmap.csv"
+    path.write_text("1,461037500\n2,461062500\n\n3,461087500\n")
+    parsed = rsp_fm.parse_channelmap_hz(str(path))
+    assert parsed == [
+        {"lcn": 1, "freq_hz": 461037500},
+        {"lcn": 2, "freq_hz": 461062500},
+        {"lcn": 3, "freq_hz": 461087500},
+    ]
+
+
+def test_parse_channelmap_hz_skips_malformed_lines(tmp_path):
+    path = tmp_path / "channelmap.csv"
+    path.write_text("1,461037500\nnot,a,number\n2,461062500\n")
+    parsed = rsp_fm.parse_channelmap_hz(str(path))
+    assert parsed == [
+        {"lcn": 1, "freq_hz": 461037500},
+        {"lcn": 2, "freq_hz": 461062500},
+    ]
+
+
+def test_multi_channel_bridge_builds_offset_per_channel():
+    config = rsp_fm.MultiChannelConfig(
+        rtl_host="127.0.0.1", rtl_port=1234,
+        channels=[{"lcn": 1, "freq_hz": 461_037_500}, {"lcn": 2, "freq_hz": 461_062_500}],
+        center_hz=461_050_000, iq_rate=240_000,
+        audio_host="127.0.0.1", audio_base_port=17355,
+        rigctl_host="127.0.0.1", rigctl_port=14532,
+        control_socket="/tmp/does-not-matter.sock",
+    )
+    bridge = rsp_fm.MultiChannelBridge(config)
+    try:
+        assert set(bridge.channels) == {1, 2}
+        assert bridge.channels[1]["demod"].offset_hz == 461_037_500 - 461_050_000
+        assert bridge.channels[2]["demod"].offset_hz == 461_062_500 - 461_050_000
+        assert bridge.channels[1]["audio"].port == 17355
+        assert bridge.channels[2]["audio"].port == 17356
+    finally:
+        bridge.close()
+
+
 def test_rigctl_spectrum_verb():
     tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
     spectrum = rsp_fm.SpectrumState()

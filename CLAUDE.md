@@ -114,7 +114,7 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
 .github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
 ```
@@ -192,6 +192,28 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 ב
   (מתויג-epoch, לא נוגע ב-dedup). `_discover_active` נבדק **ראשון** ב-`api_state`/
   `api_health`. הלוגיקה הטהורה ב-`discovery.py`; שרשרת האותות (`_sweep_read`/rsp_fm
   sweep) `pragma: no cover` (חומרה). ר' §8 ו-§10 Phase 6.
+- **★ multi (Phase 7): פענוח כל ערוצי ה-channelmap בו-זמנית.** מצב `app_mode`
+  חדש, אותה יחידת systemd בדיוק כמו `dmr` (`MODE_SERVICE["multi"]=DMR_SERVICE` —
+  **לא** unit נפרד, שומר על "SDR אחד בהחלפה"; `_live_mode` מבדיל dmr/multi לפי
+  `state.json` כי systemctl לא יכול). `_validate_multi_feasible` (טהורה: ≥2
+  ערוצים, `MULTI_CHANNELS_MAX`, נכנס ב-`MULTI_MAX_SPAN_HZ` דרך
+  `dsd_pty.compute_wideband_plan`) נבדק ב-`api_mode` **לפני** תפיסת `TUNE_LOCK`.
+  `render_dmr_env(system, multi=True)` מוסיף `DSD_MULTI=1`+
+  `DSD_MULTI_GUARD_HZ`/`DSD_MULTI_MAX_RATE_HZ` (מהקבועים `MULTI_GUARD_HZ`/
+  `MULTI_MAX_SPAN_HZ` — **אותם ערכים** ש-`_validate_multi_feasible` כבר אימת
+  מולם, כדי ש-`dsd_pty._run_multi` לא יחשב עם ברירות-מחדל שסוטות) + `DSD_AUDIO_TCP_BASE`
+  (בלתי-תלוי-מצב, כמו שאר קבועי הגשר — ר' §8). `dsd_pty._run_multi` מריץ
+  `rsp_tcp` **רחב-פס אחד** (מכוון פעם אחת ל-center_hz שחושב) + `rsp_fm.py` עם N
+  מדמודלטורי NFM מוסטים (`offset_hz` לכל ערוץ; אין retune פר-ערוץ — LO משותף
+  יחיד) + N מפענחי DSD-FME (כל אחד `-i tcp:...:port_i`, בלי `-T`/`-U` — אין
+  trunking-follow פר-ערוץ). כל אירוע מתויג `tag_event(phys_lcn, phys_freq_hz)`
+  ב-dsd_pty (ground-truth מ-spawn, לא ניחוש טקסט) — `_normalize_dsd` מעדיף אותו
+  על `_channelmap_freq(lcn)`, ו-`_dmr_listener`'s dedup/`_slot_open_call`/RF
+  ticks כולם מורחבים במפתח `phys_lcn` (בחד-ערוצי תמיד `None` ⇒ ללא שינוי
+  התנהגות). כשל בכל מפענח יחיד ⇒ כשל כל השירות (כמו חד-ערוצי; רסטרט חלקי
+  פר-ערוץ **לא** ממומש). **שרשרת האותות `pragma: no cover`, לא אומתה על
+  חומרה** (ר' §10 Phase 7) — הלוגיקה הטהורה (`compute_wideband_plan`,
+  `parse_channelmap_hz`, `tag_event`, בוני-הפקודות) כן נבדקת ב-CI.
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
   TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
 - **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
@@ -215,7 +237,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 ב
 | GET/PUT | `/api/systems` | מערכות DMR (עריכה על הסט המלא) |
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
-| POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover. דרך `_guard`. כישלון ⇒ off + 500 |
+| POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
 | GET | `/api/discover` | סטטוס גילוי חי (שלב/התקדמות/מועמדים) + הדוח האחרון |
 | POST | `/api/discover/save` | שומר רשת מגולה כמערכת (מיזוג ל-systems דרך `_validate_systems`) |
@@ -226,7 +248,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 ב
 | GET | `/api/analytics/traffic` | אנליטיקת תעבורה: air-time/TG + heatmap שעתי (`?day=`/`?all=1`) |
 | GET | `/api/analytics/graph` | גרף RID↔TG (who-talks-to-whom) (`?day=`/`?all=1`) |
 | GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו") |
-| GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge`. **אין dBFS/SNR** |
+| GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge` + `by_channel` (Phase 7, `multi` בלבד). **אין dBFS/SNR** |
 | POST | `/api/gain` | נוד-רווח חי (`{direction: up\|down}`) — הקשת g/G, בלי לעצור את DSD-FME |
 | GET | `/api/activity` | הקלטות אחרונות |
 | GET | `/recordings/<name>` | קובץ WAV |
@@ -240,7 +262,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 140 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (140 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (177 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -390,6 +412,27 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   "🔎 גילוי" עם "שמור כמערכת". **מיפוי LCN↔תדר best-effort/ידני** (Cap+ = LSN לוגי,
   SDR יחיד; ר' §8). הלוגיקה הטהורה + Flask נבדקים ב-CI (140 בדיקות); מצב ה-sweep
   ולקוח ה-rigctl/spectrum הם `pragma: no cover` — לאימות על Pi 5 + RSP1B.
+- **Phase 7 (v0.6.0, קוד+CI ירוקים; שרשרת הפענוח הרב-ערוצית טרם אומתה על
+  חומרה):** מיזוג עם `DMR-DECREP-SHAHAR` — מצב `multi` חדש: פענוח **כל** ערוצי
+  ה-channelmap של מערכת בו-זמנית, לא רק תדר-בקרה יחיד (§5 "multi"). קליטה
+  רחבת-פס אחת (`rsp_tcp` מכוון פעם אחת) → N מדמודלטורי NFM מוסטים ב-`rsp_fm.py`
+  (`offset_hz` פר-ערוץ, גרסה כללית של המדמודלטור החד-ערוצי הקיים — לא retune
+  פר-ערוץ, יש LO משותף יחיד) → N מפענחי DSD-FME תחת PTY, כל אחד תג-מזוהה
+  (`dsd_pty.tag_event`) עם `phys_lcn`/`phys_freq_hz` אמיתיים. `_normalize_dsd`
+  ו-`_dmr_listener` (dedup/הצפנה/RF-quality) מורחבים במפתח `phys_lcn` —
+  בחד-ערוצי הוא תמיד `None` ⇒ **אפס שינוי התנהגות** לקוד הקיים (140 הבדיקות
+  המקוריות + 68/68 ה-fixture replay נשארו ירוקים ללא שינוי). `/api/rf` מחזיר
+  גם `by_channel` (פירוט איכות-RF פר-ערוץ). **החלטות-מוצר של Phase 7:** יום-1
+  מפעיל את **כל** ה-channelmap (בלי בחירת-ערוצים חלקית — `channel_ids`/
+  `--follow-traffic` נדחו ל-Phase הבא), איכות-RF פר-ערוץ ביום-1 (לא נדחתה),
+  שכבת ה-UI/`channels.json` (טבלת קונפיגורציה+live status) נדחתה ל-Phase 8,
+  אחרי שהמנוע יאומת על חומרה. **קליטת ה-IQ הרחבה-פס (`rsp_tcp` בקצב מעל
+  240kHz הקיים) היא הסיכון הטכני המרכזי הפתוח** — לא אומתה על RSP1B אמיתי;
+  אם רוחב-הפס לא יציב שם, החלופה היא Soapy-direct כמו ב-DECREP (ר' spike
+  script בריפו DMR-DECREP-SHAHAR). הלוגיקה הטהורה (`compute_wideband_plan`,
+  `parse_channelmap_hz`, `tag_event`, בוני-פקודות `dsd_pty`, `_validate_multi_feasible`)
+  נבדקת מלאה ב-CI (177 בדיקות); `dsd_pty._run_multi`/`rsp_fm.run_multi` הם
+  `pragma: no cover` — דורשים אימות על Pi 5 + RSP1B אמיתי לפני שהמצב ייחשב מוכן-לשטח.
 - **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
   קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
 - **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —
