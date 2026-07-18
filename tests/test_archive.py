@@ -52,6 +52,29 @@ def test_api_dmr_export_json(paths):
     assert r.status_code == 200 and isinstance(r.get_json(), list)
 
 
+def test_api_dmr_export_day_filter(paths):
+    """UI bug: לחיצה על CSV בזמן צפייה בארכיון של יום מסוים ייצאה בעבר את *כל*
+    ה-jsonl השמור, לא רק את היום המוצג. /api/dmr/export?day= חייב לסנן כמו
+    /api/dmr?day= (אותה סמנטיקה)."""
+    app = paths
+    b = app._day_bounds("2026-07-12")
+    mid = (b[0] + b[1]) / 2
+    _write_log(app, [
+        {"t": mid, "tg": 1, "src": 2, "call_type": "group"},
+        {"t": b[0] - 100, "tg": 9, "src": 9, "call_type": "group"},   # יום קודם — לא אמור להיכלל
+    ])
+    r = _c(app).get("/api/dmr/export?format=json&day=2026-07-12")
+    rows = r.get_json()
+    assert r.status_code == 200 and len(rows) == 1 and rows[0]["tg"] == 1
+    # בלי day= — ברירת המחדל המקורית (הכל) נשארת ללא שינוי
+    r_all = _c(app).get("/api/dmr/export?format=json")
+    assert len(r_all.get_json()) == 2
+
+
+def test_api_dmr_export_bad_day(paths):
+    assert _c(paths).get("/api/dmr/export?format=json&day=nope").status_code == 400
+
+
 def test_roster_identity_fusion(paths):
     app = paths
     with app._dmr_lock:

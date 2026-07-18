@@ -105,6 +105,21 @@ def test_api_health_dmr(paths, monkeypatch):
     assert body["app_mode"] == "dmr" and body["ok"] is True
 
 
+def test_api_health_multi(paths, monkeypatch):
+    """נתפס ב-visual-verification: dmr/multi חולקות systemd unit אחד, ו-
+    api_health's גרסה-פרטית-לו של פתרון-המצב (`mode = "dmr" if dmr_active
+    else saved`) בלעה כל multi בחזרה ל-"dmr" ברגע שהשירות פעיל — בדיוק אותו
+    באג שכבר תוקן ב-_live_mode(), רק עותק שני שלא תוקן. חובה: /api/health
+    ידווח app_mode="multi" (לא "dmr") + ok=True כשהשירות פעיל ו-multi שמור."""
+    app = paths
+    app.save_state({"app_mode": "multi", "system": "s1"})
+    monkeypatch.setattr(app.subprocess, "run",
+                        lambda *a, **k: __import__("types").SimpleNamespace(
+                            stdout="active", returncode=0))
+    body = _client(app).get("/api/health").get_json()
+    assert body["app_mode"] == "multi" and body["ok"] is True
+
+
 def test_systems_put_validation(paths):
     app = paths
     c = _client(app)

@@ -33,8 +33,18 @@
     --border:#d6dee6; --border-strong:#c2ccd6; --text:#141b22; --dim:#4a5b6b; --faint:#8496a5;
     --sh-card:0 1px 4px rgba(20,30,45,.10); }
 }
-:root[data-theme="dark"]{ color-scheme: dark; --bg:#0b0f14; --panel:#131a22; --text:#e6edf3; }
-:root[data-theme="light"]{ color-scheme: light; --bg:#eef2f6; --panel:#fff; --text:#141b22; }
+/* ⚠ טוגל ה-UI (themeToggle) קובע data-theme במפורש — כל טוקן שהמדיה-קוורי
+   שולט בו חייב הופעה מלאה כאן גם, אחרת בכפיית ערכת-נושא ידנית נגד ה-OS
+   נשארים טוקנים "יתומים" מהערך הישן (למשל --panel-2/--border נשארים כהים
+   כש-data-theme="light" נכפה מול OS כהה => כרטיסים כהים בתוך topbar בהיר).
+   שני הבלוקים למטה חוזרים במלואם על כל 10 הטוקנים (זהה ל-:root הבסיסי/
+   ה-media למעלה), לא רק bg/panel/text. */
+:root[data-theme="dark"]{ color-scheme: dark; --bg:#0b0f14; --panel:#131a22; --panel-2:#1a232e;
+  --hover:#212d3a; --border:#26313d; --border-strong:#33414f; --text:#e6edf3; --dim:#9db0c0;
+  --faint:#6b7d8d; --sh-card:0 2px 8px rgba(0,0,0,.28); }
+:root[data-theme="light"]{ color-scheme: light; --bg:#eef2f6; --panel:#fff; --panel-2:#f5f8fb;
+  --hover:#e9eef3; --border:#d6dee6; --border-strong:#c2ccd6; --text:#141b22; --dim:#4a5b6b;
+  --faint:#8496a5; --sh-card:0 1px 4px rgba(20,30,45,.10); }
 *{ box-sizing:border-box; }
 html,body{ margin:0; background:var(--bg); color:var(--text);
   font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Hebrew",Arial,sans-serif; }
@@ -139,6 +149,8 @@ button.btn:disabled{ opacity:.5; cursor:default; }
 
 <div class="topbar">
   <div class="brand">📻 DMR <small id="ver"></small></div>
+  <button class="btn ghost" id="themeToggle" title="החלף מצב-בהיר/כהה"
+    style="padding:5px 9px;margin-inline-start:10px">🌓</button>
   <div class="seg" id="seg">
     <button data-v="home" class="on">🏠 בית</button>
     <button data-v="calls">📻 שיחות</button>
@@ -161,6 +173,9 @@ button.btn:disabled{ opacity:.5; cursor:default; }
           <div class="count" id="callsToday"></div>
         </div>
       </div>
+      <div class="row hidden" id="powerRow" style="margin-top:var(--sp-2)">
+        <span class="pill" id="powerPill">·</span>
+      </div>
     </div>
 
     <div id="homeErr"></div>
@@ -176,6 +191,11 @@ button.btn:disabled{ opacity:.5; cursor:default; }
           <div class="mc-title">📻 DMR</div>
           <div class="mc-desc">מעקב טראנקינג Cap+ ופענוח שיחות מהמערכת הנבחרת.</div>
           <button class="btn" id="goDmr">התחל DMR</button>
+        </div>
+        <div class="mode-card" id="cardMulti">
+          <div class="mc-title">📡 רב-ערוצי</div>
+          <div class="mc-desc">פענוח כל ערוצי ה-channelmap של המערכת הנבחרת בו-זמנית.</div>
+          <button class="btn ghost" id="goMulti">התחל רב-ערוצי</button>
         </div>
         <div class="mode-card" id="cardScan">
           <div class="mc-title">🔁 סריקה</div>
@@ -212,6 +232,15 @@ button.btn:disabled{ opacity:.5; cursor:default; }
         <button class="btn ghost" id="cmapAdd">+ ערוץ</button>
         <button class="btn" id="sysSave">שמור מערכת</button>
         <span class="muted" id="sysMsg"></span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="channelsCard">
+      <h2>📡 ערוצים (רב-ערוצי)</h2>
+      <div id="channelsList"><div class="muted">טוען…</div></div>
+      <div class="muted" style="margin-top:8px;font-size:12px">
+        שיחה אחרונה + שגיאות CRC/FEC אמיתיות פר-ערוץ (60ש') — אותו מקור-נתונים
+        כמו כרטיס ה-RF למטה, מפורק לפי ערוץ פיזי. אין מד עוצמה/dBFS.
       </div>
     </div>
 
@@ -424,6 +453,7 @@ async function applyMode(mode, extra){
   await refreshState();
 }
 $("goDmr").onclick = ()=> applyMode("dmr", {system: $("sysSelect").value});
+$("goMulti").onclick = ()=> applyMode("multi", {system: $("sysSelect").value});
 $("goOff").onclick = ()=> applyMode("off");
 $("goScan").onclick = ()=>{
   if(!scanLegs.length){ $("homeErr").innerHTML=`<div class="err-box">הוסף לפחות רגל אחת ללוח הסריקה.</div>`; return; }
@@ -438,21 +468,35 @@ async function refreshState(){
   $("ver").textContent = "v"+(r.body.version||"");
   renderHome(); renderSystems(); renderScanEditor();
 }
-function modeLabel(m){ return {dmr:"📻 DMR פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה", discover:"🔎 גילוי רשתות"}[m]||m; }
+function modeLabel(m){ return {dmr:"📻 DMR פעיל", multi:"📡 רב-ערוצי פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה", discover:"🔎 גילוי רשתות"}[m]||m; }
+function sysChanCount(s){ return s&&s.channelmap ? s.channelmap.length : 0; }
 function renderHome(){
   const m = STATE.app_mode||"off";
   $("homeState").textContent = modeLabel(m);
   const sys = SYSTEMS.find(s=>s.id===STATE.system);
   $("homeSub").textContent = (m==="dmr"&&sys) ? `מערכת: ${sys.name} · CC ${sys.color_code}` :
+    (m==="multi"&&sys) ? `רב-ערוצי · ${sysChanCount(sys)} ערוצים בו-זמנית · ${sys.name}` :
     (m==="scan" ? "סבב אוטומטי בין מערכות" :
     (m==="discover" ? "🔎 גילוי תדרים פעיל — תופס את ה-SDR (מסך גילוי)" : "בחר מערכת והתחל"));
   $("cardDmr").classList.toggle("live", m==="dmr");
+  $("cardMulti").classList.toggle("live", m==="multi");
   $("cardScan").classList.toggle("live", m==="scan");
   $("cardOff").classList.toggle("live", m==="off");
   $("discoverWarn").classList.toggle("hidden", m!=="discover");
+  $("channelsCard").classList.toggle("hidden", m!=="multi");   // לוח פר-ערוץ רק ב-multi
+  updateMultiBtn();
+  renderChannelsBoard();   // מתנוון בשקט (return מוקדם) אם לא multi — ר' הגדרה למטה
   if(STATE.mode_ok===false){
     $("healthPill").className="pill err"; $("healthPill").textContent="תקלה";
   }
+}
+// כפתור "התחל רב-ערוצי" פעיל רק אם למערכת הנבחרת יש >=2 ערוצים (כמו _validate_multi_feasible)
+function updateMultiBtn(){
+  const s = SYSTEMS.find(x=>x.id===$("sysSelect").value);
+  const ok = sysChanCount(s) >= 2;
+  const btn=$("goMulti"); if(!btn) return;
+  btn.disabled = !ok;
+  btn.title = ok ? "" : "דרושים לפחות 2 ערוצים ב-channelmap";
 }
 
 // ---------- systems editor ----------
@@ -462,7 +506,7 @@ function renderSystems(){
   if(cur) sel.value=cur;
   loadSysEditor();
 }
-$("sysSelect").onchange = loadSysEditor;
+$("sysSelect").onchange = ()=>{ loadSysEditor(); updateMultiBtn(); };
 function loadSysEditor(){
   const s = SYSTEMS.find(x=>x.id===$("sysSelect").value);
   if(!s){ $("cmapList").innerHTML=""; return; }
@@ -625,6 +669,7 @@ async function pollHealth(){
   const h=r.body;
   const p=$("healthPill");
   if(h.app_mode==="dmr"&&h.ok){ p.className="pill on"; p.textContent = h.calls_today?`מפענח · ${h.calls_today} היום`:"מאזין"; }
+  else if(h.app_mode==="multi"&&h.ok){ p.className="pill on"; p.textContent = h.calls_today?`רב-ערוצי · ${h.calls_today} היום`:"רב-ערוצי · מאזין"; }
   else if(h.app_mode==="off"){ p.className="pill off"; p.textContent="כבוי"; }
   else if(h.app_mode==="scan"&&h.ok){ p.className="pill on"; p.textContent="סורק"; }
   else if(h.app_mode==="discover"&&h.ok){ p.className="pill on"; p.textContent="🔎 מגלה תדרים"; }
@@ -636,17 +681,73 @@ async function pollHealth(){
   } else $("scanStatusTxt").textContent="";
 }
 
+// ---------- מתח/טמפ' ה-Pi (undervoltage/throttle — תקלת-Pi-בשטח #1) ----------
+async function pollPower(){
+  const r=await api("/api/power"); if(!r.ok||!r.body.ok){ $("powerRow").classList.add("hidden"); return; }
+  const d=r.body;
+  const p=$("powerPill");
+  const bad = d.undervolt_now || d.throttle_now;
+  const everBad = d.undervolt_ever || d.throttle_ever;
+  p.className = "pill " + (bad ? "err" : (everBad ? "off" : "on"));
+  const parts=[];
+  if(d.volts_in!=null) parts.push(`${d.volts_in}V`);
+  if(d.temp!=null) parts.push(`${d.temp}°C`);
+  if(d.undervolt_now) parts.push("⚠ undervoltage כרגע");
+  else if(d.throttle_now) parts.push("⚠ throttling כרגע");
+  else if(everBad) parts.push("היה undervoltage/throttle מאז ההפעלה");
+  p.textContent = parts.join(" · ") || "תקין";
+  $("powerRow").classList.remove("hidden");
+}
+
 // ---------- איכות RF + נוד-רווח ----------
 // abarRow מוגדר בהמשך (סעיף האנליטיקה) — hoisting של function declaration.
+let lastRF = null;   // נשמר גלובלית — renderChannelsBoard() קורא ממנו בלי fetch נוסף
 async function pollRF(){
   const r=await api("/api/rf"); if(!r.ok||!r.body.ok)return;
   const d=r.body;
+  lastRF = d;
   $("rfErrPerMin").textContent = d.errors_per_min;
   $("rfGainVal").textContent = (d.gain_nudge>0?"+":"")+d.gain_nudge;
   const max = Math.max(1, ...d.by_type.map(t=>t.count), 0);
   $("rfByType").innerHTML = d.by_type.length
     ? d.by_type.map(t=>abarRow(t.error_type, t.count, max)).join("")
     : `<div class="muted">אין שגיאות ב-${d.window_sec|0} השניות האחרונות.</div>`;
+  renderChannelsBoard();
+}
+
+// ---------- לוח פר-ערוץ (multi mode) ----------
+// שורה לכל ערוץ פיזי (LCN) של המערכת הפעילה: שיחה אחרונה + שגיאות פר-ערוץ.
+// לא fetch נוסף — קורא מ-feedMsgs (מעודכן כל 3ש' תמיד, ר' setInterval(pollFeed))
+// ומ-lastRF.by_channel (מעודכן כל 4ש', ר' pollRF). ריק בשקט אם אין ערוצים/לא-multi.
+function renderChannelsBoard(){
+  if(STATE.app_mode!=="multi") return;
+  const sys = SYSTEMS.find(s=>s.id===STATE.system);
+  const cmap = (sys&&sys.channelmap)||[];
+  if(!cmap.length){ $("channelsList").innerHTML = `<div class="muted">אין ערוצים במערכת.</div>`; return; }
+  const byLcn = {};
+  for(const m of feedMsgs){ if(m.phys_lcn==null) continue;
+    if(!byLcn[m.phys_lcn] || m.t>byLcn[m.phys_lcn].t) byLcn[m.phys_lcn]=m; }
+  const rfByLcn = {};
+  if(lastRF) for(const c of (lastRF.by_channel||[])) rfByLcn[c.phys_lcn]=c;
+  $("channelsList").innerHTML = [...cmap].sort((a,b)=>a.lcn-b.lcn).map(ch=>{
+    const last = byLcn[ch.lcn];
+    const rf = rfByLcn[ch.lcn];
+    const tg = last ? (last.tg!=null?`TG ${esc(last.tg)}${last.tg_alias?" · "+esc(last.tg_alias):""}`:
+                       (last.tgt!=null?`→ ${esc(last.tgt)}`:"—")) : "—";
+    const when = last ? fmtT(last.t) : "אין שיחה עדיין";
+    const enc = last&&last.encrypted ? `<span class="tag enc">🔒</span>` : "";
+    const errTxt = rf ? `${rf.errors_per_min} שגיאות/דק'` : "0 שגיאות/דק'";
+    return `<div class="call" data-board-lcn="${esc(ch.lcn)}">
+      <div class="tsl">${esc(ch.freq)}<br><span class=mono>LCN${esc(ch.lcn)}</span></div>
+      <div><div class="tg">${tg}</div><div class="rid muted">${when}</div>
+        <div class="meta">${enc}<span class="tag">${errTxt}</span></div></div>
+      <div></div>
+    </div>`;
+  }).join("");
+  // לחיצה על שורת-ערוץ => קופץ לפיד השיחות, מסונן לערוץ הזה בלבד
+  $("channelsList").querySelectorAll("[data-board-lcn]").forEach(el=>el.onclick=()=>{
+    showView("calls"); $("callFilter").value = "lcn:"+el.dataset.boardLcn; renderFeed();
+  });
 }
 async function nudgeGain(direction){
   $("gainMsg").textContent = "…";
@@ -666,6 +767,7 @@ $("gainDown").onclick = ()=>nudgeGain("down");
 function callCard(m){
   const tags=[];
   tags.push(`<span class="tag ${esc(m.group||"data")}">${esc(m.category||m.call_type)}</span>`);
+  if(m.phys_lcn!=null) tags.push(`<span class="tag mono">LCN${esc(m.phys_lcn)}</span>`);   // multi mode: ערוץ-אמת
   if(m.slot!=null) tags.push(`<span class="tag slot">TS${m.slot}</span>`);
   if(m.cc!=null) tags.push(`<span class="tag">CC${m.cc}</span>`);
   if(m.encrypted) tags.push(`<span class="tag enc">🔒 ${esc((m.enc&&m.enc.alg_name)||"מוצפן")}</span>`);
@@ -682,6 +784,8 @@ function callCard(m){
 function filterMatch(m,q){
   if(!q)return true; q=q.toLowerCase();
   if(q==="מוצפן"||q==="enc") return !!m.encrypted;
+  const lcnMatch = q.match(/^lcn:?(\d+)$/);   // "lcn:3" או "lcn3" — סינון פר-ערוץ (multi)
+  if(lcnMatch) return String(m.phys_lcn)===lcnMatch[1];
   return [m.tg,m.src,m.tgt,m.tg_alias,m.src_alias,m.category].some(v=>String(v==null?"":v).toLowerCase().includes(q));
 }
 function renderFeed(){
@@ -719,6 +823,7 @@ async function pollFeed(){
     lastId=Math.max(lastId, ...msgs.map(m=>m.id));
     if(feedMsgs.length>800) feedMsgs=feedMsgs.slice(-800);
     if(appView==="calls") renderFeed();
+    if(appView==="home") renderChannelsBoard();
   }
 }
 $("callFilter").oninput=()=>{ if(appView==="calls") renderFeed(); };
@@ -726,10 +831,15 @@ $("archGo").onclick=async()=>{
   const d=$("archDate").value; if(!d)return;
   const r=await api("/api/dmr?day="+d); if(!r.ok||!r.body.ok){ alert(r.body.error||"שגיאה"); return; }
   archiveDay=d; feedMsgs=(r.body.messages||[]).map((m,i)=>({...m,id:m.id||i+1}));
-  $("archLive").classList.remove("hidden"); $("exportBtn").href="/api/dmr/export?format=csv";
+  // ⚠ בלי day= כאן, ה-CSV היה מייצא את כל ה-jsonl השמור, לא רק את יום הארכיון המוצג
+  $("archLive").classList.remove("hidden"); $("exportBtn").href="/api/dmr/export?format=csv&day="+d;
   renderFeed();
 };
-$("archLive").onclick=()=>{ archiveDay=null; feedMsgs=[]; lastId=0; $("archLive").classList.add("hidden"); renderFeed(); };
+$("archLive").onclick=()=>{
+  archiveDay=null; feedMsgs=[]; lastId=0; $("archLive").classList.add("hidden");
+  $("exportBtn").href="/api/dmr/export?format=csv";
+  renderFeed();
+};
 
 // ---------- analytics (Phase 2/3): הצפנה, תעבורה, גרף RID↔TG, מפת LRRP ----------
 // טוקני --st-good/--st-critical עברו ולידציה מול validate_palette.js (ר' CLAUDE.md).
@@ -852,11 +962,29 @@ async function renderMap(positions){
   }
 }
 
+// ---------- ערכת-נושא (בהיר/כהה): שמור ידנית, ברירת מחדל = העדפת המכשיר ----------
+// ⚠ מצב "עוקב-אחרי-מערכת" (בלי data-theme) חייב עדיין להיחשב "כהה" כברירת
+// מחדל של ה-CSS (:root הבסיסי הוא כהה; @media(light) הוא רק דריסה כשה-OS
+// בהיר) — לכן אי-אפשר לגזור "מצב נוכחי" מ-matchMedia בכל לחיצה (זה לא תמיד
+// תואם את הקאסקייד בפועל); שומרים משתנה JS יחיד שמאותחל פעם אחת נכון.
+let currentTheme = localStorage.getItem("dmr_theme");
+if(currentTheme==="light"||currentTheme==="dark"){
+  document.documentElement.setAttribute("data-theme", currentTheme);
+} else {
+  currentTheme = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+$("themeToggle").onclick = ()=>{
+  currentTheme = currentTheme==="dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", currentTheme);
+  localStorage.setItem("dmr_theme", currentTheme);
+};
+
 // ---------- boot ----------
 async function init(){
   await refreshState(); await loadAliases();
   // נחיתה: אם במצב שיחות פעיל נשאר בבית; המשתמש עובר ידנית
   setInterval(pollHealth, 4000); pollHealth();
+  setInterval(pollPower, 15000); pollPower();   // מתח לא משתנה מהר — פחות תדיר מ-health
   setInterval(pollRF, 4000); pollRF();
   setInterval(pollRoster, 20000); pollRoster();
   setInterval(pollFeed, 3000); pollFeed();

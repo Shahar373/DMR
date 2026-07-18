@@ -1760,8 +1760,13 @@ def api_health():
         any_due = any(_leg_active_now(leg) for leg in plan) if plan else True
         mode, ok = "scan", dmr_active or not any_due
     else:
-        mode = ("dmr" if dmr_active else saved)
-        ok = dmr_active if mode == "dmr" else off_ok
+        # dmr/multi חולקות את אותה יחידת systemd (DMR_SERVICE) — systemctl
+        # לבדו לא יכול להבדיל ביניהן, בדיוק כמו ב-_live_mode(). MODE_SERVICE
+        # הוא מקור-האמת המשותף: "dmr" הוא רק ברירת-מחדל לשם לא-מוכר, לא
+        # לקיצור-דרך שבולע multi (⚠ באג היה כאן: `mode = "dmr" if dmr_active
+        # else saved` דרס כל multi בחזרה ל-"dmr" מיד כשהשירות פעיל).
+        mode = (saved if saved in MODE_SERVICE else "dmr") if dmr_active else saved
+        ok = dmr_active if mode in MODE_SERVICE else off_ok
     # מדדי פיד: מספר שיחות היום + זמן השיחה האחרונה (חי חושף "האם אני מפענח")
     with _dmr_lock:
         floor = _today_start()
@@ -1807,8 +1812,18 @@ DMR_EXPORT_COLS = ["time_iso", "timestamp", "proto", "freq", "slot", "cc", "lcn"
 
 @app.route("/api/dmr/export")
 def api_dmr_export():
-    """ייצוא כל שיחות ה-DMR השמורות (dmr.jsonl). ?format=csv (BOM) | json."""
-    return dsd_export.export_response(app, request, _read_dmr_log(), DMR_EXPORT_COLS, "dmr")
+    """ייצוא שיחות DMR. ?format=csv (BOM) | json. ?day=YYYY-MM-DD => מסונן ליום
+    הארכיון הזה בלבד (כמו /api/dmr) — בלי הפרמטר, כל ה-jsonl השמור (כברירת
+    מחדל, זהה להתנהגות המקורית)."""
+    recs = _read_dmr_log()
+    day = request.args.get("day")
+    if day:
+        bounds = _day_bounds(day)
+        if bounds is None:
+            return jsonify(ok=False, error="תאריך לא תקין (פורמט: YYYY-MM-DD)"), 400
+        start, end = bounds
+        recs = [r for r in recs if start <= (r.get("t") or 0) < end]
+    return dsd_export.export_response(app, request, recs, DMR_EXPORT_COLS, "dmr")
 
 
 @app.route("/api/aircraft")
