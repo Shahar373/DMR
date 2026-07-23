@@ -46,6 +46,27 @@ def rtl_command(command: int, value: int) -> bytes:
     return struct.pack(">BI", command & 0xFF, value & 0xFFFFFFFF)
 
 
+def scaled_taps(iq_rate: int, base_taps: int = 121,
+                ref_rate: int = DEFAULT_IQ_RATE, cap: int = 1023) -> int:
+    """Tap count that holds the low-pass transition width ~constant across
+    sample rates. A windowed-sinc's transition width is ~3.3*fs/taps, so at a
+    fixed `base_taps` a wider `iq_rate` gives a *wider* (worse) transition —
+    exactly the multi-mode problem: the single-channel filter was tuned at
+    240kHz (121 taps, ~6.5kHz transition), but multi runs one wideband capture
+    at e.g. 672kHz where 121 taps balloon to ~18kHz, letting the adjacent Cap+
+    channel (12.5-25kHz away) bleed through and hurting per-channel decode.
+    Scaling taps ∝ iq_rate keeps selectivity constant. Pure/odd/CI-testable.
+    At iq_rate==ref_rate this returns base_taps EXACTLY, so the hardware-
+    validated single-channel path (240kHz) is byte-for-byte unchanged; only
+    the wider multi rates get more taps (CPU re-measured by scripts/spike-dmr-
+    multi -- there is headroom, 154%/400% at 6ch)."""
+    n = round(base_taps * iq_rate / ref_rate)
+    n = min(n, cap)
+    if n % 2 == 0:
+        n += 1
+    return max(n, base_taps if iq_rate >= ref_rate else 3)
+
+
 def design_lowpass(sample_rate: int, cutoff_hz: float, taps: int = 121) -> np.ndarray:
     """Windowed-sinc low-pass used before integer decimation."""
     if taps < 3 or taps % 2 == 0:
@@ -194,6 +215,10 @@ class NfmDemodulator:
         self.audio_rate = audio_rate
         self.decimation = iq_rate // audio_rate
         self.audio_gain = float(audio_gain)
+        # `taps` is used as-is (absolute count). Single-channel passes the
+        # validated 121; multi decides its own count in MultiChannelBridge
+        # (fixed 121 by default = the hardware-validated engine; scaled_taps()
+        # only when DSD_MULTI_SCALED_TAPS is set, for the field A/B test).
         self.taps = design_lowpass(iq_rate, cutoff_hz, taps)
         self.overlap = np.zeros(len(self.taps) - 1, dtype=np.complex64)
         self.previous = np.complex64(1.0 + 0.0j)
@@ -782,10 +807,17 @@ class MultiChannelBridge:
         self.config = config
         self.tuner = RtlTcpClient(config.rtl_host, config.rtl_port,
                                   config.center_hz, config.iq_rate)
+        # ⚠ ברירת-מחדל: 121 taps קבוע — בדיוק מנוע ה-multi שאומת על חומרה (v0.7.1).
+        # DSD_MULTI_SCALED_TAPS=1 מפעיל את scaled_taps (סלקטיביות טובה יותר לרוחב-פס,
+        # אך ×~2.8 עומס-קונבולוציה) — opt-in ל-A/B בשדה עד שיאומת CPU על RSP1B. ר'
+        # CLAUDE.md §8. חד-ערוצי (240kHz) לא מושפע כי scaled_taps(240k)==121 ממילא.
+        multi_taps = (scaled_taps(config.iq_rate)
+                      if os.environ.get("DSD_MULTI_SCALED_TAPS", "").lower()
+                      in ("1", "true", "yes") else 121)
         self.channels: "dict[int, dict]" = {}   # lcn -> {"demod":, "audio":, "sender":}
         for i, ch in enumerate(config.channels):
             demod = NfmDemodulator(iq_rate=config.iq_rate, audio_rate=config.audio_rate,
-                                   audio_gain=config.audio_gain,
+                                   audio_gain=config.audio_gain, taps=multi_taps,
                                    offset_hz=ch["freq_hz"] - config.center_hz)
             audio = AudioServer(config.audio_host, config.audio_base_port + i)
             sender = AudioSender(audio)

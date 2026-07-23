@@ -330,6 +330,17 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   נקיים. **לעומת זאת** — שרשרת האותות (rsp_tcp→rsp_fm.py→DSD-FME) היא תלוית-hardware
   אמיתית ולא נבדקת ב-CI (`dsd_pty._run`/`rsp_fm.run` הם `pragma: no cover`); שינוי בה
   דורש בדיקה על RSP1B אמיתי, לא רק pytest ירוק.
+- **⚠ `scaled_taps` ב-multi הוא opt-in (`DSD_MULTI_SCALED_TAPS`, כבוי כברירת-מחדל,
+  v0.7.3):** רוחב-המעבר של פילטר ה-anti-alias הוא ~3.3·fs/taps, אז 121 taps קבוע
+  נותן סלקטיביות גרועה יותר ככל ש-iq_rate גדל (ב-672kHz של multi זה חשוד ל"רק
+  2/6 ערוצים נעלו"). `rsp_fm.scaled_taps(iq_rate)` מתאים אותם (339 @ 672kHz)
+  לשמור רוחב-מעבר קבוע — **אבל זה ×~2.8 עומס-קונבולוציה על תהליך `rsp_fm.run_multi`
+  היחיד, ולא אומת על RSP1B**. לכן `MultiChannelBridge` משתמש ב-121 קבוע (המנוע
+  שאומת ב-v0.7.1) **אלא אם** `DSD_MULTI_SCALED_TAPS` דלוק. חד-ערוצי (240kHz) זהה
+  byte-for-byte בכל מקרה (`scaled_taps(240k)==121`; `NfmDemodulator` משתמש ב-`taps`
+  כפי-שהוא). אימות: A/B בשדה דרך הספייק (`DSD_MULTI_SCALED_TAPS=1 sudo bash
+  scripts/spike-dmr-multi ...` מול הרצה רגילה) — משווים ערוצים-עם-אירועים + CPU
+  שיא. רק כשמוכח שיפור בלי רוויה → הופכים לברירת-מחדל.
 - **rsp_tcp + rsp_fm.py כתהליכי-בן:** dsd_pty מריץ את שניהם (ובנוסף את DSD-FME עצמו
   תחת PTY) => יחידת systemd אחת = צרכן-SDR אחד (מודל ה-standby/PartOf של AIR-AM
   נשמר). כל שלושת התהליכים מקבלים `PR_SET_PDEATHSIG` (`dsd_pty._pdeathsig_term`) כדי
@@ -417,8 +428,16 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   "🔎 גילוי" עם "שמור כמערכת". **מיפוי LCN↔תדר best-effort/ידני** (Cap+ = LSN לוגי,
   SDR יחיד; ר' §8). הלוגיקה הטהורה + Flask נבדקים ב-CI (140 בדיקות); מצב ה-sweep
   ולקוח ה-rigctl/spectrum הם `pragma: no cover` — לאימות על Pi 5 + RSP1B.
-- **Phase 7 (v0.6.0, קוד+CI ירוקים; שרשרת הפענוח הרב-ערוצית טרם אומתה על
-  חומרה):** מיזוג עם `DMR-DECREP-SHAHAR` — מצב `multi` חדש: פענוח **כל** ערוצי
+- **Phase 7 (v0.6.0 קוד+CI; v0.7.1 — ✅ מנוע ה-multi אומת על חומרה אמיתית):**
+  ב-23.07.2026 הורץ `scripts/spike-dmr-multi multi_164cluster` על Pi 5 + RSP1B:
+  **rsp_tcp שרד קליטה רחבת-פס 672kHz** (הסיכון הטכני המרכזי — נסגר), **6 מפענחי
+  dsd-fme במקביל** חיו 120ש', **CPU 133% ממוצע/154% שיא מתוך 400%** (headroom),
+  ותיוג `phys_lcn` הגיע נכון ב-UDP (1318 אירועים). **סייג:** רק 2/6 ערוצים
+  ייצרו אירועים בחלון, רובם `quality`/`encryption` (לא `voice_call`) — **המנוע**
+  הוכח, אך כיסוי-קול על *כל* הערוצים הוא שאלת תעבורה-בזמן/קליטה שתיבדק בחלון-שדה
+  ארוך. ⚠ **לקח תפעולי:** ריצה שנקטעה משאירה יתומים שמחזיקים את ה-SDR והריצה
+  הבאה מתה ב-bring-up (`t≈9s`, 0 אירועים) — הספייק מטאטא יתומים ב-preflight
+  מ-v0.7.1 (ר' CHANGELOG). מיזוג עם `DMR-DECREP-SHAHAR` — מצב `multi` חדש: פענוח **כל** ערוצי
   ה-channelmap של מערכת בו-זמנית, לא רק תדר-בקרה יחיד (§5 "multi"). קליטה
   רחבת-פס אחת (`rsp_tcp` מכוון פעם אחת) → N מדמודלטורי NFM מוסטים ב-`rsp_fm.py`
   (`offset_hz` פר-ערוץ, גרסה כללית של המדמודלטור החד-ערוצי הקיים — לא retune

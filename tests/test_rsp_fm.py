@@ -258,6 +258,35 @@ def test_nfm_demodulator_offset_reset_clears_mix_phase():
     assert demod._mix_phase == 0.0
 
 
+def test_scaled_taps_preserves_single_channel_reference():
+    """At the single-channel reference rate (240kHz) scaled_taps returns the
+    base count EXACTLY, so the field A/B flag can never perturb the hardware-
+    validated dmr/scan path (240kHz -> 121 either way)."""
+    assert rsp_fm.scaled_taps(rsp_fm.DEFAULT_IQ_RATE, 121) == 121
+    # NfmDemodulator itself no longer auto-scales: it uses `taps` as-is, so the
+    # default single-channel demod is exactly 121 regardless of the flag.
+    demod = rsp_fm.NfmDemodulator(iq_rate=rsp_fm.DEFAULT_IQ_RATE)
+    assert len(demod.taps) == 121
+
+
+def test_scaled_taps_widens_for_multi_rate_and_stays_odd():
+    """A ~2.8x wider capture (672kHz, the multi_164cluster rate) needs ~2.8x
+    the taps to hold the transition width -- otherwise the adjacent Cap+
+    channel bleeds through. Always odd (design_lowpass requires it). This is
+    the value the OPT-IN DSD_MULTI_SCALED_TAPS path feeds each multi demod."""
+    n = rsp_fm.scaled_taps(672_000, 121)
+    assert n == 339                      # round(121 * 672000/240000) -> 338.8 -> 339
+    assert n % 2 == 1
+    assert rsp_fm.scaled_taps(240_000, 121) < n   # monotonic in rate
+    # applied explicitly, the demod honors it
+    assert len(rsp_fm.NfmDemodulator(iq_rate=672_000, taps=n).taps) == 339
+
+
+def test_scaled_taps_is_capped_and_odd_at_extremes():
+    capped = rsp_fm.scaled_taps(2_000_000, 121, cap=1023)
+    assert capped <= 1023 and capped % 2 == 1
+
+
 def test_compute_wideband_plan_center_and_rate():
     center_hz, iq_rate = rsp_fm.compute_wideband_plan(
         [461_037_500, 461_062_500, 461_087_500, 461_112_500], guard_hz=25_000)
@@ -333,6 +362,42 @@ def test_multi_channel_bridge_builds_offset_per_channel():
         assert bridge.channels[2]["demod"].offset_hz == 461_062_500 - 461_050_000
         assert bridge.channels[1]["audio"].port == 17355
         assert bridge.channels[2]["audio"].port == 17356
+    finally:
+        bridge.close()
+
+
+def _wideband_multi_config():
+    return rsp_fm.MultiChannelConfig(
+        rtl_host="127.0.0.1", rtl_port=1234,
+        channels=[{"lcn": 1, "freq_hz": 164_100_000},
+                  {"lcn": 2, "freq_hz": 164_700_000}],
+        center_hz=164_400_000, iq_rate=672_000,
+        audio_host="127.0.0.1", audio_base_port=17355,
+        rigctl_host="127.0.0.1", rigctl_port=14532,
+        control_socket="/tmp/does-not-matter.sock",
+    )
+
+
+def test_multi_bridge_uses_fixed_taps_by_default(monkeypatch):
+    """Default (flag unset) MUST be the hardware-validated 121 taps, even at a
+    wideband 672kHz rate -- merging to main never changes decode behavior until
+    DSD_MULTI_SCALED_TAPS is validated on an RSP1B (CLAUDE.md §8)."""
+    monkeypatch.delenv("DSD_MULTI_SCALED_TAPS", raising=False)
+    bridge = rsp_fm.MultiChannelBridge(_wideband_multi_config())
+    try:
+        assert len(bridge.channels[1]["demod"].taps) == 121
+    finally:
+        bridge.close()
+
+
+def test_multi_bridge_scales_taps_when_flag_set(monkeypatch):
+    """The opt-in A/B flag widens every multi demod's anti-alias filter to hold
+    selectivity at the wideband rate (672kHz -> 339 taps)."""
+    monkeypatch.setenv("DSD_MULTI_SCALED_TAPS", "1")
+    bridge = rsp_fm.MultiChannelBridge(_wideband_multi_config())
+    try:
+        assert len(bridge.channels[1]["demod"].taps) == 339
+        assert len(bridge.channels[2]["demod"].taps) == 339
     finally:
         bridge.close()
 

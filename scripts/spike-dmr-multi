@@ -44,6 +44,22 @@ echo "  webtune: $WEBTUNE   systems: $SYSTEMS"
 echo "════════════════════════════════════════════════════════════════"
 
 # ── 1. Preflight ────────────────────────────────────────────────────────────
+# ⚠ טאטוא יתומים לפני הכל: ריצה קודמת שנקטעה (Ctrl+C על הסקריפט, קריסה חלקית)
+# משאירה את dsd_pty/rsp_tcp/rsp_fm/dsd-fme חיים ברקע, מחזיקים את ה-SDR — והריצה
+# הבאה מתה ב-bring-up כי rsp_tcp לא יכול לפתוח SDR תפוס (בדיוק כלל "SDR אחד
+# בהחלפה", §8). זיהוי: מוות ב-~t=9s עם 0 אירועים. את rsp_fm/dsd_pty הורגים
+# ב-full-cmdline (-f) כי הם רצים כ-python3, לא כשם-בינארי ייחודי.
+echo "── טאטוא יתומים מריצה קודמת ──"
+orphans=0
+for pat in "rsp_fm.py" "dsd_pty.py" "$RSP_TCP_BIN" "$DSD_BIN"; do
+  hits=$(pgrep -f "$pat" 2>/dev/null || true)
+  if [ -n "$hits" ]; then
+    echo "  הורג יתומים ($pat): $(echo "$hits" | tr '\n' ' ')"; orphans=1
+    pkill -9 -f "$pat" 2>/dev/null || true
+  fi
+done
+[ "$orphans" -eq 0 ] && echo "  אין יתומים ✓" || sleep 1
+
 fail=0
 check() { printf "  %-26s " "$1"; if eval "$2" >/dev/null 2>&1; then echo "✓"; else echo "✗ ($3)"; fail=1; fi; }
 echo; echo "── בדיקות מקדימות ──"
@@ -89,6 +105,15 @@ export DSD_MULTI_GUARD_HZ="25000"
 export DSD_MULTI_MAX_RATE_HZ="2000000"
 export DSD_WAV_DIR="$OUT_DIR/recordings"
 export RSP_FM_BIN="$WEBTUNE/rsp_fm.py"
+# A/B של scaled_taps: הרץ פעם בלי (ברירת-מחדל, 121 taps — המנוע שאומת) ופעם עם
+#   DSD_MULTI_SCALED_TAPS=1 sudo bash scripts/spike-dmr-multi ...
+# והשווה CPU (שיא) + ערוצים-עם-אירועים. אם עם-הדגל CPU רווי (🔴) — הפילטר יקר מדי.
+if [ "${DSD_MULTI_SCALED_TAPS:-}" = "1" ]; then
+  export DSD_MULTI_SCALED_TAPS=1
+  echo "  ⚙ scaled_taps מופעל (סלקטיביות רחבת-פס, ×~2.8 עומס-קונבולוציה) — מצב A/B"
+else
+  echo "  ⚙ scaled_taps כבוי (ברירת-מחדל: 121 taps — המנוע שאומת ב-v0.7.1)"
+fi
 mkdir -p "$DSD_WAV_DIR"
 
 echo; echo "── מריץ dsd_pty._run_multi (rsp_tcp רחב-פס + rsp_fm + ${NCH}×dsd-fme) ──"
