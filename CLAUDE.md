@@ -330,13 +330,17 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   נקיים. **לעומת זאת** — שרשרת האותות (rsp_tcp→rsp_fm.py→DSD-FME) היא תלוית-hardware
   אמיתית ולא נבדקת ב-CI (`dsd_pty._run`/`rsp_fm.run` הם `pragma: no cover`); שינוי בה
   דורש בדיקה על RSP1B אמיתי, לא רק pytest ירוק.
-- **⚠ `NfmDemodulator` taps מוקצים לפי קצב (v0.7.2):** רוחב-המעבר של פילטר
-  ה-anti-alias הוא ~3.3·fs/taps, אז מספר taps קבוע נותן סלקטיביות גרועה יותר
-  ככל ש-iq_rate גדל. `rsp_fm.scaled_taps(iq_rate, base=121)` מתאים אותם לשמור
-  רוחב-מעבר קבוע. **ב-DEFAULT_IQ_RATE (240kHz) הוא מחזיר 121 בדיוק** — חד-ערוצי
-  (המסלול שאומת על חומרה ב-Phase 5) נשאר byte-for-byte זהה; רק multi (רחב-פס)
-  מקבל יותר taps. שינוי ל-scaling הזה = שינוי-DSP: עלות ה-CPU ב-multi נמדדת
-  ב-`scripts/spike-dmr-multi`, לא רק ב-pytest.
+- **⚠ `scaled_taps` ב-multi הוא opt-in (`DSD_MULTI_SCALED_TAPS`, כבוי כברירת-מחדל,
+  v0.7.3):** רוחב-המעבר של פילטר ה-anti-alias הוא ~3.3·fs/taps, אז 121 taps קבוע
+  נותן סלקטיביות גרועה יותר ככל ש-iq_rate גדל (ב-672kHz של multi זה חשוד ל"רק
+  2/6 ערוצים נעלו"). `rsp_fm.scaled_taps(iq_rate)` מתאים אותם (339 @ 672kHz)
+  לשמור רוחב-מעבר קבוע — **אבל זה ×~2.8 עומס-קונבולוציה על תהליך `rsp_fm.run_multi`
+  היחיד, ולא אומת על RSP1B**. לכן `MultiChannelBridge` משתמש ב-121 קבוע (המנוע
+  שאומת ב-v0.7.1) **אלא אם** `DSD_MULTI_SCALED_TAPS` דלוק. חד-ערוצי (240kHz) זהה
+  byte-for-byte בכל מקרה (`scaled_taps(240k)==121`; `NfmDemodulator` משתמש ב-`taps`
+  כפי-שהוא). אימות: A/B בשדה דרך הספייק (`DSD_MULTI_SCALED_TAPS=1 sudo bash
+  scripts/spike-dmr-multi ...` מול הרצה רגילה) — משווים ערוצים-עם-אירועים + CPU
+  שיא. רק כשמוכח שיפור בלי רוויה → הופכים לברירת-מחדל.
 - **rsp_tcp + rsp_fm.py כתהליכי-בן:** dsd_pty מריץ את שניהם (ובנוסף את DSD-FME עצמו
   תחת PTY) => יחידת systemd אחת = צרכן-SDR אחד (מודל ה-standby/PartOf של AIR-AM
   נשמר). כל שלושת התהליכים מקבלים `PR_SET_PDEATHSIG` (`dsd_pty._pdeathsig_term`) כדי

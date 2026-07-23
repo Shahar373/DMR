@@ -105,6 +105,15 @@ export DSD_MULTI_GUARD_HZ="25000"
 export DSD_MULTI_MAX_RATE_HZ="2000000"
 export DSD_WAV_DIR="$OUT_DIR/recordings"
 export RSP_FM_BIN="$WEBTUNE/rsp_fm.py"
+# A/B של scaled_taps: הרץ פעם בלי (ברירת-מחדל, 121 taps — המנוע שאומת) ופעם עם
+#   DSD_MULTI_SCALED_TAPS=1 sudo bash scripts/spike-dmr-multi ...
+# והשווה CPU (שיא) + ערוצים-עם-אירועים. אם עם-הדגל CPU רווי (🔴) — הפילטר יקר מדי.
+if [ "${DSD_MULTI_SCALED_TAPS:-}" = "1" ]; then
+  export DSD_MULTI_SCALED_TAPS=1
+  echo "  ⚙ scaled_taps מופעל (סלקטיביות רחבת-פס, ×~2.8 עומס-קונבולוציה) — מצב A/B"
+else
+  echo "  ⚙ scaled_taps כבוי (ברירת-מחדל: 121 taps — המנוע שאומת ב-v0.7.1)"
+fi
 mkdir -p "$DSD_WAV_DIR"
 
 echo; echo "── מריץ dsd_pty._run_multi (rsp_tcp רחב-פס + rsp_fm + ${NCH}×dsd-fme) ──"

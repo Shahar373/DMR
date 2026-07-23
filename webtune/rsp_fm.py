@@ -215,11 +215,11 @@ class NfmDemodulator:
         self.audio_rate = audio_rate
         self.decimation = iq_rate // audio_rate
         self.audio_gain = float(audio_gain)
-        # `taps` is the reference count at DEFAULT_IQ_RATE (240kHz); scaled_taps
-        # holds transition width constant at wider (multi) rates and returns it
-        # UNCHANGED at 240kHz, so single-channel stays byte-identical. See
-        # scaled_taps() for why fixed taps under-filter multi's wideband capture.
-        self.taps = design_lowpass(iq_rate, cutoff_hz, scaled_taps(iq_rate, taps))
+        # `taps` is used as-is (absolute count). Single-channel passes the
+        # validated 121; multi decides its own count in MultiChannelBridge
+        # (fixed 121 by default = the hardware-validated engine; scaled_taps()
+        # only when DSD_MULTI_SCALED_TAPS is set, for the field A/B test).
+        self.taps = design_lowpass(iq_rate, cutoff_hz, taps)
         self.overlap = np.zeros(len(self.taps) - 1, dtype=np.complex64)
         self.previous = np.complex64(1.0 + 0.0j)
         # DC-blocker state (single-pole IIR, y[n] = x[n] - x[n-1] + r*y[n-1]).
@@ -807,10 +807,17 @@ class MultiChannelBridge:
         self.config = config
         self.tuner = RtlTcpClient(config.rtl_host, config.rtl_port,
                                   config.center_hz, config.iq_rate)
+        # ⚠ ברירת-מחדל: 121 taps קבוע — בדיוק מנוע ה-multi שאומת על חומרה (v0.7.1).
+        # DSD_MULTI_SCALED_TAPS=1 מפעיל את scaled_taps (סלקטיביות טובה יותר לרוחב-פס,
+        # אך ×~2.8 עומס-קונבולוציה) — opt-in ל-A/B בשדה עד שיאומת CPU על RSP1B. ר'
+        # CLAUDE.md §8. חד-ערוצי (240kHz) לא מושפע כי scaled_taps(240k)==121 ממילא.
+        multi_taps = (scaled_taps(config.iq_rate)
+                      if os.environ.get("DSD_MULTI_SCALED_TAPS", "").lower()
+                      in ("1", "true", "yes") else 121)
         self.channels: "dict[int, dict]" = {}   # lcn -> {"demod":, "audio":, "sender":}
         for i, ch in enumerate(config.channels):
             demod = NfmDemodulator(iq_rate=config.iq_rate, audio_rate=config.audio_rate,
-                                   audio_gain=config.audio_gain,
+                                   audio_gain=config.audio_gain, taps=multi_taps,
                                    offset_hz=ch["freq_hz"] - config.center_hz)
             audio = AudioServer(config.audio_host, config.audio_base_port + i)
             sender = AudioSender(audio)
