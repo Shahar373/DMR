@@ -68,6 +68,7 @@ DMR_BRIDGE_AUDIO_GAIN = 4.0
 MULTI_GUARD_HZ = 25_000          # מרווח-שוליים בכל צד הטווח (Hz)
 MULTI_MAX_SPAN_HZ = 2_000_000    # תקרת רוחב-פס לקליטה רחבת-פס אחת (RSP1B)
 MULTI_CHANNELS_MAX = 8           # תקרה שמרנית עד מדידת CPU בפועל על Pi 5 (ר' CLAUDE.md)
+MULTI_MIN_SEP_HZ = 12_500        # מרווח מינימלי בין ערוצים (raster DMR 12.5kHz): קרוב יותר = כפילות/טעות
 DMR_BUF_MAX = 800                     # שיחות אחרונות בזיכרון (נטענות בעלייה, היום בלבד)
 DMR_LOG_PATH = Path("/var/lib/dmr/dmr.jsonl")
 DMR_LOG_KEEP = 8000                   # retention בדיסק (זנב נשמר; ייצוא לניתוח)
@@ -410,6 +411,15 @@ def _validate_multi_feasible(system):
     if len(set(lcns)) != len(lcns):
         return False, "מצב רב-ערוצי דורש LCN ייחודי לכל ערוץ (יש LCN כפול במפה)"
     chan_hz = [int(round(float(ch["freq"]) * 1e6)) for ch in cmap]
+    # ⚠ תדרים חייבים להיות רחוקים ≥MULTI_MIN_SEP_HZ זה מזה: שני ערוצים באותו תדר
+    # (או קרובים מ-raster DMR) הם כפילות/טעות — היו מריצים שני מדמודלטורי-NFM
+    # חופפים (offset זהה) ושני מפענחים על אותו אות, אירועים כפולים בלי הפרדה
+    # אמיתית. נכשל כאן ב-400 במקום להטעות בשקט. (כל אשכולות הסקר ≥25kHz — עוברים.)
+    ordered = sorted(chan_hz)
+    tight = min((b - a for a, b in zip(ordered, ordered[1:])), default=MULTI_MIN_SEP_HZ)
+    if tight < MULTI_MIN_SEP_HZ:
+        return False, (f"מצב רב-ערוצי דורש מרווח ≥{MULTI_MIN_SEP_HZ // 1000}kHz בין "
+                       f"תדרים (יש זוג במרווח {tight} Hz — כפילות או טעות במפה)")
     try:
         dsd_pty.compute_wideband_plan(chan_hz, guard_hz=MULTI_GUARD_HZ,
                                       max_rate=MULTI_MAX_SPAN_HZ)

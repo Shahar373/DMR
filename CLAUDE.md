@@ -330,6 +330,13 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   נקיים. **לעומת זאת** — שרשרת האותות (rsp_tcp→rsp_fm.py→DSD-FME) היא תלוית-hardware
   אמיתית ולא נבדקת ב-CI (`dsd_pty._run`/`rsp_fm.run` הם `pragma: no cover`); שינוי בה
   דורש בדיקה על RSP1B אמיתי, לא רק pytest ירוק.
+- **⚠ `NfmDemodulator` taps מוקצים לפי קצב (v0.7.2):** רוחב-המעבר של פילטר
+  ה-anti-alias הוא ~3.3·fs/taps, אז מספר taps קבוע נותן סלקטיביות גרועה יותר
+  ככל ש-iq_rate גדל. `rsp_fm.scaled_taps(iq_rate, base=121)` מתאים אותם לשמור
+  רוחב-מעבר קבוע. **ב-DEFAULT_IQ_RATE (240kHz) הוא מחזיר 121 בדיוק** — חד-ערוצי
+  (המסלול שאומת על חומרה ב-Phase 5) נשאר byte-for-byte זהה; רק multi (רחב-פס)
+  מקבל יותר taps. שינוי ל-scaling הזה = שינוי-DSP: עלות ה-CPU ב-multi נמדדת
+  ב-`scripts/spike-dmr-multi`, לא רק ב-pytest.
 - **rsp_tcp + rsp_fm.py כתהליכי-בן:** dsd_pty מריץ את שניהם (ובנוסף את DSD-FME עצמו
   תחת PTY) => יחידת systemd אחת = צרכן-SDR אחד (מודל ה-standby/PartOf של AIR-AM
   נשמר). כל שלושת התהליכים מקבלים `PR_SET_PDEATHSIG` (`dsd_pty._pdeathsig_term`) כדי

@@ -223,6 +223,30 @@ def test_validate_multi_feasible_rejects_duplicate_lcn():
     assert ok is False and "LCN" in err
 
 
+def test_validate_multi_feasible_rejects_near_duplicate_freqs():
+    """Finding #2: two channels closer than the DMR 12.5kHz raster are a
+    duplicate/typo -- they'd spawn two overlapping NFM demodulators (same
+    offset) decoding one signal, producing duplicate events with no real
+    separation. Reject at multi entry, not as a silent hardware mess."""
+    import app
+    sys = {"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
+           "channelmap": [{"lcn": 1, "freq": 461.0375},
+                          {"lcn": 2, "freq": 461.0400}]}   # 2.5kHz apart
+    ok, err = app._validate_multi_feasible(sys)
+    assert ok is False and "kHz" in err
+
+
+def test_validate_multi_feasible_accepts_exact_raster_spacing():
+    """A pair spaced exactly one DMR raster (12.5kHz) apart is legitimate and
+    must pass -- the guard rejects only *tighter* than the raster."""
+    import app
+    sys = {"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
+           "channelmap": [{"lcn": 1, "freq": 461.0375},
+                          {"lcn": 2, "freq": 461.0500}]}   # exactly 12.5kHz
+    ok, err = app._validate_multi_feasible(sys)
+    assert ok is True and err is None
+
+
 def test_api_mode_multi_rejects_duplicate_lcn(paths, sysctl, no_sleep):
     app = paths
     _seed_systems(app, [{"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,

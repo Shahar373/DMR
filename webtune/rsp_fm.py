@@ -46,6 +46,27 @@ def rtl_command(command: int, value: int) -> bytes:
     return struct.pack(">BI", command & 0xFF, value & 0xFFFFFFFF)
 
 
+def scaled_taps(iq_rate: int, base_taps: int = 121,
+                ref_rate: int = DEFAULT_IQ_RATE, cap: int = 1023) -> int:
+    """Tap count that holds the low-pass transition width ~constant across
+    sample rates. A windowed-sinc's transition width is ~3.3*fs/taps, so at a
+    fixed `base_taps` a wider `iq_rate` gives a *wider* (worse) transition —
+    exactly the multi-mode problem: the single-channel filter was tuned at
+    240kHz (121 taps, ~6.5kHz transition), but multi runs one wideband capture
+    at e.g. 672kHz where 121 taps balloon to ~18kHz, letting the adjacent Cap+
+    channel (12.5-25kHz away) bleed through and hurting per-channel decode.
+    Scaling taps ∝ iq_rate keeps selectivity constant. Pure/odd/CI-testable.
+    At iq_rate==ref_rate this returns base_taps EXACTLY, so the hardware-
+    validated single-channel path (240kHz) is byte-for-byte unchanged; only
+    the wider multi rates get more taps (CPU re-measured by scripts/spike-dmr-
+    multi -- there is headroom, 154%/400% at 6ch)."""
+    n = round(base_taps * iq_rate / ref_rate)
+    n = min(n, cap)
+    if n % 2 == 0:
+        n += 1
+    return max(n, base_taps if iq_rate >= ref_rate else 3)
+
+
 def design_lowpass(sample_rate: int, cutoff_hz: float, taps: int = 121) -> np.ndarray:
     """Windowed-sinc low-pass used before integer decimation."""
     if taps < 3 or taps % 2 == 0:
@@ -194,7 +215,11 @@ class NfmDemodulator:
         self.audio_rate = audio_rate
         self.decimation = iq_rate // audio_rate
         self.audio_gain = float(audio_gain)
-        self.taps = design_lowpass(iq_rate, cutoff_hz, taps)
+        # `taps` is the reference count at DEFAULT_IQ_RATE (240kHz); scaled_taps
+        # holds transition width constant at wider (multi) rates and returns it
+        # UNCHANGED at 240kHz, so single-channel stays byte-identical. See
+        # scaled_taps() for why fixed taps under-filter multi's wideband capture.
+        self.taps = design_lowpass(iq_rate, cutoff_hz, scaled_taps(iq_rate, taps))
         self.overlap = np.zeros(len(self.taps) - 1, dtype=np.complex64)
         self.previous = np.complex64(1.0 + 0.0j)
         # DC-blocker state (single-pole IIR, y[n] = x[n] - x[n-1] + r*y[n-1]).

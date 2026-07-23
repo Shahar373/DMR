@@ -258,6 +258,32 @@ def test_nfm_demodulator_offset_reset_clears_mix_phase():
     assert demod._mix_phase == 0.0
 
 
+def test_scaled_taps_preserves_single_channel_reference():
+    """At the single-channel reference rate (240kHz) scaled_taps must return
+    the base count EXACTLY -- the hardware-validated dmr/scan path stays
+    byte-for-byte unchanged; only wider multi rates get more taps."""
+    assert rsp_fm.scaled_taps(rsp_fm.DEFAULT_IQ_RATE, 121) == 121
+    demod = rsp_fm.NfmDemodulator(iq_rate=rsp_fm.DEFAULT_IQ_RATE)
+    assert len(demod.taps) == 121
+
+
+def test_scaled_taps_widens_for_multi_rate_and_stays_odd():
+    """A ~2.8x wider capture (672kHz, the multi_164cluster rate) needs ~2.8x
+    the taps to hold the transition width -- otherwise the adjacent Cap+
+    channel bleeds through. Always odd (design_lowpass requires it)."""
+    n = rsp_fm.scaled_taps(672_000, 121)
+    assert n == 339                      # round(121 * 672000/240000) -> 338.8 -> 339
+    assert n % 2 == 1
+    demod = rsp_fm.NfmDemodulator(iq_rate=672_000)
+    assert len(demod.taps) == 339
+    assert rsp_fm.scaled_taps(240_000, 121) < n   # monotonic in rate
+
+
+def test_scaled_taps_is_capped_and_odd_at_extremes():
+    capped = rsp_fm.scaled_taps(2_000_000, 121, cap=1023)
+    assert capped <= 1023 and capped % 2 == 1
+
+
 def test_compute_wideband_plan_center_and_rate():
     center_hz, iq_rate = rsp_fm.compute_wideband_plan(
         [461_037_500, 461_062_500, 461_087_500, 461_112_500], guard_hz=25_000)
