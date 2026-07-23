@@ -44,6 +44,22 @@ echo "  webtune: $WEBTUNE   systems: $SYSTEMS"
 echo "════════════════════════════════════════════════════════════════"
 
 # ── 1. Preflight ────────────────────────────────────────────────────────────
+# ⚠ טאטוא יתומים לפני הכל: ריצה קודמת שנקטעה (Ctrl+C על הסקריפט, קריסה חלקית)
+# משאירה את dsd_pty/rsp_tcp/rsp_fm/dsd-fme חיים ברקע, מחזיקים את ה-SDR — והריצה
+# הבאה מתה ב-bring-up כי rsp_tcp לא יכול לפתוח SDR תפוס (בדיוק כלל "SDR אחד
+# בהחלפה", §8). זיהוי: מוות ב-~t=9s עם 0 אירועים. את rsp_fm/dsd_pty הורגים
+# ב-full-cmdline (-f) כי הם רצים כ-python3, לא כשם-בינארי ייחודי.
+echo "── טאטוא יתומים מריצה קודמת ──"
+orphans=0
+for pat in "rsp_fm.py" "dsd_pty.py" "$RSP_TCP_BIN" "$DSD_BIN"; do
+  hits=$(pgrep -f "$pat" 2>/dev/null || true)
+  if [ -n "$hits" ]; then
+    echo "  הורג יתומים ($pat): $(echo "$hits" | tr '\n' ' ')"; orphans=1
+    pkill -9 -f "$pat" 2>/dev/null || true
+  fi
+done
+[ "$orphans" -eq 0 ] && echo "  אין יתומים ✓" || sleep 1
+
 fail=0
 check() { printf "  %-26s " "$1"; if eval "$2" >/dev/null 2>&1; then echo "✓"; else echo "✗ ($3)"; fail=1; fi; }
 echo; echo "── בדיקות מקדימות ──"
