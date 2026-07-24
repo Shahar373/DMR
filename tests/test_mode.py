@@ -23,6 +23,18 @@ def test_enter_dmr_success(paths, sysctl, no_sleep):
     assert "461037500" in app.CHANNELMAP_PATH.read_text()
 
 
+def test_enter_dmr_caches_active_system_for_intel(paths, sysctl, no_sleep):
+    """_active_system_id/_active_color_code נקבעים ב-_enter_dmr => ה-listener
+    יודע לשייך system-radar (lsn_status/site_info/וכו') בלי load_state() בכל
+    אירוע UDP (ר' §5 system_intel)."""
+    app = paths
+    system = {"id": "s1", "name": "Test", "control": 461.0375, "color_code": 3,
+              "channelmap": [{"lcn": 1, "freq": 461.0375}]}
+    err, detail = app._enter_dmr(system)
+    assert err is None
+    assert app._active_system_id == "s1" and app._active_color_code == 3
+
+
 def test_enter_dmr_clears_channel_status(paths, sysctl, no_sleep):
     """restart אמיתי = כל מפענחי ה-multi עולים מ-0 (Phase 7 partial-restart) --
     סטטוס-ערוצים (down/restarting) מריצה קודמת לא רלוונטי יותר."""

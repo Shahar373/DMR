@@ -272,6 +272,21 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       </div>
     </div>
 
+    <div class="card" id="intelCard">
+      <h2>🔬 מודיעין-מערכת <span class="count" id="intelSystemName"></span></h2>
+      <div class="muted" style="margin-bottom:var(--sp-2)">
+        נצבר אוטומטית מערוץ-הבקרה בזמן-אמת — בלי לתפוס אף ערוץ אחר (lsn_status/
+        preamble_csbk/bank_call/site_info). מעשיר את בנק-התדרים לאורך זמן.
+      </div>
+      <div id="intelCc"></div>
+      <div id="intelSites" style="margin-top:var(--sp-2)"></div>
+      <div id="intelLsn" style="margin-top:var(--sp-2)"></div>
+      <div style="margin-top:var(--sp-2)" id="intelCdrWrap">
+        <b>שיחות-יחיד אחרונות (CDR)</b>
+        <div id="intelCdr"><div class="muted">—</div></div>
+      </div>
+    </div>
+
     <div class="card" id="scanCard">
       <h2>לוח סריקה</h2>
       <div id="scanLegs"></div>
@@ -867,6 +882,45 @@ async function pollRF(){
   renderChannelsBoard();
 }
 
+// ---------- מודיעין-מערכת (Phase 8: אתרים/מפת-תפוסה/CDR/סחיפת-CC) ---------
+// נצבר server-side מ-_dmr_listener (dsd_pty: lsn_status/site_info/preamble_csbk/
+// bank_call, ר' CLAUDE.md §5) — כאן רק תצוגה, בלי חישוב.
+async function pollSystemIntel(){
+  const r=await api("/api/system-intel"); if(!r.ok||!r.body.ok)return;
+  const sid=r.body.system, d=r.body.intel;
+  const sys=SYSTEMS.find(s=>s.id===sid);
+  $("intelSystemName").textContent = sid ? `(${esc(sys?sys.name:sid)})` : "";
+
+  if(d.cc){
+    const mism=d.cc.mismatch;
+    $("intelCc").innerHTML = `<span class="tag${mism?' err':''}">Color Code: מוגדר ${esc(d.cc.configured)} · נצפה ${esc(d.cc.observed)}${mism?' ⚠ אי-התאמה':' ✓'}</span>`;
+  } else {
+    $("intelCc").innerHTML = `<div class="muted">Color Code: אין עדיין תצפית.</div>`;
+  }
+
+  const sites=Object.entries(d.sites||{}).sort((a,b)=>b[1].last_seen-a[1].last_seen);
+  $("intelSites").innerHTML = sites.length
+    ? `<b>אתרים שנצפו:</b> ` + sites.map(([site,s])=>
+        `<span class="tag">אתר ${esc(site)} · ${s.count}× · ${fmtT(s.last_seen)}</span>`).join(" ")
+    : `<div class="muted">אין אתרים שנצפו (site_info) עדיין.</div>`;
+
+  const lsns=Object.entries(d.lsn_directory||{}).sort((a,b)=>(+a[0])-(+b[0]));
+  $("intelLsn").innerHTML = lsns.length
+    ? `<b>מפת-תפוסה (LSN):</b>` + lsns.map(([lsn,e])=>{
+        const occ = e.occupant==="idle" ? "פנוי" : e.occupant==="rest" ? "Rest" : `תפוס · ${esc(e.occupant)}`;
+        return `<div class="roster-row"><span><b class=mono>LSN ${esc(lsn)}</b> ${occ}</span><span class=muted>${fmtT(e.last_seen)}</span></div>`;
+      }).join("")
+    : `<div class="muted">אין מפת-תפוסה עדיין (lsn_status).</div>`;
+
+  const calls=d.private_calls||[];
+  $("intelCdr").innerHTML = calls.length
+    ? calls.map(c=>{
+        const who = c.src!=null ? `${c.src} → ${c.tgt}` : `→ ${c.tgt}`;
+        return `<div class="roster-row"><span class=mono>${esc(who)}</span><span class=muted>${esc(c.kind)} · ${fmtT(c.t)}</span></div>`;
+      }).join("")
+    : `<div class="muted">אין שיחות-יחיד שנצפו עדיין.</div>`;
+}
+
 // ---------- לוח פר-ערוץ (multi mode) ----------
 // שורה לכל ערוץ פיזי (LCN) של המערכת הפעילה: שיחה אחרונה + שגיאות פר-ערוץ.
 // לא fetch נוסף — קורא מ-feedMsgs (מעודכן כל 3ש' תמיד, ר' setInterval(pollFeed))
@@ -1144,6 +1198,7 @@ async function init(){
   setInterval(pollHealth, 4000); pollHealth();
   setInterval(pollPower, 15000); pollPower();   // מתח לא משתנה מהר — פחות תדיר מ-health
   setInterval(pollRF, 4000); pollRF();
+  setInterval(pollSystemIntel, 6000); pollSystemIntel();
   setInterval(pollRoster, 20000); pollRoster();
   setInterval(pollFeed, 3000); pollFeed();
   setInterval(refreshState, 12000);

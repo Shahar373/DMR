@@ -70,6 +70,28 @@ _RE_CHAN_STATUS = re.compile(
     r"Channel Status\b.*?Rest LSN:\s*(?P<rest_lsn>\d+)", re.I)
 _RE_LSN_STATE = re.compile(r"LSN\s*(?P<lsn>\d+):\s*(?P<state>Rest|Idle|\d+)", re.I)
 
+# --- System radar (Phase 8): control-channel telemetry about the WHOLE system,
+# not just the tuned slot -- Cap+ broadcasts this on the control channel so
+# subscribers know where to roam. Confirmed against tests/fixtures/
+# capplus_slco_sample.csv (real 20k-line Cap+/SLCO capture), previously 100%
+# dropped as housekeeping. Always emitted (not emit_status-gated) -- these
+# feed the always-on system_intel enrichment in app.py, not just discovery.
+# ⚠ lsn_status alone is ~half of all real output (34/68 unique shapes) --
+# app.py's listener must NOT persist-to-disk on every line (SD-card wear);
+# see system_intel.py's debounced flush.
+_RE_LSN_STATUS_LINE = re.compile(
+    r"^(?:\s*LSN\s*\d+:\s*(?:Idle|Rest|\d+);\s*)+$", re.I)
+_RE_BANK_CALL_HEAD = re.compile(
+    r"Bank\s+(?P<bank>\w+\s+[0-9A-F]+)\s+Private or Data Call\(s\)\s*-", re.I)
+_RE_BANK_ENTRY = re.compile(r"LSN\s*(?P<lsn>\d+):\s*TGT\s*(?P<tgt>\d+)", re.I)
+_RE_PREAMBLE_CSBK = re.compile(
+    r"Preamble CSBK\s*-\s*(?P<kind>Individual CSBK|Individual Data)\s*-\s*"
+    r"Source:\s*(?P<src>\d+)\s*-\s*Target:\s*(?P<tgt>\d+)\s*-\s*"
+    r"Rest LSN:\s*(?P<rest_lsn>\d+)", re.I)
+_RE_SITE_INFO = re.compile(
+    r"SLCO Capacity Plus Site:\s*(?P<site>\d+)\s*-\s*Rest LSN:\s*(?P<rest_lsn>\d+)"
+    r"\s*-\s*RS:\s*(?P<rs>\d+)", re.I)
+
 
 def clean_dsd_line(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "").strip()
@@ -83,7 +105,16 @@ def parse_dsd_line(text, emit_status=False):
     clean `Sync: +DMR` line and a `channel_status` event (Rest LSN + per-LSN
     states) from a Capacity Plus Channel Status line. In normal dmr/scan
     operation `emit_status` stays False, so parsing is byte-for-byte identical
-    to before (those lines return None and never hit the UDP feed)."""
+    to before (those lines return None and never hit the UDP feed).
+
+    System-radar types (`lsn_status`/`bank_call`/`preamble_csbk`/`site_info`,
+    Phase 8) are ALWAYS emitted regardless of `emit_status` -- unlike
+    `sync`/`channel_status` these feed the always-on system_intel enrichment
+    in app.py, not just a one-shot discovery probe. They were previously
+    ~half of all real Cap+ output (see tests/fixtures/capplus_slco_sample.csv)
+    and were dropped as housekeeping; callers that persist these to disk MUST
+    debounce (see system_intel.py) -- lsn_status alone is periodic control-
+    channel telemetry, not an occasional event."""
     if not text or not text.strip():
         return None
     text = clean_dsd_line(text)
@@ -153,6 +184,36 @@ def parse_dsd_line(text, emit_status=False):
         if cc:
             event["cc"] = int(cc.group("cc"))
         return event
+
+    # --- System radar: control-channel telemetry, always on (not emit_status-
+    # gated) -- see the block comment above _RE_LSN_STATUS_LINE. Order doesn't
+    # matter much here since the four shapes are mutually exclusive by keyword.
+    if _RE_LSN_STATUS_LINE.match(text):
+        channels = {}
+        for lsn, state in _RE_LSN_STATE.findall(text):
+            s = state.lower()
+            channels[int(lsn)] = "idle" if s == "idle" else "rest" if s == "rest" else int(state)
+        return {"type": "lsn_status", "channels": channels}
+
+    match = _RE_BANK_CALL_HEAD.search(text)
+    if match:
+        entries = [{"lsn": int(lsn), "tgt": int(tgt)}
+                   for lsn, tgt in _RE_BANK_ENTRY.findall(text)]
+        return {"type": "bank_call", "bank": match.group("bank"), "entries": entries}
+
+    match = _RE_PREAMBLE_CSBK.search(text)
+    if match:
+        return {
+            "type": "preamble_csbk",
+            "kind": "csbk" if match.group("kind").lower() == "individual csbk" else "data",
+            "src": int(match.group("src")), "tgt": int(match.group("tgt")),
+            "rest_lsn": int(match.group("rest_lsn")),
+        }
+
+    match = _RE_SITE_INFO.search(text)
+    if match:
+        return {"type": "site_info", "site": int(match.group("site")),
+                "rest_lsn": int(match.group("rest_lsn")), "rs": int(match.group("rs"))}
 
     if emit_status:
         # Error'd sync lines were already returned as `quality` above, so only
