@@ -1467,6 +1467,48 @@ def _rid_tg_graph(recs):
     return out[:GRAPH_TOP_N]
 
 
+UNKNOWN_MAX = 200
+
+
+def _unknown_aliases(recs):
+    """worklist של IDs שנצפו בתעבורה אך עדיין ללא שם — הדרך המהירה ביותר ממספר
+    גולמי למשמעות. אוסף RID-ים (source + target) ו-TG-ים עם כמה/מתי נצפו; כל מה
+    ש-aliasdb פותר **כרגע** (ייבוא או ידני) מוסלל החוצה, כך שמתן-שם מפיל את
+    הרשומה מהתור בקריאה הבאה. ממוין לפי count יורד (קודם הפעילים — התשואה הגבוהה).
+    טהור פרט לחיפוש-האליאס (aliasdb) => נבדק ישירות עם aliasdb מזורע."""
+    rids, tgs = {}, {}
+    for r in recs:
+        t = r.get("t") or 0
+        tg = r.get("tg")
+        for rid in (r.get("src"), r.get("tgt")):
+            if rid is None:
+                continue
+            s = rids.setdefault(int(rid), {"count": 0, "last_t": 0, "tgs": set()})
+            s["count"] += 1
+            s["last_t"] = max(s["last_t"], t)
+            if tg is not None:
+                s["tgs"].add(int(tg))
+        if tg is not None:
+            s = tgs.setdefault(int(tg), {"count": 0, "last_t": 0, "rids": set()})
+            s["count"] += 1
+            s["last_t"] = max(s["last_t"], t)
+            if r.get("src") is not None:
+                s["rids"].add(int(r["src"]))
+    out = []
+    for rid, s in rids.items():
+        if aliasdb.rid_name(rid):
+            continue
+        out.append({"kind": "rid", "id": rid, "count": s["count"],
+                    "last_t": s["last_t"] or None, "tgs": sorted(s["tgs"])[:8]})
+    for tg, s in tgs.items():
+        if aliasdb.tg_name(tg):
+            continue
+        out.append({"kind": "tg", "id": tg, "count": s["count"],
+                    "last_t": s["last_t"] or None, "rid_count": len(s["rids"])})
+    out.sort(key=lambda u: (u["count"], u["last_t"] or 0), reverse=True)
+    return out[:UNKNOWN_MAX]
+
+
 def _lrrp_snapshot():
     """מיקום אחרון-ידוע פר-RID מאירועי LRRP שבזיכרון (לא מהדיסק — "עכשיו" בלבד,
     כמו adsb.aircraft_snapshot ב-AIR-AM). {rid: {lat, lon, t, alias}}."""
@@ -1510,6 +1552,17 @@ def api_analytics_graph():
     if err:
         return jsonify(ok=False, error=err), 400
     return jsonify(ok=True, edges=_rid_tg_graph(recs))
+
+
+@app.route("/api/aliases/unknown")
+def api_aliases_unknown():
+    """תור IDs שנצפו בתעבורה אך עדיין ללא שם — worklist למתן שמות. אותם פרמטרים
+    כמו האנליטיקה (?day=YYYY-MM-DD ארכיון | ?all=1 הכל | ברירת מחדל היום)."""
+    recs, err = _analytics_source(request.args.get("day"),
+                                  request.args.get("all") in ("1", "true", "yes"))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, unknown=_unknown_aliases(recs))
 
 
 @app.route("/api/positions")

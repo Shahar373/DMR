@@ -54,3 +54,53 @@ def test_api_aliases_bad_put(paths):
     app = paths
     r = app.app.test_client().put("/api/aliases", json={"tg": "not-an-object"})
     assert r.status_code == 400
+
+
+# --- תור לא-מזוהים (worklist למתן שמות) --------------------------------------
+def test_unknown_aliases_ranks_by_count_and_excludes_named(paths):
+    """RID/TG שנצפו בתעבורה ואין להם שם => בתור, ממוין לפי count יורד. מה
+    ש-aliasdb פותר (ידני/ייבוא) מוסלל החוצה — מתן שם מפיל מהתור."""
+    import aliases
+    app = paths
+    aliases.replace_manual({"rid": {"500": "מוכר"}, "tg": {}})
+    recs = [
+        {"t": 10, "src": 100, "tg": 9, "tgt": None},   # RID 100 ×3
+        {"t": 11, "src": 100, "tg": 9, "tgt": None},
+        {"t": 12, "src": 100, "tg": 9, "tgt": None},
+        {"t": 13, "src": 200, "tg": 9, "tgt": None},   # RID 200 ×1
+        {"t": 14, "src": 500, "tg": 9, "tgt": None},   # RID 500 מוכר => לא בתור
+    ]
+    unk = app._unknown_aliases(recs)
+    rids = [u for u in unk if u["kind"] == "rid"]
+    ids = [u["id"] for u in rids]
+    assert 500 not in ids                       # שם ידני => מוסלל
+    assert ids[0] == 100 and rids[0]["count"] == 3   # הפעיל ביותר ראשון
+    assert 200 in ids
+    tg9 = next(u for u in unk if u["kind"] == "tg" and u["id"] == 9)
+    assert tg9["rid_count"] == 3                 # 100/200/500 מובחנים
+    assert 9 in rids[0]["tgs"]                    # הקשר: עם אילו TG דיבר
+
+
+def test_unknown_aliases_includes_target_rid(paths):
+    """גם RID-יעד (tgt, למשל שיחת יחיד) נכנס לתור — לא רק מקור."""
+    app = paths
+    unk = app._unknown_aliases([{"t": 1, "src": 10, "tgt": 20, "tg": None}])
+    ids = {(u["kind"], u["id"]) for u in unk}
+    assert ("rid", 10) in ids and ("rid", 20) in ids
+
+
+def test_api_aliases_unknown(paths):
+    app = paths
+    c = app.app.test_client()
+    b = app._day_bounds("2026-07-20")
+    mid = (b[0] + b[1]) / 2
+    app.DMR_LOG_PATH.write_text(
+        json.dumps({"t": mid, "src": 777, "tg": 42, "call_type": "group"}) + "\n")
+    body = c.get("/api/aliases/unknown?day=2026-07-20").get_json()
+    assert body["ok"]
+    ids = {(u["kind"], u["id"]) for u in body["unknown"]}
+    assert ("rid", 777) in ids and ("tg", 42) in ids
+
+
+def test_api_aliases_unknown_bad_day(paths):
+    assert paths.app.test_client().get("/api/aliases/unknown?day=bad").status_code == 400

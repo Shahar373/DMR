@@ -228,6 +228,8 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
   צירי RID→TG ממושקלים, רק שיחות קבוצה). `_lrrp_snapshot` (מיקום אחרון-ידוע פר-RID
   מהזיכרון — "עכשיו" בלבד, כמו `adsb.aircraft_snapshot` ב-AIR-AM; ריק אם הרשת לא
   שולחת LRRP סטנדרטי — Motorola proprietary לא מפוענח ע"י DSD-FME).
+  `_unknown_aliases` (worklist: RID-source+target ו-TG שנצפו בתעבורה אך `aliasdb`
+  לא פותר **כרגע** — ממוין לפי count; `/api/aliases/unknown`, פאנל ב-UI).
 - **הקלטות:** `_activity_watcher`/`_sweep_recordings` (retention), `_transcribe_worker`
   (whisper אופציונלי), `/recordings/<name>`.
 - **`_boot_restore`** (thread ב-startup) + `__main__` (listener + watchers + `app.run(threaded=True)`).
@@ -241,6 +243,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | GET | `/api/state` | מצב + `mode_ok` + systems + version + alg_names |
 | GET/PUT | `/api/systems` | מערכות DMR (עריכה על הסט המלא) |
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
+| GET | `/api/aliases/unknown` | תור לא-מזוהים: RID/TG שנצפו בתעבורה אך בלי שם, ממוין לפי count (`?day=`/`?all=1`) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
 | POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
