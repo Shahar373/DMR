@@ -344,6 +344,36 @@ def tag_event(event, lcn, freq_hz):
     return event
 
 
+CHANNEL_RESTART_MAX = 3           # respawns allowed per channel within the window before giving up
+CHANNEL_RESTART_WINDOW_SEC = 300  # 5 minutes
+
+
+def _channel_restart_decision(restart_times, now, max_restarts=CHANNEL_RESTART_MAX,
+                              window_sec=CHANNEL_RESTART_WINDOW_SEC):
+    """(should_respawn, kept_times) for one multi-mode channel whose dsd-fme
+    just died. Prunes restart_times older than window_sec, then permits
+    another respawn only if fewer than max_restarts remain in that window --
+    caps a respawn-storm on a permanently broken channel (bad LCN/frequency,
+    stuck audio device) instead of restarting it forever, while still letting
+    a channel recover from an isolated crash. Pure -- no subprocess/pty,
+    testable without hardware."""
+    kept = [t for t in restart_times if now - t < window_sec]
+    return len(kept) < max_restarts, kept
+
+
+def build_decoder_status_event(lcn, freq_hz, status, restart_count, t=None):
+    """Pure event builder for a per-channel decoder lifecycle transition --
+    dsd_pty's own supervisor telling app.py a decoder just restarted or was
+    disabled after exhausting its restart budget. Distinct from
+    parse_dsd_line's 'channel_status' event (a DSD-FME trunking line type);
+    this one never comes from DSD-FME's stdout. Pulled out as a pure helper
+    (like tag_event) so the wire format is unit-testable without pty/
+    subprocess machinery."""
+    return {"type": "decoder_status", "phys_lcn": int(lcn), "phys_freq_hz": int(freq_hz),
+            "status": status, "restart_count": int(restart_count),
+            "t": t if t is not None else time.time()}
+
+
 def build_command(env):
     """Build a DSD-FME argv using supported PCM TCP input and rigctl tuning."""
     audio_host, audio_port = _split_endpoint(env.get("DSD_AUDIO_TCP", AUDIO_TCP_HOST), 7355)
@@ -586,10 +616,18 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
     one per physical channel in DSD_CHANNELMAP. Every parsed event is tagged
     with (phys_lcn, phys_freq_hz) via tag_event() before going out on UDP --
     ground truth app.py needs to disambiguate N simultaneous channels (see
-    app.py's _normalize_dsd/_dmr_listener phys_lcn handling). Any single
-    dsd-fme instance dying takes the whole service down (matches
-    single-channel _run()'s Restart=always semantics -- partial per-channel
-    respawn is a deliberate day-one simplification, not yet implemented)."""
+    app.py's _normalize_dsd/_dmr_listener phys_lcn handling). A single dsd-fme
+    instance dying is respawned in place (same audio port -- rsp_fm's
+    AudioServer already tolerates a fresh client reconnecting, same as any
+    normal DSD-FME disconnect) rather than taking the whole service down;
+    only rsp_tcp/rsp_fm dying (the shared front-end) still does that. A
+    channel that keeps dying is given up on after CHANNEL_RESTART_MAX
+    restarts within CHANNEL_RESTART_WINDOW_SEC (see _channel_restart_decision)
+    -- the other channels keep running. Every restart/give-up is reported to
+    app.py via build_decoder_status_event so it's visible, not silently
+    dropped (CLAUDE.md: never hide a metric). If every channel gives up,
+    the whole service fails (no point holding rsp_tcp/rsp_fm open for zero
+    decoders) and systemd's Restart=always takes over, same as before."""
     import pty
     import subprocess
 
@@ -650,7 +688,8 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
             os.close(slave)
             processes.insert(0, proc)
             dsd_procs[ch["lcn"]] = {"proc": proc, "master": master, "buffer": b"",
-                                    "freq_hz": ch["freq_hz"]}
+                                    "freq_hz": ch["freq_hz"], "port": port,
+                                    "restart_times": []}
 
         # ערוץ נוד-הרווח החי (g/G מ-app.py דרך send_gain_nudge → DSD_CTRL_SOCK).
         # זהה ל-_run: מקבל מ-app.py ומעביר לגשר (rsp_fm.GainControlServer על
@@ -677,9 +716,42 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
                 sys.stderr.write(f"dsd_pty: rsp_fm exited with status {bridge.returncode}\n")
                 break
             dead = [lcn for lcn, c in dsd_procs.items() if c["proc"].poll() is not None]
-            if dead:
-                sys.stderr.write(f"dsd_pty: dsd-fme for lcn={dead} exited\n")
-                break
+            for lcn in dead:
+                c = dsd_procs[lcn]
+                try:
+                    os.close(c["master"])
+                except OSError:
+                    pass
+                now_ts = time.time()
+                should_respawn, kept = _channel_restart_decision(c["restart_times"], now_ts)
+                processes = [p for p in processes if p is not c["proc"]]
+                if should_respawn:
+                    attempt = len(kept) + 1
+                    sys.stderr.write(f"dsd_pty: dsd-fme for lcn={lcn} exited -- respawning "
+                                     f"(attempt {attempt}/{CHANNEL_RESTART_MAX})\n")
+                    sys.stderr.flush()
+                    command = build_channel_dsd_command(env, lcn, c["port"], wav_dir)
+                    master, slave = pty.openpty()
+                    proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                                            close_fds=True, preexec_fn=_pdeathsig_term)
+                    os.close(slave)
+                    processes.insert(0, proc)
+                    c.update(proc=proc, master=master, buffer=b"",
+                             restart_times=kept + [now_ts])
+                    event = build_decoder_status_event(lcn, c["freq_hz"], "restarting", attempt)
+                else:
+                    sys.stderr.write(f"dsd_pty: dsd-fme for lcn={lcn} exceeded restart budget "
+                                     f"({CHANNEL_RESTART_MAX}/{CHANNEL_RESTART_WINDOW_SEC}s) -- "
+                                     "disabling this channel, others continue\n")
+                    sys.stderr.flush()
+                    event = build_decoder_status_event(lcn, c["freq_hz"], "down", len(kept))
+                    del dsd_procs[lcn]
+                try:
+                    udp.sendto(json.dumps(event).encode("utf-8"), target)
+                except OSError:
+                    pass
+            if not dsd_procs:
+                raise RuntimeError("all channel decoders exhausted their restart budget")
             readers = [c["master"] for c in dsd_procs.values()] + ([ctrl] if ctrl else [])
             ready, _, _ = select.select(readers, [], [], 1.0)
             if ctrl in ready:

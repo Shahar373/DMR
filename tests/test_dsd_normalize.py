@@ -288,6 +288,48 @@ def test_tag_event_stamps_phys_lcn_and_freq():
     assert tagged["phys_freq_hz"] == 461_062_500
 
 
+# --- Phase 7: restart פר-ערוץ ב-multi (מפענח בודד קורס => לא מפיל את כולם) --
+def test_channel_restart_decision_allows_under_budget():
+    should, kept = dsd_pty._channel_restart_decision([], now=1000.0)
+    assert should is True and kept == []
+
+
+def test_channel_restart_decision_denies_at_budget():
+    """3 restarts תוך 5 דקות (ברירת מחדל) => הרביעי נדחה."""
+    now = 1000.0
+    times = [now - 10, now - 20, now - 30]
+    should, kept = dsd_pty._channel_restart_decision(times, now)
+    assert should is False
+    assert kept == times   # כולם עדיין בתוך החלון, לא נגזמו
+
+
+def test_channel_restart_decision_prunes_old_entries_outside_window():
+    """restart ישן מ-window_sec לא נספר במכסה -- ערוץ שהתייצב מקבל מכסה טרייה."""
+    now = 1000.0
+    times = [now - 400, now - 350]   # שניהם ישנים מ-300ש' (ברירת מחדל)
+    should, kept = dsd_pty._channel_restart_decision(times, now)
+    assert should is True
+    assert kept == []   # נגזמו לגמרי
+
+
+def test_channel_restart_decision_custom_budget():
+    should, kept = dsd_pty._channel_restart_decision(
+        [1.0, 2.0], now=3.0, max_restarts=2, window_sec=100)
+    assert should is False and kept == [1.0, 2.0]
+
+
+def test_build_decoder_status_event_restarting():
+    event = dsd_pty.build_decoder_status_event(3, 164_325_000, "restarting", 2, t=555.0)
+    assert event == {"type": "decoder_status", "phys_lcn": 3, "phys_freq_hz": 164_325_000,
+                     "status": "restarting", "restart_count": 2, "t": 555.0}
+
+
+def test_build_decoder_status_event_down_defaults_time():
+    event = dsd_pty.build_decoder_status_event(6, 164_725_000, "down", 3)
+    assert event["status"] == "down" and event["restart_count"] == 3
+    assert isinstance(event["t"], float)
+
+
 def test_send_gain_nudge(tmp_path):
     socket_path = str(tmp_path / "ctrl.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -430,6 +472,37 @@ def test_rf_quality_snapshot_per_channel_filters_correctly(paths):
     assert by_channel == {1: 2, 2: 1}
 
 
+# --- Phase 7: channel_status (restart/give-up) --> /api/rf by_channel ------
+def test_channel_status_tick_records_and_appears_in_by_channel(paths):
+    app = paths
+    with app._channel_status_lock:
+        app._channel_status.clear()
+    app._rf_ticks.clear()
+    app._channel_status_tick({"phys_lcn": 4, "status": "restarting", "restart_count": 2, "t": 111.0})
+    by_lcn = {d["phys_lcn"]: d for d in app._rf_quality_by_channel()}
+    assert by_lcn[4]["status"] == "restarting" and by_lcn[4]["restart_count"] == 2
+
+
+def test_channel_status_survives_with_zero_rf_ticks(paths):
+    """ערוץ שנפל ולא מייצר יותר טיקים עדיין מופיע ב-by_channel (לא נעלם בשקט) --
+    זו בדיוק הנקודה: give-up היה שקוף, לא מוסתר."""
+    app = paths
+    with app._channel_status_lock:
+        app._channel_status.clear()
+    app._rf_ticks.clear()
+    app._channel_status_tick({"phys_lcn": 6, "status": "down", "restart_count": 3, "t": 222.0})
+    lcns = {d["phys_lcn"] for d in app._rf_quality_by_channel()}
+    assert 6 in lcns
+
+
+def test_channel_status_ignores_missing_phys_lcn(paths):
+    app = paths
+    with app._channel_status_lock:
+        app._channel_status.clear()
+    app._channel_status_tick({"status": "down", "restart_count": 1})
+    assert app._channel_status == {}
+
+
 def _send_udp(port, obj):
     import json
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -495,6 +568,26 @@ def test_listener_voice_crc_err_feeds_rf_window(paths, monkeypatch):
     assert snapshot["by_type"][0]["error_type"] == "VOICE_CRC"
     with app._dmr_lock:
         assert len(app._dmr_msgs) == 1
+
+
+def test_listener_decoder_status_updates_by_channel_not_feed(paths, monkeypatch):
+    """decoder_status (Phase 7 partial-restart) לא הופך לכרטיס-שיחה -- רק
+    מעדכן את סטטוס-הערוץ שנחשף דרך /api/rf by_channel."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15554)
+    with app._channel_status_lock:
+        app._channel_status.clear()
+    with app._dmr_lock:
+        app._dmr_msgs.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15554, {"type": "decoder_status", "phys_lcn": 5, "phys_freq_hz": 164_637_500,
+                      "status": "restarting", "restart_count": 1, "t": time.time()})
+    time.sleep(0.3)
+    with app._dmr_lock:
+        assert len(app._dmr_msgs) == 0
+    by_lcn = {d["phys_lcn"]: d for d in app._rf_quality_by_channel()}
+    assert by_lcn[5]["status"] == "restarting" and by_lcn[5]["restart_count"] == 1
 
 
 def test_listener_dedup_keys_on_phys_lcn(paths, monkeypatch):

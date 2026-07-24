@@ -23,6 +23,20 @@ def test_enter_dmr_success(paths, sysctl, no_sleep):
     assert "461037500" in app.CHANNELMAP_PATH.read_text()
 
 
+def test_enter_dmr_clears_channel_status(paths, sysctl, no_sleep):
+    """restart אמיתי = כל מפענחי ה-multi עולים מ-0 (Phase 7 partial-restart) --
+    סטטוס-ערוצים (down/restarting) מריצה קודמת לא רלוונטי יותר."""
+    app = paths
+    with app._channel_status_lock:
+        app._channel_status[3] = {"status": "down", "restart_count": 3, "t": 1.0}
+    system = {"id": "s1", "name": "Test", "control": 461.0375, "color_code": 1,
+              "channelmap": [{"lcn": 1, "freq": 461.0375}]}
+    err, detail = app._enter_dmr(system)
+    assert err is None
+    with app._channel_status_lock:
+        assert app._channel_status == {}
+
+
 def test_enter_dmr_crash_returns_error(paths, sysctl, no_sleep, monkeypatch):
     app = paths
     monkeypatch.setattr(app, "_is_active", lambda svc: False)   # השירות "קרס" מיד

@@ -453,6 +453,10 @@ def _enter_dmr(system, multi=False):
         save_state({**load_state(), "gain_nudge": 0})
     except Exception:
         pass
+    # restart אמיתי = כל מפענחי ה-multi עולים מ-0 => סטטוס-הערוצים (Phase 7
+    # partial-restart) של הריצה הקודמת כבר לא רלוונטי.
+    with _channel_status_lock:
+        _channel_status.clear()
     return None, None
 
 
@@ -679,17 +683,50 @@ def _rf_quality_snapshot(phys_lcn=None):
             "by_type": [{"error_type": k, "count": v} for k, v in by_type.most_common()]}
 
 
+_channel_status_lock = threading.Lock()
+_channel_status: dict = {}   # phys_lcn -> {"status": "restarting"|"down", "restart_count": int, "t": float}
+
+
+def _channel_status_tick(msg):
+    """דוגרן חי מ-dsd_pty._run_multi (Phase 7 partial-restart): מפענח בודד
+    שקרס וקם-מחדש (או ויתר עליו אחרי שחרג ממכסת-restart), בלי להפיל שאר
+    הערוצים. **לעולם לא נבנה בשקט** — מדווח כאן כדי ש-/api/rf יציג אותו,
+    ולא ייעלם סתם מ-by_channel (CLAUDE.md: לעולם לא מסתירים מדד)."""
+    lcn = _int_or_none(msg.get("phys_lcn"))
+    if lcn is None:
+        return
+    with _channel_status_lock:
+        _channel_status[lcn] = {
+            "status": msg.get("status") or "unknown",
+            "restart_count": _int_or_none(msg.get("restart_count")) or 0,
+            "t": msg.get("t") or time.time(),
+        }
+
+
 def _rf_quality_by_channel():
-    """פירוט איכות-RF פר-ערוץ (multi mode, Phase 2). ריק בחד-ערוצי — שם כל
+    """פירוט איכות-RF פר-ערוץ (multi mode, Phase 2/7). ריק בחד-ערוצי — שם כל
     הטיקים נושאים phys_lcn=None ואף ערוץ לא נספר כאן (הם כלולים בצובר
-    הגלובלי של _rf_quality_snapshot()/None, לא כפולים)."""
+    הגלובלי של _rf_quality_snapshot()/None, לא כפולים). מוסיף status/
+    restart_count לערוץ שדיווח אי-פעם decoder_status (Phase 7 partial-restart)
+    — כך שערוץ שקרס ולא מייצר עוד טיקים עדיין מופיע (לא נעלם בשקט)."""
     with _rf_lock:
         now = time.time()
         cutoff = now - RF_WINDOW_SEC
         while _rf_ticks and _rf_ticks[0][0] < cutoff:
             _rf_ticks.popleft()
-        channels = sorted({t[1] for t in _rf_ticks if t[1] is not None})
-    return [{"phys_lcn": lcn, **_rf_quality_snapshot(lcn)} for lcn in channels]
+        channels = {t[1] for t in _rf_ticks if t[1] is not None}
+    with _channel_status_lock:
+        channels |= set(_channel_status.keys())
+        status_snapshot = dict(_channel_status)
+    out = []
+    for lcn in sorted(channels):
+        row = {"phys_lcn": lcn, **_rf_quality_snapshot(lcn)}
+        st = status_snapshot.get(lcn)
+        if st:
+            row["status"] = st["status"]
+            row["restart_count"] = st["restart_count"]
+        out.append(row)
+    return out
 
 
 # נוד-רווח חי: g/G דרך dsd_pty.send_gain_nudge (הקשה ל-DSD-FME, בלי לעצור אותו).
@@ -810,6 +847,9 @@ def _dmr_listener():
 
         mtype = msg.get("type")
         msg_phys_lcn = _int_or_none(msg.get("phys_lcn"))
+        if mtype == "decoder_status":   # Phase 7 partial-restart: מפענח בודד קם-מחדש/ויתרנו עליו
+            _channel_status_tick(msg)
+            continue
         if mtype == "quality":
             _rf_quality_tick(msg.get("error_type") or "UNKNOWN", phys_lcn=msg_phys_lcn)
             continue
