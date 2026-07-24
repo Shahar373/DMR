@@ -96,6 +96,10 @@ webtune/
   aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
   watchlist.py              # מעקב RID/TG: match() טהורה, נצרך ע"י _normalize_dsd.
                             #   התראה מקומית בלבד ב-UI (Notification API, לא Web Push — ר' §8).
+  system_intel.py           # ★ מודיעין-מערכת (Phase 8): אתרים/מפת-תפוסה-LSN/CDR
+                            #   שיחות-יחיד/סחיפת-CC, נצבר מ-lsn_status/bank_call/
+                            #   preamble_csbk/site_info. record_* טהורות; flush debounced
+                            #   (lsn_status תכוף מדי לכתיבה בכל אירוע). ר' §5/§8/§10.
   discovery.py              # ★ גילוי רשתות (טהור): ולידציית טווח, גריד, זיהוי מועמדים
                             #   (סף אדפטיבי FFT), סיכום בדיקה, רשומה→מערכת. ר' §5/§10.
   dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
@@ -141,6 +145,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | `/var/lib/dmr/systems.json` | מערכות DMR (נערכות מה-UI) | app.py |
 | `/var/lib/dmr/aliases.json` | עריכות אליאס ידניות | aliases.py |
 | `/var/lib/dmr/watchlist.json` | רשימת RID/TG במעקב (התראה מקומית) | watchlist.py |
+| `/var/lib/dmr/system_intel.json` | מודיעין-מערכת נצבר (אתרים/LSN/CDR/CC), debounced | system_intel.py |
 | `/var/lib/dmr/discovery.json` | דוח הגילוי האחרון (מועמדים + רשתות שהתגלו) | _discover_loop |
 | `/var/lib/dmr/dmr.jsonl` | היסטוריית שיחות (retention 8000) | _dmr_listener |
 | `/var/lib/dmr/activity.jsonl` | יומן הקלטות | _activity_watcher |
@@ -238,6 +243,16 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
   (`compute_wideband_plan`, `parse_channelmap_hz`, `tag_event`,
   `_channel_restart_decision`, `build_decoder_status_event`, בוני-הפקודות)
   נבדקת גם ב-CI.
+- **★ רדאר-מערכת (Phase 8, v0.11.0):** `_dmr_listener` מדספ'ץ `lsn_status`/
+  `site_info`/`preamble_csbk`/`bank_call` (תמיד פעילים — ר' §8) ישירות ל-
+  `system_intel.record_*` (**לא** הופכים לכרטיס-שיחה). `quality`'s `cc`
+  (שכבר מפוענח, קודם נזרק) מוזן ל-`system_intel.record_cc` מול
+  `_active_color_code`. `_intel_system_id()` מסנן standby/מערכות-גילוי
+  חולפות (`__probe__`/`__sweep__`) — לא מסאבים את בנק-התדרים. `_active_
+  system_id`/`_active_color_code` (מטמון בזיכרון, נקבע ב-`_enter_dmr`) —
+  ה-listener **לעולם לא** קורא `load_state()`/`load_systems()` (דיסק) פר-
+  אירוע UDP, כי `lsn_status` תכוף מדי לזה. `GET /api/system-intel` חושף
+  את הפרופיל הנצבר (אין PUT — זה לא config נערך-ידנית).
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
   TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
 - **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
@@ -264,6 +279,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
 | GET | `/api/aliases/unknown` | תור לא-מזוהים: RID/TG שנצפו בתעבורה אך בלי שם, ממוין לפי count (`?day=`/`?all=1`) |
 | GET/PUT | `/api/watchlist` | מעקב RID/TG להתראה מקומית (GET=רשימה, PUT=החלפה מלאה) |
+| GET | `/api/system-intel` | מודיעין-מערכת נצבר: אתרים/מפת-LSN/CDR/סחיפת-CC (`?system=<id>`, ברירת מחדל: הפעילה) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
 | POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
@@ -303,9 +319,12 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 ראשון.** אם מגיעה דגימה אמיתית חדשה (רשת/גרסת DSD-FME אחרת) — הוסף לפיקסצ'ר, אל תמציא.
 
 קבצים: `test_dsd_normalize` (הלב — parse + normalize + replay + listener e2e, וגם
-argv טהור של `build_command`/`build_rsp_tcp_command`/`build_bridge_command`), `test_rsp_fm`
-(הגשר IQ→PCM: דמודולטור, DC-blocker stateful, timeout על `RtlTcpClient`, `AudioSender`,
-`RigctlServer`), `test_mode`, `test_boot`, `test_scan`, `test_aliases`, `test_recordings`,
+argv טהור של `build_command`/`build_rsp_tcp_command`/`build_bridge_command`, וגם דיספאץ'
+רדאר-המערכת: `lsn_status`/`site_info`/`preamble_csbk`/`bank_call`/CC-drift → `system_intel`),
+`test_rsp_fm` (הגשר IQ→PCM: דמודולטור, DC-blocker stateful, timeout על `RtlTcpClient`,
+`AudioSender`, `RigctlServer`), `test_mode`, `test_boot`, `test_scan`, `test_aliases`,
+`test_watchlist` (מעקב RID/TG + `_normalize_dsd` tagging), `test_system_intel` (record_*
+טהורות: אתרים/LSN/CDR/CC-drift/debounced-flush — בלי UDP/Flask), `test_recordings`,
 `test_security`, `test_archive`, `test_analytics` (הצפנה/תעבורה/גרף/LRRP), `test_rf_gain`
 (שכבת ה-HTTP של `/api/rf`/`/api/gain`), `test_discovery` (גילוי: `validate_sweep_plan`/
 `build_freq_grid`/`detect_candidates`/`aggregate_probe`/`discovery_to_system` הטהורים +
@@ -387,6 +406,14 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   ברירת המחדל (dmr/scan רגיל) משאירה אותם `None` — שומר על "סינון housekeeping
   במקור" (§2) ועל ה-fixture replay (68/68). רק בדיקת גילוי (`_probe_system` מגדיר
   `DSD_EMIT_STATUS=1`) מפעילה אותם. שורת sync **עם שגיאה** נשארת `quality` (קדימות).
+- **⚠ רדאר-המערכת (`lsn_status`/`bank_call`/`preamble_csbk`/`site_info`,
+  v0.11.0) הוא **תמיד פעיל**, בניגוד ל-`sync`/`channel_status` שמעל —
+  כי הוא מזין את `system_intel` הרציף (§5), לא רק בדיקת-גילוי חד-פעמית.
+  **חובה debounce בכל צרכן-חדש:** `lsn_status` לבדו הוא ~חצי מהפלט האמיתי
+  (34/68 בפיקסצ'ר) — צרכן שכותב-לדיסק על כל אירוע ישחק כרטיס-SD (בדיוק
+  כמו `system_intel.maybe_flush`). אל תוסיפו צרכן ל-4 הטיפוסים האלה בלי
+  debounce/צבירה-בזיכרון. `lsn_status`'s occupant-id **לא מסווג** group/
+  private (שני הסוגים תופסים LSN באותה צורה בקליטה שנבדקה) — אל תניחו סיווג.
 - **⚠ `render_dmr_env`/`write_dmr_env` דורסים את `/etc/dmr/dmr.env` בכל מעבר מצב:**
   כל מפתח env שהגשר (`rsp_tcp`/`rsp_fm.py`) צריך (`DSD_RTLTCP`/`DSD_AUDIO_TCP`/
   `DSD_RIGCTL`/`DSD_IQ_RATE`/`DSD_AUDIO_GAIN`) **חייב** להופיע כקבוע קשיח בתוך
@@ -556,6 +583,26 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   מקומית-בלבד בדף פתוח, ר' §8. תוקן בבדיקה-חזותית (לא code review): batch
   ההיסטוריה הראשון של `pollFeed` היה מציף בהתראות-שווא על שיחות ישנות בכל
   פתיחת-דף — נפתר עם `wlSeeded`. 220 בדיקות ירוקות (209→220).
+- **v0.11.0 — רדאר-מערכת (Phase 8): מודיעין מערוץ-הבקרה, מעשיר את
+  `systems.json` (קוד+CI ירוקים; טרם אומת על חומרה):** Cap+ הוא רשת-
+  טראנקינג — ערוץ-הבקרה משדר טלמטריה על **כל** המערכת, לא רק על עצמו.
+  4 טיפוסי-אירוע חדשים ב-`dsd_pty.parse_dsd_line` (**תמיד פעילים**, לא
+  emit_status-מותנים כמו sync/channel_status — ר' §8): `lsn_status`
+  (מפת-תפוסה חיה של כל הערוצים), `preamble_csbk`/`bank_call` (CDR לשיחות-
+  יחיד — מי→מי, גם בלי לשמוע), `site_info` (זהות-אתר, Cap+ רב-אתרי).
+  כל הארבעה אומתו מול **כל** הווריאציות האמיתיות בפיקסצ'ר (34 lsn_status
+  שונים!, לא דוגמה אחת). `webtune/system_intel.py` (מודול חדש) צובר את זה
+  ל-`/var/lib/dmr/system_intel.json` — קובץ-state **נפרד** מ-`systems.json`
+  (לעולם לא נכתב חזרה לקונפיג עצמו). זיהוי-סחיפת Color-Code (`cc` שכבר
+  מפוענח על `quality` ונזרק עד היום, מושווה מול `color_code` המוגדר).
+  `GET /api/system-intel` + כרטיס-UI. **⚠ קריטי:** `lsn_status` לבדו הוא
+  ~חצי מהפלט האמיתי — `maybe_flush()` debounced (15ש') + thread-גיבוי
+  תקופתי מונעים שחיקת כרטיס-SD. 254 בדיקות ירוקות (220→254), כולל listener
+  e2e מלא (UDP→app.py→system_intel). **שרשרת האותות `pragma`-דומה ל-
+  `_run_multi`** — הפרסור עצמו נבדק ב-CI מול דגימות אמיתיות, אבל תדירות-
+  האמת/וריאציות-נוספות של הטיפוסים החדשים בשטח (מעבר ל-68 דגימות
+  הפיקסצ'ר) עדיין לא אומתו על חומרה. אם מגיעה דגימה חדשה שלא תואמת —
+  מוסיפים לפיקסצ'ר, לא ממציאים.
 - **`config/systems.survey.json` — 19 מערכות אמיתיות ממדידת-שדה (17.07.2026):**
   ייבוא מ-inventory Excel של סקר IQ עצמאי (SoapySDR+SDRconnect, decoder+SQLite,
   `integrity_check` תקין). 16 ערוצי DMR מאומתים (VHF 162.14–167.14MHz, כל אחד

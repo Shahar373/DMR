@@ -35,6 +35,7 @@ import discovery as discmod # גילוי רשתות: ולידציה/גריד/ז�
 import dsd_export           # ייצוא CSV/JSON (BOM ל-Excel)
 import dsd_pty              # build_command וכו', וגם send_gain_nudge (נוד-רווח חי דרך PTY)
 import watchlist            # מעקב RID/TG — תיוג כרטיס, התראה מקומית בלבד (ר' §8, בלי Push API)
+import system_intel         # מודיעין-מערכת: אתרים/מפת-תפוסה/CDR/סחיפת-CC (Phase 8)
 
 # stdout => journald (השירות רץ תחת systemd); journalctl -u dmr-web מציג הכל
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -458,6 +459,12 @@ def _enter_dmr(system, multi=False):
     # partial-restart) של הריצה הקודמת כבר לא רלוונטי.
     with _channel_status_lock:
         _channel_status.clear()
+    # מטמון בזיכרון (לא load_systems()/load_state() בכל אירוע UDP — lsn_status
+    # תכוף מדי, ר' _dmr_listener/system_intel). __probe__/__sweep__ (גילוי)
+    # מסוננים בדיספאץ', לא כאן, כדי לשמור את _enter_dmr פשוט.
+    global _active_system_id, _active_color_code
+    _active_system_id = system.get("id")
+    _active_color_code = system.get("color_code")
     return None, None
 
 
@@ -492,6 +499,18 @@ def _fail_to_off(st, err, detail, log_prefix):
 
 
 MODE_SERVICE = {"dmr": DMR_SERVICE, "multi": DMR_SERVICE}   # שתיהן אותה יחידת systemd (§0)
+_active_system_id = None    # נקבע ב-_enter_dmr; _dmr_listener קורא אותו (לא load_state()
+                            # בכל אירוע UDP — lsn_status תכוף מדי, ר' system_intel.py)
+_active_color_code = None   # ה-color_code המוגדר למערכת הפעילה — להשוואה מול נצפה (CC-drift)
+
+
+def _intel_system_id():
+    """מזהה-המערכת הפעילה לצורך system_intel, או None (standby/אין מערכת/
+    מערכת-גילוי חולפת __probe__/__sweep__ — לא נשמרת ולא מסמאת את הבנק)."""
+    sid = _active_system_id
+    if not sid or sid.startswith("__"):
+        return None
+    return sid
 
 
 def _live_mode():
@@ -854,6 +873,39 @@ def _dmr_listener():
             continue
         if mtype == "quality":
             _rf_quality_tick(msg.get("error_type") or "UNKNOWN", phys_lcn=msg_phys_lcn)
+            cc = _int_or_none(msg.get("cc"))
+            sid = _intel_system_id()
+            if cc is not None and sid:
+                system_intel.record_cc(sid, cc, _active_color_code, t=msg.get("t"))
+            continue
+        # --- Phase 8: system radar (control-channel telemetry, always-on --
+        # never cards, only enriches system_intel; §5 "multi"/§10). Filtered
+        # to real user systems only (_intel_system_id() is None during
+        # standby/discovery-probe __probe__/__sweep__).
+        if mtype == "lsn_status":
+            sid = _intel_system_id()
+            if sid:
+                system_intel.record_lsn_status(sid, msg.get("channels") or {}, t=msg.get("t"))
+            continue
+        if mtype == "site_info":
+            sid = _intel_system_id()
+            if sid:
+                system_intel.record_site(sid, msg.get("site"), t=msg.get("t"))
+            continue
+        if mtype == "preamble_csbk":
+            sid = _intel_system_id()
+            if sid:
+                system_intel.record_private_call(
+                    sid, src=msg.get("src"), tgt=msg.get("tgt"), kind=msg.get("kind"),
+                    rest_lsn=msg.get("rest_lsn"), t=msg.get("t"))
+            continue
+        if mtype == "bank_call":
+            sid = _intel_system_id()
+            if sid:
+                for entry in (msg.get("entries") or []):
+                    system_intel.record_private_call(
+                        sid, src=None, tgt=entry.get("tgt"), kind="bank",
+                        rest_lsn=entry.get("lsn"), t=msg.get("t"))
             continue
         if mtype == "encryption":
             entry = _slot_open_call.get((msg_phys_lcn, msg.get("slot")))
@@ -1624,6 +1676,17 @@ def api_rf():
                    by_channel=_rf_quality_by_channel(), **_rf_quality_snapshot())
 
 
+@app.route("/api/system-intel")
+def api_system_intel():
+    """מודיעין-מערכת נצבר (Phase 8): אתרים (site_info), מפת-תפוסה-LSN חיה
+    (lsn_status), CDR שיחות-יחיד (preamble_csbk/bank_call), סחיפת-CC. נצבר
+    אוטומטית ב-_dmr_listener מתעבורה אמיתית — אין PUT (לא config נערך-ידנית,
+    ר' CLAUDE.md §5/§8). `?system=<id>` לצפייה במערכת ספציפית (גם לא-פעילה
+    כרגע); ברירת מחדל: המערכת הפעילה. ריק בשקט אם המערכת עוד לא נצפתה."""
+    sid = request.args.get("system") or _active_system_id
+    return jsonify(ok=True, system=sid, intel=system_intel.export_for(sid))
+
+
 @app.route("/api/gain", methods=["POST"])
 def api_gain():
     """נוד-רווח חי (הקשת g/G דרך dsd_pty, בלי לעצור את DSD-FME). יחסי בלבד —
@@ -1756,6 +1819,19 @@ def _activity_watcher():
         except Exception:
             log.exception("activity watcher")
         time.sleep(WATCH_INTERVAL)
+
+
+def _intel_flush_watcher():
+    """גיבוי לדיסק לכתיבת ה-debounce שב-system_intel.record_*: אם אירועים
+    מפסיקים להגיע (מערכת נרגעת) בלי שיקרה עוד record_* שיפעיל flush, השינוי
+    האחרון היה נשאר תקוע ב-dirty בזיכרון בלבד. טיק תקופתי מבטיח שמירה
+    בסופו-של-דבר, בלי לכתוב על כל אירוע (ר' system_intel.FLUSH_MIN_INTERVAL_SEC)."""
+    while True:
+        try:
+            system_intel.maybe_flush()
+        except Exception:
+            log.exception("system_intel flush watcher")
+        time.sleep(system_intel.FLUSH_MIN_INTERVAL_SEC)
 
 
 # --- נתיבים ----------------------------------------------------------------
@@ -2245,9 +2321,11 @@ def _boot_restore():
 if __name__ == "__main__":
     aliasdb.load()   # טעינת אליאסים (CSV מיובא + עריכות ידניות) לזיכרון
     watchlist.load()  # טעינת רשימת-המעקב (RID/TG להתראה מקומית) לזיכרון
+    system_intel.load()  # טעינת מודיעין-המערכת הנצבר (אתרים/LSN/CDR/CC) לזיכרון
     threading.Thread(target=_boot_restore, daemon=True).start()
     REC_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_activity_watcher, daemon=True).start()
+    threading.Thread(target=_intel_flush_watcher, daemon=True).start()
     _load_dmr_history()                                            # היסטוריית היום שורדת restart (לפני ה-listener)
     threading.Thread(target=_dmr_listener, daemon=True).start()    # פיד UDP מ-dsd_pty (שקט ב-standby)
     if TRANSCRIBE:

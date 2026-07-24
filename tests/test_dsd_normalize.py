@@ -11,6 +11,10 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "capplus_slco_samp
 _KEPT_TYPES = {
     "voice_call", "data_header", "lrrp_position", "lrrp_request",
     "encryption", "quality",
+    # Phase 8 system radar -- always-on control-channel telemetry (not
+    # emit_status-gated like sync/channel_status). ip_mapping stays dropped
+    # (housekeeping) -- no feature consumes it yet.
+    "lsn_status", "bank_call", "preamble_csbk", "site_info",
 }
 
 
@@ -100,16 +104,98 @@ def test_parse_encryption_and_quality():
     }
 
 
+# --- Phase 8: system radar (control-channel telemetry, always-on) ----------
+def test_parse_lsn_status_all_state_kinds():
+    """idle/rest/numeric-occupant, and a line with a 3-digit + a 5-digit
+    occupant id in the same line (real capture has both small TGs and the
+    large 64250 special id side by side)."""
+    event = dsd_pty.parse_dsd_line(
+        "LSN 05:   223;  LSN 06: 64250;  LSN 07:  Idle;  LSN 08:  Idle;"
+    )
+    assert event == {"type": "lsn_status",
+                     "channels": {5: 223, 6: 64250, 7: "idle", 8: "idle"}}
+
+
+def test_parse_lsn_status_rest_state():
+    event = dsd_pty.parse_dsd_line(
+        "LSN 05:     1;  LSN 06:  Rest;  LSN 07:  Idle;  LSN 08:  Idle;"
+    )
+    assert event["channels"][6] == "rest"
+
+
+def test_parse_lsn_status_does_not_swallow_other_lsn_mentions():
+    """A voice-call line also contains 'Rest LSN: N' -- must NOT be
+    misclassified as lsn_status (the full-line-shape regex requires the
+    entire line to be LSN-state segments, nothing else)."""
+    event = dsd_pty.parse_dsd_line(
+        "SLOT 1 TGT=3 SRC=2120 Cap+ Group Call  Rest LSN: 5"
+    )
+    assert event["type"] == "voice_call"
+
+
+def test_parse_bank_call_with_entries():
+    event = dsd_pty.parse_dsd_line(
+        "Bank One F80 Private or Data Call(s) -  LSN 03: TGT 64250; LSN 05: TGT 64250;"
+    )
+    assert event == {"type": "bank_call", "bank": "One F80",
+                     "entries": [{"lsn": 3, "tgt": 64250}, {"lsn": 5, "tgt": 64250}]}
+
+
+def test_parse_bank_call_no_active_entries():
+    """'Bank ... -' with nothing after it => no private/data calls active on
+    that bank right now -- a legitimate, common real-capture shape (empty
+    entries list, not None)."""
+    event = dsd_pty.parse_dsd_line("Bank One F20 Private or Data Call(s) -")
+    assert event == {"type": "bank_call", "bank": "One F20", "entries": []}
+
+
+def test_parse_preamble_csbk_individual_csbk():
+    event = dsd_pty.parse_dsd_line(
+        "Preamble CSBK - Individual CSBK - Source: 64250 - Target: 2232 - Rest LSN: 5"
+    )
+    assert event == {"type": "preamble_csbk", "kind": "csbk",
+                     "src": 64250, "tgt": 2232, "rest_lsn": 5}
+
+
+def test_parse_preamble_csbk_individual_data():
+    event = dsd_pty.parse_dsd_line(
+        "Preamble CSBK - Individual Data - Source: 191 - Target: 64250 - Rest LSN: 4"
+    )
+    assert event == {"type": "preamble_csbk", "kind": "data",
+                     "src": 191, "tgt": 64250, "rest_lsn": 4}
+
+
+def test_parse_site_info():
+    event = dsd_pty.parse_dsd_line(
+        "SLCO Capacity Plus Site: 2 - Rest LSN: 5 - RS: 00"
+    )
+    assert event == {"type": "site_info", "site": 2, "rest_lsn": 5, "rs": 0}
+
+
 def test_housekeeping_and_ansi_are_handled():
     for line in [
-        "LSN 01:  Idle;  LSN 02:  Idle;  LSN 03: 64250;  LSN 04:  Idle;",
+        # channel_status stays emit_status-gated (unchanged) -- only real housekeeping here
         "Capacity Plus Channel Status - FL: 2 TS: 1 RS: 0 - Rest LSN: 6 - Initial Block",
-        "SLCO Capacity Plus Site: 2 - Rest LSN: 5 - RS: 00",
+        # ip_mapping stays dropped -- no feature consumes it (yet)
         "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
-        "Bank One F80 Private or Data Call(s) -  LSN 03: TGT 64250;",
-        "Preamble CSBK - Individual Data - Source: 191 - Target: 64250 - Rest LSN: 4",
     ]:
         assert dsd_pty.parse_dsd_line(line) is None
+    # Phase 8 system radar: these four are now always-on typed events, not
+    # housekeeping (see _KEPT_TYPES + test_fixture_replay_matches_reality for
+    # full real-sample coverage). Confirm here too since this test used to
+    # assert the opposite.
+    assert dsd_pty.parse_dsd_line(
+        "LSN 01:  Idle;  LSN 02:  Idle;  LSN 03: 64250;  LSN 04:  Idle;"
+    )["type"] == "lsn_status"
+    assert dsd_pty.parse_dsd_line(
+        "SLCO Capacity Plus Site: 2 - Rest LSN: 5 - RS: 00"
+    )["type"] == "site_info"
+    assert dsd_pty.parse_dsd_line(
+        "Bank One F80 Private or Data Call(s) -  LSN 03: TGT 64250;"
+    )["type"] == "bank_call"
+    assert dsd_pty.parse_dsd_line(
+        "Preamble CSBK - Individual Data - Source: 191 - Target: 64250 - Rest LSN: 4"
+    )["type"] == "preamble_csbk"
     colored = "\x1b[31mSLOT 1 TGT=3 SRC=2120 Cap+ Group Call\x1b[0m"
     assert dsd_pty.parse_dsd_line(colored)["tg"] == 3
     assert dsd_pty.parse_dsd_line("") is None
@@ -606,6 +692,113 @@ def test_listener_decoder_status_updates_by_channel_not_feed(paths, monkeypatch)
         assert len(app._dmr_msgs) == 0
     by_lcn = {d["phys_lcn"]: d for d in app._rf_quality_by_channel()}
     assert by_lcn[5]["status"] == "restarting" and by_lcn[5]["restart_count"] == 1
+
+
+# --- Phase 8: system radar dispatch (UDP -> system_intel, not a card) -------
+def test_listener_site_info_updates_intel_not_feed(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15560)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    with app._dmr_lock:
+        app._dmr_msgs.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15560, {"type": "site_info", "site": 2, "rest_lsn": 5, "rs": 0, "t": time.time()})
+    time.sleep(0.3)
+    with app._dmr_lock:
+        assert len(app._dmr_msgs) == 0
+    assert "2" in app.system_intel.export_for("s1")["sites"]
+
+
+def test_listener_lsn_status_updates_intel(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15561)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15561, {"type": "lsn_status",
+                      "channels": {"5": 223, "6": "idle"}, "t": time.time()})
+    time.sleep(0.3)
+    lsn_dir = app.system_intel.export_for("s1")["lsn_directory"]
+    assert lsn_dir["5"]["occupant"] == 223 and lsn_dir["6"]["occupant"] == "idle"
+
+
+def test_listener_preamble_csbk_updates_intel_cdr(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15562)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15562, {"type": "preamble_csbk", "kind": "csbk", "src": 64250,
+                      "tgt": 2232, "rest_lsn": 5, "t": time.time()})
+    time.sleep(0.3)
+    calls = app.system_intel.export_for("s1")["private_calls"]
+    assert calls[0] == {"t": calls[0]["t"], "src": 64250, "tgt": 2232, "kind": "csbk", "rest_lsn": 5}
+
+
+def test_listener_bank_call_updates_intel_cdr(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15563)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15563, {"type": "bank_call", "bank": "One F80",
+                      "entries": [{"lsn": 3, "tgt": 64250}], "t": time.time()})
+    time.sleep(0.3)
+    calls = app.system_intel.export_for("s1")["private_calls"]
+    assert calls[0]["tgt"] == 64250 and calls[0]["src"] is None and calls[0]["kind"] == "bank"
+
+
+def test_listener_quality_cc_feeds_cc_drift(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15564)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    monkeypatch.setattr(app, "_active_color_code", 1)
+    app._rf_ticks.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15564, {"type": "quality", "error_type": "CSBK_CRC", "cc": 2, "t": time.time()})
+    time.sleep(0.3)
+    cc = app.system_intel.export_for("s1")["cc"]
+    assert cc["observed"] == 2 and cc["configured"] == 1 and cc["mismatch"] is True
+
+
+def test_listener_system_radar_ignores_discovery_probe_system(paths, monkeypatch):
+    """__probe__/__sweep__ (Phase 6 discovery) לא מסאבים את בנק-התדרים."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15565)
+    monkeypatch.setattr(app, "_active_system_id", "__probe__")
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    _send_udp(15565, {"type": "site_info", "site": 9, "rest_lsn": 1, "rs": 0, "t": time.time()})
+    time.sleep(0.3)
+    assert app.system_intel.export_for("__probe__")["sites"] == {}
+
+
+def test_api_system_intel_defaults_to_active_system(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel.record_site("s1", 2, t=1.0)
+    body = app.app.test_client().get("/api/system-intel").get_json()
+    assert body["ok"] and body["system"] == "s1"
+    assert body["intel"]["sites"]["2"]["count"] == 1
+
+
+def test_api_system_intel_explicit_system_param(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel.record_site("other-sys", 4, t=1.0)
+    body = app.app.test_client().get("/api/system-intel?system=other-sys").get_json()
+    assert body["system"] == "other-sys"
+    assert "4" in body["intel"]["sites"]
+
+
+def test_api_system_intel_no_active_system_returns_blank(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_active_system_id", None)
+    body = app.app.test_client().get("/api/system-intel").get_json()
+    assert body["system"] is None
+    assert body["intel"] == {"sites": {}, "lsn_directory": {}, "cc": None, "private_calls": []}
 
 
 def test_listener_dedup_keys_on_phys_lcn(paths, monkeypatch):

@@ -15,6 +15,7 @@ def paths(tmp_path, monkeypatch):
     import app
     import aliases
     import watchlist
+    import system_intel
 
     monkeypatch.setattr(app, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(app, "DMR_ENV_PATH", tmp_path / "dmr.env")
@@ -33,6 +34,11 @@ def paths(tmp_path, monkeypatch):
 
     monkeypatch.setattr(watchlist, "WATCHLIST_PATH", tmp_path / "watchlist.json")
     watchlist._tg.clear(); watchlist._rid.clear()
+
+    monkeypatch.setattr(system_intel, "INTEL_PATH", tmp_path / "system_intel.json")
+    system_intel._intel.clear()
+    system_intel._dirty = False
+    system_intel._last_flush = 0.0
     return app
 
 
