@@ -34,6 +34,7 @@ import aliases as aliasdb   # ניהול אליאסים (TG/RID) — טעינת 
 import discovery as discmod # גילוי רשתות: ולידציה/גריד/זיהוי-מועמדים/סיכום-בדיקה (טהור)
 import dsd_export           # ייצוא CSV/JSON (BOM ל-Excel)
 import dsd_pty              # build_command וכו', וגם send_gain_nudge (נוד-רווח חי דרך PTY)
+import watchlist            # מעקב RID/TG — תיוג כרטיס, התראה מקומית בלבד (ר' §8, בלי Push API)
 
 # stdout => journald (השירות רץ תחת systemd); journalctl -u dmr-web מציג הכל
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -604,6 +605,7 @@ def _normalize_dsd(m):
         "call_type": ct, "category": category, "group": group,
         "encrypted": False, "enc": None,   # מתואם בהמשך ע"י ה-listener אם רלוונטי
         "ber": None, "level": None,        # DSD-FME לא מדפיס — אף פעם לא ממציאים
+        "watchlist": watchlist.match(tg, src, tgt),   # None אם אין התאמה
         "dur": None, "event": typ,
         "lat": round(lat, 5) if lat is not None else None,
         "lon": round(lon, 5) if lon is not None else None,
@@ -1836,6 +1838,20 @@ def api_aliases():
     return jsonify(ok=True, aliases=aliasdb.export_all())
 
 
+@app.route("/api/watchlist", methods=["GET", "PUT"])
+def api_watchlist():
+    """מעקב RID/TG להתראה מקומית (§8: לא Web Push — בלי שרת-relay חיצוני).
+    GET מחזיר את הרשימה. PUT מחליף אותה במלואה (כמו /api/aliases)."""
+    if request.method == "GET":
+        return jsonify(ok=True, watchlist=watchlist.export_all())
+    data = request.get_json(silent=True)
+    ok, err = watchlist.replace(data)
+    if not ok:
+        return jsonify(ok=False, error=err), 400
+    log.info("watchlist updated (from %s)", request.remote_addr)
+    return jsonify(ok=True, watchlist=watchlist.export_all())
+
+
 @app.route("/api/health")
 def api_health():
     """סטטוס המערכת — מאפשר ל-UI להבדיל בין "אין תעבורה" ל"משהו נפל"."""
@@ -2228,6 +2244,7 @@ def _boot_restore():
 
 if __name__ == "__main__":
     aliasdb.load()   # טעינת אליאסים (CSV מיובא + עריכות ידניות) לזיכרון
+    watchlist.load()  # טעינת רשימת-המעקב (RID/TG להתראה מקומית) לזיכרון
     threading.Thread(target=_boot_restore, daemon=True).start()
     REC_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_activity_watcher, daemon=True).start()

@@ -14,6 +14,7 @@ def paths(tmp_path, monkeypatch):
     מחזיר את app אחרי הפניית הנתיבים (כולל מודול האליאסים)."""
     import app
     import aliases
+    import watchlist
 
     monkeypatch.setattr(app, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(app, "DMR_ENV_PATH", tmp_path / "dmr.env")
@@ -29,6 +30,9 @@ def paths(tmp_path, monkeypatch):
     # מאתחל את מצב האליאסים לזיכרון נקי לכל בדיקה
     aliases._tg_import.clear(); aliases._rid_import.clear()
     aliases._tg_manual.clear(); aliases._rid_manual.clear()
+
+    monkeypatch.setattr(watchlist, "WATCHLIST_PATH", tmp_path / "watchlist.json")
+    watchlist._tg.clear(); watchlist._rid.clear()
     return app
 
 

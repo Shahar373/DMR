@@ -94,6 +94,8 @@ webtune/
   rsp_fm.py                 # ★ הגשר: IQ (מ-rsp_tcp) → דמודולציית NFM ל-PCM 48kHz + שרת
                             #   rigctl לכיוונון טראנקינג. NumPy. ר' §2/§8.
   aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
+  watchlist.py              # מעקב RID/TG: match() טהורה, נצרך ע"י _normalize_dsd.
+                            #   התראה מקומית בלבד ב-UI (Notification API, לא Web Push — ר' §8).
   discovery.py              # ★ גילוי רשתות (טהור): ולידציית טווח, גריד, זיהוי מועמדים
                             #   (סף אדפטיבי FFT), סיכום בדיקה, רשומה→מערכת. ר' §5/§10.
   dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
@@ -138,6 +140,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | `/var/lib/dmr/state.json` | מצב אחרון (app_mode: dmr/off/scan, system, scan_plan) | app.py |
 | `/var/lib/dmr/systems.json` | מערכות DMR (נערכות מה-UI) | app.py |
 | `/var/lib/dmr/aliases.json` | עריכות אליאס ידניות | aliases.py |
+| `/var/lib/dmr/watchlist.json` | רשימת RID/TG במעקב (התראה מקומית) | watchlist.py |
 | `/var/lib/dmr/discovery.json` | דוח הגילוי האחרון (מועמדים + רשתות שהתגלו) | _discover_loop |
 | `/var/lib/dmr/dmr.jsonl` | היסטוריית שיחות (retention 8000) | _dmr_listener |
 | `/var/lib/dmr/activity.jsonl` | יומן הקלטות | _activity_watcher |
@@ -166,7 +169,8 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
   מ-`_channelmap_freq(lcn)` (חיפוש ב-channelmap של המערכת הפעילה לפי Rest-LSN), **לא**
   מטקסט DSD-FME. אליאסים ב-join מ-`aliases.py`. `enc.alg`/`enc.key_id` נשארים `None` תמיד
   (DSD-FME לא מדפיס ALG/KEY בקליטה שנבדקה — `DMR_ALG_NAMES` שמור כטבלת-מיפוי לעתיד
-  אם קליטה אחרת כן תחשוף אותם).
+  אם קליטה אחרת כן תחשוף אותם). `watchlist: {kind,id}|None` נגזר מ-`watchlist.match(tg,
+  src, tgt)` (v0.10.0) — אותו עקרון כמו aliasdb: העשרת-מזהים בזמן נרמול, לא בזמן-תצוגה.
 - **★ `_dmr_listener` (thread, UDP 5555) — dispatch לפי `type`:**
   `voice_call`/`data_header`/`lrrp_position`/`lrrp_request` → `_normalize_dsd` + dedup
   המשך-שיחה (tg+src+slot, חלון 8ש', מצטבר ל-`dur`) → `dmr.jsonl`+`_dmr_msgs`.
@@ -259,6 +263,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | GET/PUT | `/api/systems` | מערכות DMR (עריכה על הסט המלא) |
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
 | GET | `/api/aliases/unknown` | תור לא-מזוהים: RID/TG שנצפו בתעבורה אך בלי שם, ממוין לפי count (`?day=`/`?all=1`) |
+| GET/PUT | `/api/watchlist` | מעקב RID/TG להתראה מקומית (GET=רשימה, PUT=החלפה מלאה) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
 | POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
@@ -393,6 +398,15 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   ערך ישיר).
 - **בידוד + כתיבה אטומית:** `_atomic_write` לכל env/state/channelmap. `threaded=True` ל-Flask.
 - **עברית ב-RTL** ב-UI; CSV עם BOM ל-Excel.
+- **⚠ מעקב (watchlist, v0.10.0) הוא התראה מקומית — במפורש לא Web Push:**
+  Web Push API הסטנדרטי (גם self-hosted) עובר **תמיד** דרך שרת-relay של
+  ספק-הדפדפן (Google FCM/Mozilla Autopush/Apple) — זו לא בחירת-מימוש, זו
+  איך ה-API בנוי. זה סוטה מ"פרטי-מקומי (בלי ענן)" (§1). לכן: `Notification`
+  API (לא Push API — אין subscription/VAPID/שרת), רטט, וצליל (Web Audio
+  oscillator, בלי קובץ-מדיה) — הכל בתוך הדפדפן, בלי לצאת לרשת חיצונית.
+  מגבלה מודעת: לא יעבוד אם ה-PWA סגור לגמרי (בניגוד ל-Push אמיתי) — זה
+  המחיר של "בלי ענן" באמת. אם משנים בעתיד לכיוון Push אמיתי — עדכנו כאן
+  ותעדו את הסטייה מהעיקרון במפורש, אל תחליקו את זה.
 
 ---
 
@@ -535,6 +549,13 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   4 הערוצים האחרים לא הופרעו). מסלול-הוויתור (חריגה מ-3 ניסיונות/5 דק')
   עדיין לא נבדק בפועל — הלוגיקה שלו (`_channel_restart_decision`) כן נבדקת
   ב-CI (allow/deny/prune).
+- **v0.10.0 — מעקב RID/TG עם התראה מקומית:** פיצ'ר-תפעול ללא-חומרה.
+  `webtune/watchlist.py` (מודול חדש, מראה `aliases.py`) + תיוג ב-`_normalize_dsd`
+  + כרטיס-UI + toast/רטט/צליל/`Notification`. **החלטת-ארכיטקטורה מפורשת:**
+  לא Web Push (עובר תמיד דרך שרת-relay חיצוני, סותר "בלי ענן" §1) — התראה
+  מקומית-בלבד בדף פתוח, ר' §8. תוקן בבדיקה-חזותית (לא code review): batch
+  ההיסטוריה הראשון של `pollFeed` היה מציף בהתראות-שווא על שיחות ישנות בכל
+  פתיחת-דף — נפתר עם `wlSeeded`. 220 בדיקות ירוקות (209→220).
 - **`config/systems.survey.json` — 19 מערכות אמיתיות ממדידת-שדה (17.07.2026):**
   ייבוא מ-inventory Excel של סקר IQ עצמאי (SoapySDR+SDRconnect, decoder+SQLite,
   `integrity_check` תקין). 16 ערוצי DMR מאומתים (VHF 162.14–167.14MHz, כל אחד
