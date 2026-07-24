@@ -106,6 +106,8 @@ button.btn:disabled{ opacity:.5; cursor:default; }
 .tag.control{ color:var(--faint); }
 .tag.position{ color:var(--teal); background:rgba(57,197,207,.14); border-color:transparent; }
 .tag.enc{ color:var(--red); background:rgba(248,81,73,.14); border-color:transparent; }
+.tag.err{ color:var(--red); background:rgba(248,81,73,.14); border-color:transparent; }
+.tag.warn{ color:var(--amber); background:rgba(210,153,34,.14); border-color:transparent; }
 .tag.slot{ font-family:var(--mono); }
 .audio{ width:210px; max-width:40vw; }
 .muted{ color:var(--faint); font-size:13px; }
@@ -778,10 +780,14 @@ function renderChannelsBoard(){
     const when = last ? fmtT(last.t) : "אין שיחה עדיין";
     const enc = last&&last.encrypted ? `<span class="tag enc">🔒</span>` : "";
     const errTxt = rf ? `${rf.errors_per_min} שגיאות/דק'` : "0 שגיאות/דק'";
+    // Phase 7 partial-restart: מפענח שקרס וקם-מחדש/ניתן-לו-לפול — לעולם לא מוסתר
+    let statusTag = "";
+    if(rf&&rf.status==="down") statusTag = `<span class="tag err">🔴 נפל (${rf.restart_count}× ניסיון)</span>`;
+    else if(rf&&rf.status==="restarting") statusTag = `<span class="tag warn">🟡 קם-מחדש (${rf.restart_count})</span>`;
     return `<div class="call" data-board-lcn="${esc(ch.lcn)}">
       <div class="tsl">${esc(ch.freq)}<br><span class=mono>LCN${esc(ch.lcn)}</span></div>
       <div><div class="tg">${tg}</div><div class="rid muted">${when}</div>
-        <div class="meta">${enc}<span class="tag">${errTxt}</span></div></div>
+        <div class="meta">${enc}<span class="tag">${errTxt}</span>${statusTag}</div></div>
       <div></div>
     </div>`;
   }).join("");
