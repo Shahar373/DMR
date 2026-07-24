@@ -110,6 +110,14 @@ button.btn:disabled{ opacity:.5; cursor:default; }
 .tag.warn{ color:var(--amber); background:rgba(210,153,34,.14); border-color:transparent; }
 .tag.slot{ font-family:var(--mono); }
 .audio{ width:210px; max-width:40vw; }
+.toast{ position:fixed; bottom:calc(var(--sp-4) + env(safe-area-inset-bottom,0px));
+  left:50%; transform:translateX(-50%) translateY(0); z-index:50;
+  background:var(--panel-2); border:1px solid var(--border-strong); border-radius:var(--r-card);
+  box-shadow:var(--sh-card); padding:var(--sp-3) var(--sp-4); max-width:min(92vw,420px);
+  display:flex; align-items:center; gap:var(--sp-2); font-size:14px;
+  opacity:0; pointer-events:none; transition:opacity .25s, transform .25s; }
+.toast.show{ opacity:1; transform:translateX(-50%) translateY(-4px); }
+.toast .bell{ font-size:18px; flex:0 0 auto; }
 .muted{ color:var(--faint); font-size:13px; }
 .roster-row{ display:flex; justify-content:space-between; gap:var(--sp-3); padding:8px 0;
   border-bottom:1px solid var(--border); font-size:14px; }
@@ -293,6 +301,22 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     </div>
 
     <div class="card">
+      <h2>🔔 מעקב — התראה מקומית כשTG/RID מדבר</h2>
+      <div class="muted" style="margin-bottom:var(--sp-2)">
+        התראה בדף פתוח בלבד (רטט/צליל/Notification) — בלי שרת-relay חיצוני
+        (בהתאם ל"בלי ענן", ר' CLAUDE.md).
+      </div>
+      <div class="row">
+        <select id="wlKind" style="width:90px"><option value="tg">TG</option><option value="rid">RID</option></select>
+        <input class="mono" id="wlId" placeholder="מספר" style="width:130px" inputmode="numeric">
+        <button class="btn" id="wlAdd">הוסף למעקב</button>
+        <button class="btn ghost" id="wlEnableNotif">🔔 הפעל התראות</button>
+      </div>
+      <div id="wlList" style="margin-top:var(--sp-3)"></div>
+      <div class="count" id="wlPermStatus"></div>
+    </div>
+
+    <div class="card">
       <h2>רוסטר — רדיו-IDs / talkgroups <span class="count" id="rosterCount"></span></h2>
       <div id="rosterList"><div class="muted">אין נתונים עדיין.</div></div>
     </div>
@@ -420,6 +444,8 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     </div>
   </div>
 </div>
+
+<div class="toast" id="wlToast"><span class="bell">🔔</span><span id="wlToastText"></span></div>
 
 <script>
 "use strict";
@@ -693,6 +719,89 @@ async function loadUnknown(){
 }
 $("unknownRefresh").onclick=loadUnknown;
 
+// ---------- watchlist (מעקב RID/TG — התראה מקומית בלבד, בלי Push API) -----
+// notifiedWlIds: נגד רה-התראה על אותו כרטיס בעדכוני-dedup (המשך-שיחה, ר'
+// _dmr_listener) — מתריעים פעם אחת פר-id, לא בכל poll.
+const notifiedWlIds = new Set();
+let wlSeeded = false;   // ר' checkWatchlistHits: הבאצ' הראשון הוא היסטוריית-היום, לא "עכשיו"
+let audioCtx = null;
+function beep(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+    osc.type = "sine"; osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.4);
+  }catch(e){ /* Web Audio לא נתמך/חסום — לא קריטי, יש גם toast+viz */ }
+}
+function showToast(text){
+  const t=$("wlToast"); $("wlToastText").textContent=text; t.classList.add("show");
+  clearTimeout(t._hideTimer); t._hideTimer=setTimeout(()=>t.classList.remove("show"), 4500);
+}
+function notifyWatchlistHit(m){
+  const who = m.watchlist.kind==="tg" ? `TG ${m.watchlist.id}` : `RID ${m.watchlist.id}`;
+  const detail = m.tg_alias||m.src_alias||"";
+  const text = `🔔 ${who} מדבר${detail?" · "+detail:""}`;
+  showToast(text); beep();
+  if(navigator.vibrate) navigator.vibrate([200,100,200]);
+  if(typeof Notification!=="undefined" && Notification.permission==="granted"){
+    try{ new Notification("DMR — מעקב", {body:text, tag:"dmr-watchlist-"+m.id}); }catch(e){}
+  }
+}
+function checkWatchlistHits(msgs){
+  // ה-batch הראשון (since=0, פותח את הדף) הוא היסטוריית-היום שכבר קרתה --
+  // מסמנים כ"נראה" בלי להתריע, אחרת פתיחת/רענון-הדף מציפה בהתראות על שיחות
+  // שכבר נגמרו. רק batches הבאים (אירועים אמיתיים חדשים) מתריעים.
+  if(!wlSeeded){
+    for(const m of msgs) if(m.watchlist) notifiedWlIds.add(m.id);
+    wlSeeded = true;
+    return;
+  }
+  for(const m of msgs){
+    if(!m.watchlist || notifiedWlIds.has(m.id)) continue;
+    notifiedWlIds.add(m.id);
+    notifyWatchlistHit(m);
+  }
+}
+function updateWlPermStatus(){
+  const s=$("wlPermStatus");
+  if(typeof Notification==="undefined"){ s.textContent="Notification API לא נתמך בדפדפן זה — עדיין יש רטט/צליל/toast בדף פתוח."; return; }
+  const p=Notification.permission;
+  s.textContent = p==="granted" ? "✓ התראות מופעלות" : p==="denied" ? "✗ התראות נחסמו (הגדרות דפדפן)" : "התראות כבויות — לחץ 'הפעל התראות'";
+}
+$("wlEnableNotif").onclick=async()=>{
+  if(typeof Notification==="undefined"){ updateWlPermStatus(); return; }
+  try{ await Notification.requestPermission(); }catch(e){}
+  updateWlPermStatus();
+};
+async function loadWatchlist(){
+  const r=await api("/api/watchlist"); if(!r.ok)return;
+  const wl=r.body.watchlist||{tg:[],rid:[]};
+  const rows=[...wl.tg.map(id=>({k:"tg",id})), ...wl.rid.map(id=>({k:"rid",id}))];
+  $("wlList").innerHTML = rows.length ? rows.map(row=>`
+    <div class="roster-row"><span><b class=mono>${row.k.toUpperCase()} ${esc(row.id)}</b></span>
+    <button class="btn ghost" data-wldel="${row.k}:${esc(row.id)}">✕</button></div>`).join("")
+    : `<div class="muted">אין מעקב פעיל.</div>`;
+  $("wlList").querySelectorAll("[data-wldel]").forEach(b=>b.onclick=async()=>{
+    const [k,id]=b.dataset.wldel.split(":");
+    const cur=(await api("/api/watchlist")).body.watchlist;
+    cur[k]=cur[k].filter(x=>String(x)!==id);
+    await api("/api/watchlist",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(cur)});
+    loadWatchlist();
+  });
+}
+$("wlAdd").onclick=async()=>{
+  const kind=$("wlKind").value, id=parseInt($("wlId").value,10);
+  if(!Number.isFinite(id)) return;
+  const cur=(await api("/api/watchlist")).body.watchlist||{tg:[],rid:[]};
+  if(!cur[kind].includes(id)) cur[kind].push(id);
+  await api("/api/watchlist",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(cur)});
+  $("wlId").value=""; loadWatchlist();
+};
+updateWlPermStatus();
+
 // ---------- roster ----------
 async function pollRoster(){
   const r=await api("/api/roster"); if(!r.ok)return;
@@ -818,6 +927,7 @@ function callCard(m){
   if(m.slot!=null) tags.push(`<span class="tag slot">TS${m.slot}</span>`);
   if(m.cc!=null) tags.push(`<span class="tag">CC${m.cc}</span>`);
   if(m.encrypted) tags.push(`<span class="tag enc">🔒 ${esc((m.enc&&m.enc.alg_name)||"מוצפן")}</span>`);
+  if(m.watchlist) tags.push(`<span class="tag warn">🔔 מעקב</span>`);
   if(m.ber!=null) tags.push(`<span class="tag mono">BER ${m.ber}</span>`);
   const tg = m.tg!=null ? `TG ${m.tg}${m.tg_alias?" · "+esc(m.tg_alias):""}` : (m.tgt!=null?`→ ${m.tgt}`:"—");
   const rid = m.src!=null ? `RID ${m.src}${m.src_alias?" · "+esc(m.src_alias):""}` : "";
@@ -863,10 +973,11 @@ function showDetail(id){
 async function pollFeed(){
   if(archiveDay) return;
   const r=await api("/api/dmr?since="+lastId); if(!r.ok||!r.body.ok)return;
-  if(r.body.cursor<lastId){ feedMsgs=[]; lastId=0; }  // server restart
+  if(r.body.cursor<lastId){ feedMsgs=[]; lastId=0; wlSeeded=false; }  // server restart: ids מתחילים מ-1 מחדש
   const msgs=r.body.messages||[];
   if(msgs.length){
     for(const m of msgs){ const i=feedMsgs.findIndex(x=>x.id===m.id); if(i>=0)feedMsgs[i]=m; else feedMsgs.push(m); }
+    checkWatchlistHits(msgs);
     lastId=Math.max(lastId, ...msgs.map(m=>m.id));
     if(feedMsgs.length>800) feedMsgs=feedMsgs.slice(-800);
     if(appView==="calls") renderFeed();
@@ -1028,7 +1139,7 @@ $("themeToggle").onclick = ()=>{
 
 // ---------- boot ----------
 async function init(){
-  await refreshState(); await loadAliases(); loadUnknown();
+  await refreshState(); await loadAliases(); loadUnknown(); loadWatchlist();
   // נחיתה: אם במצב שיחות פעיל נשאר בבית; המשתמש עובר ידנית
   setInterval(pollHealth, 4000); pollHealth();
   setInterval(pollPower, 15000); pollPower();   // מתח לא משתנה מהר — פחות תדיר מ-health

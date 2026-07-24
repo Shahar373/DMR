@@ -387,6 +387,24 @@ def test_normalize_alias_join(paths):
     assert card["tg_alias"] == "מוקד" and card["src_alias"] == "יחידה 1"
 
 
+def test_normalize_tags_watchlist_match(paths):
+    import watchlist
+    watchlist.replace({"tg": [3], "rid": []})
+    card = paths._normalize_dsd({
+        "type": "voice_call", "tg": 3, "src": 2120, "call_type": "group",
+    })
+    assert card["watchlist"] == {"kind": "tg", "id": 3}
+
+
+def test_normalize_watchlist_none_when_no_match(paths):
+    import watchlist
+    watchlist.replace({"tg": [], "rid": []})
+    card = paths._normalize_dsd({
+        "type": "voice_call", "tg": 3, "src": 2120, "call_type": "group",
+    })
+    assert card["watchlist"] is None
+
+
 def test_normalize_lrrp_and_invalid_position(paths):
     card = paths._normalize_dsd({
         "type": "lrrp_position", "src": 18, "lat": 32.09265,
