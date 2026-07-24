@@ -338,9 +338,13 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   היחיד, ולא אומת על RSP1B**. לכן `MultiChannelBridge` משתמש ב-121 קבוע (המנוע
   שאומת ב-v0.7.1) **אלא אם** `DSD_MULTI_SCALED_TAPS` דלוק. חד-ערוצי (240kHz) זהה
   byte-for-byte בכל מקרה (`scaled_taps(240k)==121`; `NfmDemodulator` משתמש ב-`taps`
-  כפי-שהוא). אימות: A/B בשדה דרך הספייק (`DSD_MULTI_SCALED_TAPS=1 sudo bash
-  scripts/spike-dmr-multi ...` מול הרצה רגילה) — משווים ערוצים-עם-אירועים + CPU
-  שיא. רק כשמוכח שיפור בלי רוויה → הופכים לברירת-מחדל.
+  כפי-שהוא). אימות: A/B בשדה דרך הספייק — `sudo bash scripts/spike-dmr-multi
+  multi_164cluster 120 scaled` (ארגומנט-מיקום `scaled`; **לא** `DSD_MULTI_SCALED_TAPS=1
+  sudo ...` — sudo מנקה משתני-סביבה!) מול הרצה רגילה — משווים ערוצים-עם-אירועים
+  (צריך חלון-תעבורה עמוס) + CPU שיא (מדיד תמיד). **✅ A/B נמדד על חומרה (24.07):
+  scaled 339 taps → 139% שיא מול 121 taps → 148% שיא — עלות CPU זניחה (הקונבולוציה
+  אינה צוואר-הבקבוק; dsd-fme+atan2 שולטים).** נותר רק לאשר שיפור-פענוח בחלון עמוס
+  (כל ההרצות עד כה היו דממת-תעבורה: 0–2 אירועים) → ואז הופכים לברירת-מחדל.
 - **rsp_tcp + rsp_fm.py כתהליכי-בן:** dsd_pty מריץ את שניהם (ובנוסף את DSD-FME עצמו
   תחת PTY) => יחידת systemd אחת = צרכן-SDR אחד (מודל ה-standby/PartOf של AIR-AM
   נשמר). כל שלושת התהליכים מקבלים `PR_SET_PDEATHSIG` (`dsd_pty._pdeathsig_term`) כדי
