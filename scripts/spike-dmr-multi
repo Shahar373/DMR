@@ -20,12 +20,22 @@
 #       sudo systemctl stop dmr-dsdfme
 #   sudo bash scripts/spike-dmr-multi                    # ברירת מחדל: 164cluster מ-systems.json, 90ש'
 #   sudo bash scripts/spike-dmr-multi multi_164cluster 120
+#   sudo bash scripts/spike-dmr-multi multi_164cluster 120 scaled  # A/B: scaled_taps דלוק
 #   SYSTEMS=/path/to/systems.json bash scripts/spike-dmr-multi multi_162cluster
+#   ⚠ להפעלת scaled_taps השתמש בארגומנט-המיקום "scaled" — *לא* ב-
+#     DSD_MULTI_SCALED_TAPS=1 sudo ... כי sudo מנקה משתני-סביבה (הדגל לא יעבור).
 # ============================================================================
 set -uo pipefail
 
 SYSTEM_ID="${1:-multi_164cluster}"
 DURATION="${2:-90}"
+# scaled_taps A/B: ארגומנט-מיקום 3 "scaled" (עמיד-sudo — ארגומנטים עוברים דרך
+# sudo, בניגוד למשתני-סביבה ש-sudo מנקה!) או משתנה DSD_MULTI_SCALED_TAPS אם שרד.
+if [ "${3:-}" = "scaled" ] || [ "${DSD_MULTI_SCALED_TAPS:-}" = "1" ]; then
+  SCALED_TAPS=1
+else
+  SCALED_TAPS=0
+fi
 SYSTEMS="${SYSTEMS:-/var/lib/dmr/systems.json}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEBTUNE="$REPO_ROOT/webtune"
@@ -58,7 +68,9 @@ for pat in "rsp_fm.py" "dsd_pty.py" "$RSP_TCP_BIN" "$DSD_BIN"; do
     pkill -9 -f "$pat" 2>/dev/null || true
   fi
 done
-[ "$orphans" -eq 0 ] && echo "  אין יתומים ✓" || sleep 1
+# ⚠ אחרי SIGKILL ליתום, ה-SDRplay API משחרר את ה-RSP1B תוך כמה שניות (לא מיידי).
+# המתנה קצרה מדי => המנוע הבא נופל ב-bring-up כי ה-SDR עוד תפוס (t≈9s). 4ש' בטוח.
+[ "$orphans" -eq 0 ] && echo "  אין יתומים ✓" || { echo "  ממתין 4ש' לשחרור ה-SDR מהיתום..."; sleep 4; }
 
 fail=0
 check() { printf "  %-26s " "$1"; if eval "$2" >/dev/null 2>&1; then echo "✓"; else echo "✗ ($3)"; fail=1; fi; }
@@ -108,10 +120,11 @@ export RSP_FM_BIN="$WEBTUNE/rsp_fm.py"
 # A/B של scaled_taps: הרץ פעם בלי (ברירת-מחדל, 121 taps — המנוע שאומת) ופעם עם
 #   DSD_MULTI_SCALED_TAPS=1 sudo bash scripts/spike-dmr-multi ...
 # והשווה CPU (שיא) + ערוצים-עם-אירועים. אם עם-הדגל CPU רווי (🔴) — הפילטר יקר מדי.
-if [ "${DSD_MULTI_SCALED_TAPS:-}" = "1" ]; then
+if [ "$SCALED_TAPS" = "1" ]; then
   export DSD_MULTI_SCALED_TAPS=1
   echo "  ⚙ scaled_taps מופעל (סלקטיביות רחבת-פס, ×~2.8 עומס-קונבולוציה) — מצב A/B"
 else
+  export DSD_MULTI_SCALED_TAPS=0
   echo "  ⚙ scaled_taps כבוי (ברירת-מחדל: 121 taps — המנוע שאומת ב-v0.7.1)"
 fi
 mkdir -p "$DSD_WAV_DIR"
@@ -182,7 +195,9 @@ done
 
 wait "$LISTENER" 2>/dev/null
 kill -INT "$ENGINE" 2>/dev/null; sleep 2; kill -KILL "$ENGINE" 2>/dev/null; wait "$ENGINE" 2>/dev/null
-pkill -x "$DSD_BIN" 2>/dev/null; pkill -x "$RSP_TCP_BIN" 2>/dev/null
+# ניקוי יסודי (-9 -f, כולל rsp_fm.py שרץ כ-python3) כדי לא להשאיר יתום שתופס את
+# ה-SDR לריצה הבאה — הסוויפ ב-preflight תופס שאריות, אבל עדיף לא להשאיר מלכתחילה.
+pkill -9 -f "$DSD_BIN" 2>/dev/null; pkill -9 -f "$RSP_TCP_BIN" 2>/dev/null; pkill -9 -f rsp_fm.py 2>/dev/null
 
 # ── 6. Verdict ──────────────────────────────────────────────────────────────
 avg_cpu=0; [ "$samples" -gt 0 ] && avg_cpu=$(( sum_cpu / samples ))

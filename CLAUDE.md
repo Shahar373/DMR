@@ -338,9 +338,11 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   היחיד, ולא אומת על RSP1B**. לכן `MultiChannelBridge` משתמש ב-121 קבוע (המנוע
   שאומת ב-v0.7.1) **אלא אם** `DSD_MULTI_SCALED_TAPS` דלוק. חד-ערוצי (240kHz) זהה
   byte-for-byte בכל מקרה (`scaled_taps(240k)==121`; `NfmDemodulator` משתמש ב-`taps`
-  כפי-שהוא). אימות: A/B בשדה דרך הספייק (`DSD_MULTI_SCALED_TAPS=1 sudo bash
-  scripts/spike-dmr-multi ...` מול הרצה רגילה) — משווים ערוצים-עם-אירועים + CPU
-  שיא. רק כשמוכח שיפור בלי רוויה → הופכים לברירת-מחדל.
+  כפי-שהוא). אימות: A/B בשדה דרך הספייק — `sudo bash scripts/spike-dmr-multi
+  multi_164cluster 120 scaled` (ארגומנט-מיקום `scaled`; **לא** `DSD_MULTI_SCALED_TAPS=1
+  sudo ...` — sudo מנקה משתני-סביבה!) מול הרצה רגילה — משווים ערוצים-עם-אירועים
+  (צריך חלון-תעבורה עמוס) + CPU שיא (מדיד תמיד). רק כשמוכח שיפור בלי רוויה →
+  הופכים לברירת-מחדל.
 - **rsp_tcp + rsp_fm.py כתהליכי-בן:** dsd_pty מריץ את שניהם (ובנוסף את DSD-FME עצמו
   תחת PTY) => יחידת systemd אחת = צרכן-SDR אחד (מודל ה-standby/PartOf של AIR-AM
   נשמר). כל שלושת התהליכים מקבלים `PR_SET_PDEATHSIG` (`dsd_pty._pdeathsig_term`) כדי
