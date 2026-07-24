@@ -215,19 +215,25 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
   ב-dsd_pty (ground-truth מ-spawn, לא ניחוש טקסט) — `_normalize_dsd` מעדיף אותו
   על `_channelmap_freq(lcn)`, ו-`_dmr_listener`'s dedup/`_slot_open_call`/RF
   ticks כולם מורחבים במפתח `phys_lcn` (בחד-ערוצי תמיד `None` ⇒ ללא שינוי
-  התנהגות). **⚠ רסטרט פר-ערוץ (v0.9.0):** מפענח DSD-FME בודד שקורס נקם-מחדש
-  **במקומו** (אותו audio port; `rsp_fm` כבר סובל חיבור-לקוח חדש) עד
-  `CHANNEL_RESTART_MAX` ניסיונות ב-`CHANNEL_RESTART_WINDOW_SEC` (ברירת מחדל
-  3/300ש', `dsd_pty._channel_restart_decision` טהורה) — **לא** מפיל את שאר
-  הערוצים. חורג מהמכסה ⇒ הערוץ מוסר מ-`dsd_procs` וממשיכים בלעדיו; רק אם
-  *כולם* ויתרו ⇒ כשל כל השירות (כמו קודם). כל מעבר (`restarting`/`down`)
-  מדווח כ-`decoder_status` (`build_decoder_status_event`, טהורה) → `app.py`'s
-  `_channel_status_tick` → `/api/rf`'s `by_channel` (`status`/`restart_count`,
-  **גלוי גם בלי טיקי-RF נוספים** — לעולם לא נעלם בשקט) → תג בלוח-הערוצים.
-  **שרשרת האותות `pragma: no cover`, לא אומתה על חומרה** (ר' §10 Phase 7) —
-  הלוגיקה הטהורה (`compute_wideband_plan`, `parse_channelmap_hz`, `tag_event`,
-  `_channel_restart_decision`, `build_decoder_status_event`, בוני-הפקודות) כן
-  נבדקת ב-CI.
+  התנהגות). **⚠ רסטרט פר-ערוץ (v0.9.0, ✅ אומת על חומרה 25.07.2026):** מפענח
+  DSD-FME בודד שקורס נקם-מחדש **במקומו** (אותו audio port; `rsp_fm` כבר סובל
+  חיבור-לקוח חדש) עד `CHANNEL_RESTART_MAX` ניסיונות ב-`CHANNEL_RESTART_WINDOW_SEC`
+  (ברירת מחדל 3/300ש', `dsd_pty._channel_restart_decision` טהורה) — **לא**
+  מפיל את שאר הערוצים. חורג מהמכסה ⇒ הערוץ מוסר מ-`dsd_procs` וממשיכים
+  בלעדיו; רק אם *כולם* ויתרו ⇒ כשל כל השירות (כמו קודם). כל מעבר
+  (`restarting`/`down`) מדווח כ-`decoder_status` (`build_decoder_status_event`,
+  טהורה) → `app.py`'s `_channel_status_tick` → `/api/rf`'s `by_channel`
+  (`status`/`restart_count`, **גלוי גם בלי טיקי-RF נוספים** — לעולם לא נעלם
+  בשקט) → תג בלוח-הערוצים. **אומת בפועל** על Pi 5 + RSP1B: `sudo kill -9` על
+  תהליכי-בן `dsd-fme` בודדים (multi_164cluster, 6 ערוצים חיים) → journalctl
+  הראה `respawning (attempt 1/3)` לכל אחד, שני המפענחים קמו על אותו audio
+  port והתחברו-מחדש בהצלחה (`TCP Connection Success!`, `rsp_fm` קיבל לקוח
+  חדש), `/api/rf` דיווח `status=restarting, restart_count=1` לשניהם, ו-
+  `systemctl status dmr-dsdfme` נשאר `active (running)` **ללא הפרעה** לאורך
+  כל הבדיקה (4 הערוצים האחרים המשיכו לפענח ללא שינוי). הלוגיקה הטהורה
+  (`compute_wideband_plan`, `parse_channelmap_hz`, `tag_event`,
+  `_channel_restart_decision`, `build_decoder_status_event`, בוני-הפקודות)
+  נבדקת גם ב-CI.
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
   TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
 - **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
@@ -520,12 +526,15 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
 - **v0.8.0 — תור לא-מזוהים (`/api/aliases/unknown`):** worklist ל-RID/TG
   שנצפו בתעבורה אך `aliasdb` לא פותר כרגע, ממוין לפי פעילות + הקשר (TG-ים/
   מספר-רדיו). פאנל ב-UI עם קלט-שם מוטבע. פיצ'ר-מודיעין ללא-חומרה (§5).
-- **v0.9.0 — restart פר-ערוץ ב-multi:** תיקון פער-יציבות שנתפס בסקירה —
-  מפענח DSD-FME בודד שקרס הפיל בעבר את **כל** שירות ה-multi (6 ערוצים).
-  עכשיו נקם-מחדש במקומו עד מכסת-restart, אחרת הערוץ מוסר וממשיכים בלעדיו,
-  בגלוי (`/api/rf` by_channel + תג ב-UI). ר' §5 "multi" לפרטים. הלוגיקה
-  הטהורה נבדקת ב-CI; ה-orchestration בפועל `pragma: no cover` — ממתין
-  לאימות על RSP1B בחלון-החומרה הבא (יחד עם A/B של `scaled_taps`).
+- **v0.9.0 — restart פר-ערוץ ב-multi (✅ אומת על חומרה 25.07.2026):** תיקון
+  פער-יציבות שנתפס בסקירה — מפענח DSD-FME בודד שקרס הפיל בעבר את **כל**
+  שירות ה-multi (6 ערוצים). עכשיו נקם-מחדש במקומו עד מכסת-restart, אחרת
+  הערוץ מוסר וממשיכים בלעדיו, בגלוי (`/api/rf` by_channel + תג ב-UI). ר' §5
+  "multi" לפרטים המלאים ולראיות האימות (`sudo kill -9` על 2 מפענחים בזה
+  אחר זה על multi_164cluster חי — שניהם קמו-מחדש, ה-service נשאר יציב,
+  4 הערוצים האחרים לא הופרעו). מסלול-הוויתור (חריגה מ-3 ניסיונות/5 דק')
+  עדיין לא נבדק בפועל — הלוגיקה שלו (`_channel_restart_decision`) כן נבדקת
+  ב-CI (allow/deny/prune).
 - **`config/systems.survey.json` — 19 מערכות אמיתיות ממדידת-שדה (17.07.2026):**
   ייבוא מ-inventory Excel של סקר IQ עצמאי (SoapySDR+SDRconnect, decoder+SQLite,
   `integrity_check` תקין). 16 ערוצי DMR מאומתים (VHF 162.14–167.14MHz, כל אחד

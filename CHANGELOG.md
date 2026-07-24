@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+## [0.9.1] - restart פר-ערוץ אומת על חומרה אמיתית (25.07.2026)
+
+**✅ מנגנון ה-restart-פר-ערוץ מ-v0.9.0 אומת בפועל** על Pi 5 + RSP1B (multi
+mode דרך `dmr-web`, לא ספייק — כלומר גם `app.py`/`/api/rf`/ה-UI נבדקו
+end-to-end, לא רק `dsd_pty.py`):
+
+- `sudo kill -9` על תהליכי-בן `dsd-fme` בודדים (lcn=6 ואז lcn=5, מתוך 6
+  ערוצים חיים ב-`multi_164cluster`) → journalctl הראה
+  `dsd_pty: dsd-fme for lcn=N exited -- respawning (attempt 1/3)` לכל אחד,
+  ושני המפענחים קמו-מחדש **על אותו audio port** והתחברו-מחדש בהצלחה
+  (`TCP Connection Success!`; `rsp_fm` קיבל לקוח חדש בלי בעיה).
+- `/api/rf`'s `by_channel` דיווח `status=restarting, restart_count=1` לשני
+  הערוצים, בדיוק כצפוי.
+- **`systemctl status dmr-dsdfme` נשאר `active (running)` ללא הפרעה** לאורך
+  כל הבדיקה — ה-service *לא* עבר restart, בדיוק המטרה (בניגוד להתנהגות
+  שלפני v0.9.0 שהייתה מפילה את כל השירות). 4 הערוצים האחרים המשיכו לפענח
+  ללא שינוי לכל אורך הבדיקה.
+
+מסלול-הוויתור (חריגה ממכסת-restart) עדיין לא נבדק בפועל בשטח — רק
+`_channel_restart_decision` (טהורה) ב-CI.
+
 ## [0.9.0] - restart פר-ערוץ ב-multi (Phase 7): מפענח בודד לא מפיל הכל
 
 פער-יציבות שנתפס בסקירה: `dsd_pty._run_multi` הפיל את **כל** שירות ה-multi
