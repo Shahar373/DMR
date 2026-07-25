@@ -70,9 +70,41 @@ _RE_DATA_HEADER = re.compile(
     r".*?Source:\s*(?P<src>\d+)\s+Target:\s*(?P<tgt>\d+)", re.I)
 _RE_LRRP_REQ = re.compile(
     r"LRRP\s+SRC:\s*(?P<src>\d+);\s*Response to TGT:\s*(?P<tgt>\d+);", re.I)
+# ⚠ v0.14.0 — קבוצת ה-`src` האופציונלית שהייתה כאן **מתמטית לא יכלה להתאים**:
+# `dmr_pdu.c:844-858` בונה את המחרוזת `LRRP SRC: N; (lat, lon)` אבל מדפיס אותה
+# רק ב-`if (!lat)`. כלומר שורה עם קואורדינטות **לעולם** לא נושאת SRC ⇒
+# _normalize_dsd החזיר src=None ⇒ _lrrp_snapshot סינן 100% מהמיקומים ⇒
+# /api/positions היה ריק מבנית. ה-RID מגיע מהשורה הקודמת (ip_data, ר' למטה).
 _RE_LRRP_POS = re.compile(
-    r"(?:SRC[:=]?\s*(?P<src>\d+)\D*?)?Lat:\s*(?P<lat>-?[0-9.]+)\s+"
-    r"Lon:\s*(?P<lon>-?[0-9.]+)", re.I)
+    r"Lat:\s*(?P<lat>-?[0-9.]+)\s+Lon:\s*(?P<lon>-?[0-9.]+)", re.I)
+# ★ שכבת ה-Data: שורות ה-IP/UDP שנזרקו עד כה כ-housekeeping. הן נושאות את
+# ה-RID של השולח/היעד **ואת הפורט**, והפורט הוא מסווג סוג-הדאטה בחינם
+# (dmr_pdu.c:345-484). שתי השורות (SRC ואז DST) מודפסות לפני ה-payload עצמו.
+_RE_IP_DATA = re.compile(
+    r"(?P<role>SRC|DST)\(24\):\s*(?P<rid>\d+);\s*IP:\s*(?P<ip>[0-9.]+);"
+    r"(?:\s*Port:\s*(?P<port>\d+);)?", re.I)
+DATA_PORT_KINDS = {          # dmr_pdu.c:345-484 — כל אחד fprintf מפורש שם
+    231: "cellocator",       # מעקב-רכב
+    4001: "lrrp",            # מיקום — ✅ מאומת בקליטה שלנו
+    4004: "xcmp",            # ניהול-רדיו
+    4005: "ars",             # רישום/נוכחות רדיו
+    4007: "text",            # הודעות טקסט (TMS)
+    4008: "telemetry",
+    4009: "otap",            # תכנות מרחוק
+    4012: "battery",
+    4013: "jobticket",
+}
+# תוכן הודעת טקסט. מודפס בשורה נפרדת (`\n Text: `) אחרי כותרת ה-TMS.
+_RE_TEXT_MESSAGE = re.compile(r"^\s*Text:\s*(?P<text>.*)$", re.I)
+# שדות LRRP נוספים, כל אחד בשורה נפרדת (dmr_pdu.c:735-791). ⚠ אף אחד מהם לא
+# נצפה בקליטה שלנו — נגזרו מהמקור, ר' tests/fixtures/dsdfme_source_shapes.csv.
+_RE_LRRP_TIME = re.compile(
+    r"^\s*Time:\s*(?P<time>\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})", re.I)
+_RE_LRRP_EXTRA = re.compile(
+    r"^\s*(?:Radius:\s*(?P<radius>\d+)m"
+    r"|Altitude:\s*(?P<alt>-?\d+)m"
+    r"|Speed:\s*(?P<speed_ms>[0-9.]+)\s*m/s\s+(?P<speed_kmh>[0-9.]+)\s*km/h"
+    r"|Track:\s*(?P<track>\d+))", re.I)
 _RE_ENCRYPTION = re.compile(r"SLOT\s+(?P<slot>\d)\s+Protected LC\b", re.I)
 _RE_QUALITY_ERR = re.compile(
     r"(CACH/Burst FEC ERR|CSBK \(CRC ERR\)|CSBK \(FEC ERR\)|SLCO CRC ERR)", re.I)
@@ -209,15 +241,45 @@ def parse_dsd_line(text, emit_status=False):
     if "lat:" in text.lower() and "lon:" in text.lower():
         match = _RE_LRRP_POS.search(text)
         if match:
-            event = {
+            # src/tgt מגיעים מהקשר ה-ip_data שנפתח בשורות שקדמו (app.py
+            # מקשר) — לא מהשורה הזו, שמעולם לא נושאת אותם.
+            return {
                 "type": "lrrp_position",
                 "lat": float(match.group("lat")),
                 "lon": float(match.group("lon")),
                 "call_type": "lrrp",
             }
-            if match.group("src"):
-                event["src"] = int(match.group("src"))
-            return event
+
+    match = _RE_IP_DATA.search(text)
+    if match:
+        event = {"type": "ip_data", "role": match.group("role").lower(),
+                 "rid": int(match.group("rid")), "ip": match.group("ip")}
+        if match.group("port"):
+            port = int(match.group("port"))
+            event["port"] = port
+            event["kind"] = DATA_PORT_KINDS.get(port)
+        return event
+
+    match = _RE_TEXT_MESSAGE.search(text)
+    if match and match.group("text").strip():
+        return {"type": "text_message", "text": match.group("text").strip()}
+
+    match = _RE_LRRP_TIME.search(text)
+    if match:
+        return {"type": "lrrp_extra", "fix_time": match.group("time")}
+
+    match = _RE_LRRP_EXTRA.search(text)
+    if match:
+        event = {"type": "lrrp_extra"}
+        if match.group("radius"):
+            event["radius_m"] = int(match.group("radius"))
+        if match.group("alt"):
+            event["alt_m"] = int(match.group("alt"))
+        if match.group("speed_kmh"):
+            event["speed_kmh"] = round(float(match.group("speed_kmh")), 2)
+        if match.group("track"):
+            event["track_deg"] = int(match.group("track"))
+        return event
 
     match = _RE_ENCRYPTION.search(text)
     if match:

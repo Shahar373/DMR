@@ -12,10 +12,17 @@ _KEPT_TYPES = {
     "voice_call", "data_header", "lrrp_position", "lrrp_request",
     "encryption", "quality",
     # Phase 8 system radar -- always-on control-channel telemetry (not
-    # emit_status-gated like sync/channel_status). ip_mapping stays dropped
-    # (housekeeping) -- no feature consumes it yet.
+    # emit_status-gated like sync/channel_status).
     "lsn_status", "bank_call", "preamble_csbk", "site_info",
+    # ★ v0.14.0 data layer: the SRC(24)/DST(24) lines are no longer dropped --
+    # they carry the sender RID *and* the UDP port, and the port is the free
+    # data-kind classifier (4001=LRRP, 4005=ARS, 4007=text, ...). Dropping them
+    # is what made /api/positions structurally empty.
+    "ip_mapping",
 }
+# הפיקסצ'ר תויג לפי **שם השורה** כשנבנה; שם האירוע שאנחנו פולטים מתאר את
+# התפקיד. המפה הזאת מתרגמת בין השניים במקום לשנות תיוג-קליטה היסטורי.
+_FIXTURE_TYPE_ALIAS = {"ip_mapping": "ip_data"}
 
 
 def _load_fixture():
@@ -31,6 +38,7 @@ def test_fixture_replay_matches_reality():
         event = dsd_pty.parse_dsd_line(row["raw_line"])
         parsed = event["type"] if event else "DROPPED"
         expected = row["orig_type"] if row["orig_type"] in _KEPT_TYPES else "DROPPED"
+        expected = _FIXTURE_TYPE_ALIAS.get(expected, expected)
         if parsed != expected:
             mismatches.append((row["orig_type"], row["raw_line"], expected, parsed))
     assert not mismatches
@@ -177,10 +185,14 @@ def test_housekeeping_and_ansi_are_handled():
     for line in [
         # channel_status stays emit_status-gated (unchanged) -- only real housekeeping here
         "Capacity Plus Channel Status - FL: 2 TS: 1 RS: 0 - Rest LSN: 6 - Initial Block",
-        # ip_mapping stays dropped -- no feature consumes it (yet)
-        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
     ]:
         assert dsd_pty.parse_dsd_line(line) is None
+    # ★ v0.14.0: ה-SRC(24)/DST(24) **אינם** housekeeping יותר — הם נושאים את
+    # ה-RID והפורט (מסווג סוג-הדאטה). הבדיקה הזאת קודם קבעה את ההפוך.
+    assert dsd_pty.parse_dsd_line(
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;"
+    ) == {"type": "ip_data", "role": "src", "rid": 18,
+          "ip": "012.000.000.018", "port": 4001, "kind": "lrrp"}
     # Phase 8 system radar: these four are now always-on typed events, not
     # housekeeping (see _KEPT_TYPES + test_fixture_replay_matches_reality for
     # full real-sample coverage). Confirm here too since this test used to
@@ -1370,3 +1382,204 @@ def test_boot_restore_populates_intel_cache_on_early_return(paths, monkeypatch, 
     app._active_system_id = None
     app._boot_restore()
     assert app._intel_system_id() == "s1"
+
+
+# ============================================================================
+#  ★ v0.14.0 — שכבת ה-Data: /api/positions שהיה ריק מבנית, סיווג לפי פורט,
+#  הודעות טקסט, ושדות LRRP נוספים.
+# ============================================================================
+def test_ip_data_carries_rid_and_port_kind():
+    """השורות שנזרקו עד כה כ-housekeeping נושאות את ה-RID **ואת הפורט**,
+    והפורט הוא מסווג סוג-הדאטה (dmr_pdu.c:345-484)."""
+    assert dsd_pty.parse_dsd_line(
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;"
+    ) == {"type": "ip_data", "role": "src", "rid": 18,
+          "ip": "012.000.000.018", "port": 4001, "kind": "lrrp"}
+    assert dsd_pty.parse_dsd_line(
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4007;"
+    )["kind"] == "text"
+    assert dsd_pty.parse_dsd_line(
+        "SRC(24): 00000210; IP: 012.000.000.210; Port: 4005;"
+    )["kind"] == "ars"
+
+
+def test_ip_data_unknown_port_has_no_invented_kind():
+    """פורט שלא במפה => kind=None. לא ממציאים סיווג (§8)."""
+    event = dsd_pty.parse_dsd_line("SRC(24): 00000018; IP: 012.000.000.018; Port: 9999;")
+    assert event["port"] == 9999 and event["kind"] is None
+
+
+def test_lrrp_position_regex_no_longer_expects_impossible_src():
+    """★ שורש הבאג: dmr_pdu.c:844-858 בונה 'LRRP SRC: N; (lat,lon)' אבל מדפיס
+    אותה רק ב-if(!lat) => שורה עם קואורדינטות לעולם לא נושאת SRC. הקבוצה
+    האופציונלית שהייתה כאן לא יכלה להתאים, ולכן src היה None תמיד."""
+    event = dsd_pty.parse_dsd_line("Lat: 32.09265 Lon: 34.86761 (32.09265, 34.86761)")
+    assert event == {"type": "lrrp_position", "lat": 32.09265,
+                     "lon": 34.86761, "call_type": "lrrp"}
+
+
+def test_lrrp_extra_and_text_shapes():
+    assert dsd_pty.parse_dsd_line(" Time: 2026.07.25 10:15:30") == {
+        "type": "lrrp_extra", "fix_time": "2026.07.25 10:15:30"}
+    assert dsd_pty.parse_dsd_line(" Speed: 3.5000 m/s 12.6000 km/h 7.82 mph") == {
+        "type": "lrrp_extra", "speed_kmh": 12.6}
+    assert dsd_pty.parse_dsd_line(" Track: 271") == {"type": "lrrp_extra", "track_deg": 271}
+    assert dsd_pty.parse_dsd_line(" Text: שלום") == {"type": "text_message", "text": "שלום"}
+    assert dsd_pty.parse_dsd_line(" Text:   ") is None      # ריק => לא אירוע
+
+
+def _feed_lines(app, ctx, lines, t0=1000.0):
+    for i, line in enumerate(lines):
+        event = dsd_pty.parse_dsd_line(line)
+        if event:
+            event["t"] = t0 + i * 0.05
+            app._handle_datagram(event, ctx)
+
+
+def test_position_gets_rid_from_preceding_ip_data(paths):
+    """★ התיקון המרכזי: הרצף המדויק מהקליטה האמיתית שלנו (הפיקסצ'ר, שורות
+    16-19) — SRC/DST ואז Lat/Lon — מייצר כרטיס מיקום **עם** RID."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4001;",
+        "Lat: 32.09265 Lon: 34.86761 (32.09265, 34.86761)",
+    ])
+    with app._dmr_lock:
+        cards = list(app._dmr_msgs)
+    assert len(cards) == 1                      # לא כרטיס כפול מה-ip_data
+    card = cards[0]
+    assert card["src"] == 18 and card["tgt"] == 64250
+    assert card["lat"] == 32.09265 and card["lon"] == 34.86761
+    assert card["call_type"] == "lrrp" and card["data_kind"] == "lrrp"
+    assert card["data_port"] == 4001
+
+
+def test_api_positions_no_longer_structurally_empty(paths):
+    """★ /api/positions החזיר {} תמיד — לא מחוסר LRRP אלא כי כל מיקום סוּנן
+    על src=None (app.py:_lrrp_snapshot). עכשיו יש RID אמיתי."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4001;",
+        "Lat: 32.09265 Lon: 34.86761 (32.09265, 34.86761)",
+    ])
+    snap = app._lrrp_snapshot()
+    assert set(snap) == {18}                     # מפתחות int בפייתון
+    assert snap[18]["lat"] == 32.09265 and snap[18]["lon"] == 34.86761
+    body = app.app.test_client().get("/api/positions").get_json()
+    assert body["ok"] is True and "18" in body["positions"]   # ב-JSON כמחרוזת
+
+
+def test_lrrp_extras_mutate_the_open_position_and_reach_the_archive(paths):
+    """Time מודפס לפני ה-Lat/Lon, והשאר אחריו => חלקם הקשר וחלקם מוטציה.
+    שניהם חייבים להגיע לדיסק — אחרת חוזר הבאג של v0.13.0."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4001;",
+        " Time: 2026.07.25 10:15:30",
+        "Lat: 32.09265 Lon: 34.86761 (32.09265, 34.86761)",
+        " Radius: 12m",
+        " Altitude: 45m",
+        " Speed: 3.5000 m/s 12.6000 km/h 7.82 mph",
+        " Track: 271",
+    ])
+    assert app._read_dmr_log() == []            # מיקום נדחה עד סגירה (עוד מוטבל)
+    app._close_stale_calls(ctx, force=True)
+    rec = app._read_dmr_log()[0]
+    assert rec["fix_time"] == "2026.07.25 10:15:30"
+    assert rec["radius_m"] == 12 and rec["alt_m"] == 45
+    assert rec["speed_kmh"] == 12.6 and rec["track_deg"] == 271
+
+
+def test_text_message_becomes_an_sms_card(paths):
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000191; IP: 012.000.000.191; Port: 4007;",
+        "DST(24): 00000210; IP: 012.000.000.210; Port: 4007;",
+        " Text: מגיע בעוד 5 דקות",
+    ])
+    with app._dmr_lock:
+        card = list(app._dmr_msgs)[-1]
+    assert card["call_type"] == "sms" and card["category"] == "הודעת טקסט (SMS)"
+    assert card["src"] == 191 and card["tgt"] == 210
+    assert card["text"] == "מגיע בעוד 5 דקות"
+    assert app._read_dmr_log()[0]["text"] == "מגיע בעוד 5 דקות"   # נכתב מיד
+
+
+def test_text_content_can_be_disabled(paths, monkeypatch):
+    """DMR_CAPTURE_TEXT=0 => המטא-דאטה נשמרת, התוכן לא. דלוק כברירת מחדל."""
+    app = paths
+    monkeypatch.setattr(app, "CAPTURE_TEXT", False)
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000191; IP: 012.000.000.191; Port: 4007;",
+        "DST(24): 00000210; IP: 012.000.000.210; Port: 4007;",
+        " Text: סודי",
+    ])
+    with app._dmr_lock:
+        card = list(app._dmr_msgs)[-1]
+    assert card["text"] is None
+    assert card["src"] == 191 and card["call_type"] == "sms"   # ההקשר נשמר
+
+
+def test_ars_registration_becomes_a_card(paths):
+    """ARS/טלמטריה/OTAP לא מדפיסים payload שאנחנו מפרסרים => שורת ה-DST היא
+    כל מה שנדע, והיא בכל זאת אירוע (איזה רדיו נרשם, מול מי)."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, [
+        "SRC(24): 00000210; IP: 012.000.000.210; Port: 4005;",
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4005;",
+    ])
+    with app._dmr_lock:
+        card = list(app._dmr_msgs)[-1]
+    assert card["call_type"] == "reg" and card["data_kind"] == "ars"
+    assert card["src"] == 210 and card["tgt"] == 64250
+
+
+def test_data_ctx_expires_and_does_not_leak_between_pdus(paths):
+    """הקשר של PDU אחד לא זולג למיקום של PDU אחר: תחילת SRC חדש מאפסת,
+    וגם חלון DATA_CTX_SEC פג."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    _feed_lines(app, ctx, ["SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;"], t0=1000.0)
+    # מיקום מאוחר בהרבה — ההקשר פג
+    event = dsd_pty.parse_dsd_line("Lat: 1.0 Lon: 2.0")
+    event["t"] = 1000.0 + app.DATA_CTX_SEC + 5
+    app._handle_datagram(event, ctx)
+    with app._dmr_lock:
+        assert list(app._dmr_msgs)[-1]["src"] is None
+    # ו-SRC חדש מאפס את ה-tgt של הקודם
+    ctx2 = app._new_listener_ctx()
+    _feed_lines(app, ctx2, [
+        "SRC(24): 00000018; IP: 012.000.000.018; Port: 4001;",
+        "DST(24): 00064250; IP: 013.000.250.250; Port: 4001;",
+        "SRC(24): 00000077; IP: 012.000.000.077; Port: 4001;",
+        "Lat: 5.0 Lon: 6.0",
+    ], t0=2000.0)
+    with app._dmr_lock:
+        card = list(app._dmr_msgs)[-1]
+    assert card["src"] == 77 and card["tgt"] is None      # לא ירש את 64250
+
+
+def test_position_cards_isolated_per_physical_channel(paths):
+    """ב-multi שני ערוצים יכולים לשלוח מיקום בו-זמנית — ההקשר מופרד לפי
+    phys_lcn, בדיוק כמו dedup/קורלציית-ההצפנה."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    for lcn, rid, lat in ((1, 18, 32.1), (2, 77, 31.5)):
+        for line in ("SRC(24): %08d; IP: 012.000.000.001; Port: 4001;" % rid,
+                     "Lat: %s Lon: 34.0" % lat):
+            event = dsd_pty.parse_dsd_line(line)
+            event.update(t=3000.0, phys_lcn=lcn, phys_freq_hz=164_000_000 + lcn)
+            app._handle_datagram(event, ctx)
+    with app._dmr_lock:
+        cards = {c["phys_lcn"]: c for c in app._dmr_msgs}
+    assert cards[1]["src"] == 18 and cards[1]["lat"] == 32.1
+    assert cards[2]["src"] == 77 and cards[2]["lat"] == 31.5

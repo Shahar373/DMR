@@ -114,6 +114,11 @@ WATCH_INTERVAL = 10.0
 # DMR_TRANSCRIBE=1 וגם הבינארי+המודל קיימים (install.sh בונה רק עם INSTALL_DMR_WHISPER=1).
 # הערה: תועלת נמוכה מ-ATC (DMR קצר/רב-לשוני/לעיתים מוצפן) — נשאר opt-in.
 TRANSCRIBE = os.environ.get("DMR_TRANSCRIBE", "").strip().lower() in ("1", "true", "yes", "on")
+# ★ v0.14.0 — תוכן הודעות טקסט (TMS, פורט 4007). דלוק כברירת מחדל: זו תעבורה
+# שהרשת משדרת בגלוי ו-DSD-FME מפענח, וזה בדיוק סוג המודיעין שהתחנה בנויה לו.
+# כיבוי: DMR_CAPTURE_TEXT=0 ב-/etc/dmr/dmr-web.env => המטא-דאטה (מי→מי, פורט,
+# אורך) נשמר כרגיל וה**תוכן** לא נשמר ולא מוצג.
+CAPTURE_TEXT = os.environ.get("DMR_CAPTURE_TEXT", "1").strip().lower() not in ("0", "false", "no", "off")
 WHISPER_BIN = os.environ.get("DMR_WHISPER_BIN", "/usr/local/bin/whisper-cli")
 WHISPER_MODEL = os.environ.get("DMR_WHISPER_MODEL", "/opt/dmr/models/ggml-base.bin")
 WHISPER_LANG = os.environ.get("DMR_WHISPER_LANG", "auto")
@@ -569,8 +574,22 @@ FEED_WINDOW_SEC = 60.0
 _LISTENER_INTERNAL_KEYS = ("_start",)   # מפתחות-עבודה שלא נכתבים לארכיון
 
 
+DATA_CTX_SEC = 5.0   # חלון קורלציית שכבת-הדאטה (ip_data → position/text)
+
+
 def _new_listener_ctx():
-    return {"dedup": {}, "slot_open": {}, "pending": {}, "seen": 0, "last_sweep": 0.0}
+    return {"dedup": {}, "slot_open": {}, "pending": {}, "seen": 0, "last_sweep": 0.0,
+            # ★ v0.14.0 — הקשר PDU-דאטה פר-ערוץ פיזי: {phys_lcn: (t, {...})}.
+            # שורות ה-SRC(24)/DST(24) מודפסות **לפני** ה-payload של אותו PDU
+            # (dmr_pdu.c), ולכן ה-RID/פורט של המיקום או ההודעה שיגיעו מיד
+            # אחריהם נמצא כאן. אותו דפוס בדיוק כמו _slot_open_call של ההצפנה,
+            # עם חלון קצר יותר — זו סמיכות-שורות באותו PDU, לא חלון-שיחה.
+            "data_ctx": {},
+            # כרטיס המיקום הפתוח פר-ערוץ. שדות ה-LRRP הנוספים (רדיוס/גובה/
+            # מהירות/כיוון) מודפסים **אחרי** שורת ה-Lat/Lon — כלומר אחרי שהכרטיס
+            # נוצר => מוטציה, בדיוק כמו תג-ההצפנה על שיחה פתוחה. `Time:` לעומת
+            # זאת מודפס **לפני**, ולכן הוא נכנס דרך data_ctx.
+            "pos_open": {}}
 
 
 _listener_ctx = _new_listener_ctx()   # מודולרי (לא לוקאלי ל-thread) כדי ש-
@@ -644,6 +663,75 @@ def _reset_listener_ctx():
     return _listener_ctx
 
 
+_DATA_CTX_FIELDS = ("kind", "port", "fix_time", "radius_m", "alt_m",
+                    "speed_kmh", "track_deg")
+_LRRP_EXTRA_FIELDS = ("fix_time", "radius_m", "alt_m", "speed_kmh", "track_deg")
+# סוגי PDU שאין להם שורת-payload שאנחנו מפרסרים — שורת ה-DST היא האירוע.
+_DATA_KINDS_NO_PAYLOAD = frozenset({"ars", "telemetry", "otap", "battery",
+                                    "jobticket", "xcmp"})
+
+
+def _apply_lrrp_extra(ctx, phys_lcn, msg, now=None):
+    """מחיל שדה-לוואי של LRRP על כרטיס המיקום הפתוח באותו ערוץ. מחזיר True אם
+    הוחל. מוטציה תחת _dmr_lock — הרשומה חיה גם ב-_dmr_msgs וגם ב-pending
+    (ולכן היא תיכתב לארכיון עם השדות, ולא בלעדיהם)."""
+    entry = ctx["pos_open"].get(phys_lcn)
+    if entry is None:
+        return False
+    now = _float_or_none(msg.get("t")) or (now if now is not None else time.time())
+    if now - entry[0] > DATA_CTX_SEC:
+        return False
+    applied = False
+    with _dmr_lock:
+        for key in _LRRP_EXTRA_FIELDS:
+            if msg.get(key) is not None:
+                entry[1][key] = msg[key]
+                applied = True
+    return applied
+
+
+def _data_ctx_update(ctx, phys_lcn, msg):
+    """צובר הקשר-PDU: `ip_data` (RID+פורט, role=src/dst) ו-`lrrp_extra`
+    (זמן/רדיוס/גובה/מהירות/כיוון, כל אחד בשורה נפרדת). מתאפס בכל `ip_data`
+    עם role=src — זו תחילת PDU חדש, ואסור שנתון מ-PDU קודם ידלוף פנימה."""
+    now = _float_or_none(msg.get("t")) or time.time()
+    entry = ctx["data_ctx"].get(phys_lcn)
+    fresh = entry is None or now - entry[0] > DATA_CTX_SEC
+    if msg.get("type") == "ip_data" and msg.get("role") == "src":
+        fresh = True     # תחילת PDU חדש
+    data = {} if fresh else dict(entry[1])
+    if msg.get("type") == "ip_data":
+        rid = _int_or_none(msg.get("rid"))
+        if msg.get("role") == "dst":
+            data["tgt"] = rid
+        else:
+            data["src"] = rid
+        for key in ("kind", "port"):
+            if msg.get(key) is not None:
+                data[key] = msg[key]
+    else:
+        for key in _DATA_CTX_FIELDS:
+            if msg.get(key) is not None:
+                data[key] = msg[key]
+    ctx["data_ctx"][phys_lcn] = (now, data)
+    if len(ctx["data_ctx"]) > 2 * MULTI_CHANNELS_MAX:
+        cutoff = now - DATA_CTX_SEC
+        for key in [k for k, (t0, _) in ctx["data_ctx"].items() if t0 < cutoff]:
+            del ctx["data_ctx"][key]
+
+
+def _data_ctx_take(ctx, phys_lcn, now=None):
+    """ההקשר הפעיל לערוץ, או {} אם אין/פג. לא מוחק — PDU יחיד יכול לייצר גם
+    מיקום וגם שדות-לוואי, וכולם שייכים לאותו הקשר."""
+    entry = ctx["data_ctx"].get(phys_lcn)
+    if entry is None:
+        return {}
+    now = now if now is not None else time.time()
+    if now - entry[0] > DATA_CTX_SEC:
+        return {}
+    return dict(entry[1])
+
+
 def _archive_record(rec):
     """עותק לכתיבה לדיסק, בלי מפתחות-העבודה הפנימיים."""
     return {k: v for k, v in rec.items() if k not in _LISTENER_INTERNAL_KEYS}
@@ -682,7 +770,17 @@ def _float_or_none(v):
         return None
 
 
-_CARD_EVENT_TYPES = frozenset({"voice_call", "data_header", "lrrp_position", "lrrp_request"})
+_CARD_EVENT_TYPES = frozenset({"voice_call", "data_header", "lrrp_position",
+                               "lrrp_request", "text_message",
+                               # ip_data מגיע לכאן **רק** מהענף של
+                               # _DATA_KINDS_NO_PAYLOAD ב-_handle_datagram
+                               # (ARS/טלמטריה/וכו'); שאר ה-PDU-ים יוצאים
+                               # מוקדם ומקבלים כרטיס מה-payload שלהם.
+                               "ip_data"})
+# ★ v0.14.0 — פורט ה-UDP של PDU-דאטה => סוג הכרטיס. הפורט מגיע מהשידור
+# (dsd_pty.DATA_PORT_KINDS, מאומת על 4001 בקליטה שלנו), לא מניחוש תוכן.
+_DATA_KIND_CALL_TYPES = {"lrrp": "lrrp", "text": "sms", "ars": "reg",
+                         "cellocator": "lrrp"}
 # תג-ההצפנה הגנרי. DSD-FME לא הדפיס ALG/KEY בקליטה שנבדקה => alg/key_id
 # נשארים None (CLAUDE.md §8). מקור אחד לשני המסלולים: דגל ה-SO על שורת
 # השיחה (_normalize_dsd) וקורלציית ה-Protected LC (_dmr_listener).
@@ -741,7 +839,11 @@ def _normalize_dsd(m):
     else:
         freq = _channelmap_freq(lcn)
         card_lcn = lcn
-    ct = str(m.get("call_type") or "data").strip().lower()
+    # סוג הכרטיס: מה-payload עצמו אם הוא הצהיר, אחרת מפורט ה-UDP של ה-PDU
+    # (שכבת ה-Data, v0.14.0) — שני המקורות מהשידור, אף אחד לא ניחוש.
+    ct = str(m.get("call_type") or "").strip().lower()
+    if not ct:
+        ct = _DATA_KIND_CALL_TYPES.get(m.get("kind"), "data")
     if ct not in DMR_CALL_TYPES:
         ct = "data"
     category, group = DMR_CALL_TYPES[ct]
@@ -774,8 +876,17 @@ def _normalize_dsd(m):
         "dur": None, "event": typ,
         "lat": round(lat, 5) if lat is not None else None,
         "lon": round(lon, 5) if lon is not None else None,
-        "text": None, "wav": None,
+        "text": (str(m.get("text"))[:500] if m.get("text") and CAPTURE_TEXT else None),
+        "wav": None,
         "delivery": m.get("delivery"),   # אופציונלי (data_header בלבד)
+        # ★ v0.14.0 שכבת ה-Data — כולם None אלא אם השידור נשא אותם בפועל.
+        "data_kind": m.get("kind"),      # lrrp/text/ars/telemetry/... מפורט ה-UDP
+        "data_port": _int_or_none(m.get("port")),
+        "fix_time": m.get("fix_time"),
+        "speed_kmh": _float_or_none(m.get("speed_kmh")),
+        "track_deg": _int_or_none(m.get("track_deg")),
+        "alt_m": _int_or_none(m.get("alt_m")),
+        "radius_m": _int_or_none(m.get("radius_m")),
     }
     if card["encrypted"]:
         card["enc"] = dict(ENC_TAG)
@@ -1109,6 +1220,31 @@ def _handle_datagram(msg, ctx):
                 entry[1]["enc"] = entry[1].get("enc") or dict(ENC_TAG)
         return
 
+    # --- ★ v0.14.0 שכבת ה-Data: הקשר PDU (RID + פורט) ואז ה-payload ---------
+    if mtype == "ip_data":
+        _data_ctx_update(ctx, msg_phys_lcn, msg)
+        # רוב סוגי ה-PDU (ARS/טלמטריה/OTAP/סוללה/משימות/XCMP) לא מדפיסים אחר-כך
+        # שום שורה שאנחנו מפרסרים ⇒ שורת ה-DST היא כל מה שנדע עליהם אי-פעם,
+        # והיא בכל זאת אירוע אמיתי (מי→מי, איזה שירות). ל-lrrp/text יש payload
+        # שייצר את הכרטיס, ולכן הם **לא** מייצרים כרטיס כאן (אחרת כפול).
+        if msg.get("role") == "dst" and msg.get("kind") in _DATA_KINDS_NO_PAYLOAD:
+            msg = {**_data_ctx_take(ctx, msg_phys_lcn,
+                                    now=_float_or_none(msg.get("t"))),
+                   "type": "ip_data", "kind": msg.get("kind"),
+                   "port": msg.get("port"), "t": msg.get("t")}
+        else:
+            return
+    elif mtype == "lrrp_extra":
+        # אחרי הכרטיס => מוטציה עליו; לפניו (Time:) => הקשר לכרטיס שיבוא.
+        if not _apply_lrrp_extra(ctx, msg_phys_lcn, msg):
+            _data_ctx_update(ctx, msg_phys_lcn, msg)
+        return
+    if mtype in ("lrrp_position", "text_message"):
+        # מעשירים את האירוע מההקשר לפני הנרמול, כדי ש-_normalize_dsd יישאר
+        # פונקציה טהורה של dict בודד (אפשר לבדוק אותה ישירות).
+        msg = {**_data_ctx_take(ctx, msg_phys_lcn, now=_float_or_none(msg.get("t"))),
+               **msg}
+
     if mtype == "voice_miss":
         # שורה שנראתה כמו שיחה ולא נתפסה ע"י ה-regex (ר' dsd_pty).
         # לא כרטיס — מונה גלוי ב-/api/rf, כדי שהמקרה לא ייעלם בשקט שוב.
@@ -1166,6 +1302,12 @@ def _handle_datagram(msg, ctx):
     # (data/lrrp) אינם עוברים dedup ואינם מקבלים תג-הצפנה => נכתבים מיד.
     if is_voice:
         ctx["pending"][key] = (ts, rec)
+    elif mtype == "lrrp_position":
+        # ★ v0.14.0 — כרטיס מיקום עוד עשוי לקבל מהירות/כיוון/גובה/רדיוס
+        # בשורות שאחרי ה-Lat/Lon, אז אסור לכתוב אותו מיד; אחרת חוזר בדיוק
+        # הבאג של v0.13.0 (הארכיון קופא לפני שהמידע הצטבר).
+        ctx["pending"][("pos", rec["id"])] = (ts, rec)
+        ctx["pos_open"][rec.get("phys_lcn")] = (ts, rec)
     else:
         _append_dmr_log(_archive_record(rec))
     if is_voice and rec.get("slot") is not None:

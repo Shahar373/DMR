@@ -127,9 +127,9 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 314 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
-  fixtures/dsdfme_source_shapes.csv # ★ 16 צורות שנגזרו מקוד-המקור של DSD-FME
+  fixtures/dsdfme_source_shapes.csv # ★ 24 צורות שנגזרו מקוד-המקור של DSD-FME
                             #   (מצבים שהרשת לא שידרה), כל שורה עם provenance.
                             #   ⚠ קובץ נפרד במוצהר — אל תערבבו עם הקליטה. ר' §7.
 .github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
@@ -206,6 +206,19 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 ב
   data/lrrp נכתבים מיד (אינם משתנים). ⚠ `CALL_CLOSE_SEC` חייב להישאר גדול
   **משני** החלונות שממתתים כרטיס — dedup (8ש') וקורלציית-הצפנה (15ש'); אם
   משנים אחד מהם, עדכנו גם אותו. מחיר מודע: קריסה מאבדת שיחות פתוחות (≤20ש').
+- **★ שכבת ה-Data (v0.14.0) — סיווג לפי פורט + קורלציית-PDU:** שורות
+  `SRC(24):`/`DST(24):` (שנזרקו כ-housekeeping עד v0.13.0) נושאות את ה-RID של
+  השולח/היעד **ואת פורט ה-UDP**, והפורט הוא מסווג סוג-הדאטה
+  (`dsd_pty.DATA_PORT_KINDS`: 4001=lrrp, 4005=ars, 4007=text ...). הן מודפסות
+  **לפני** ה-payload באותו PDU, ולכן `ctx["data_ctx"]` (פר-`phys_lcn`, חלון
+  `DATA_CTX_SEC`=5s) מחזיק אותן והכרטיס הבא יורש `src`/`tgt`/`kind`/`port`.
+  ⚠ `role="src"` **מאפס** את ההקשר — זו תחילת PDU חדש, ואסור שנתון מ-PDU קודם
+  ידלוף. שדות ה-LRRP הנוספים מתחלקים לשני כיוונים: `Time:` מודפס לפני שורת
+  ה-Lat/Lon (⇒ הקשר), והשאר אחריה (⇒ מוטציה על הכרטיס דרך
+  `_apply_lrrp_extra`/`ctx["pos_open"]`). **ולכן כרטיסי מיקום נדחים לכתיבה
+  כמו שיחות-קול** — כתיבה מיידית הייתה מחזירה בדיוק את באג-הארכיון של v0.13.0.
+  ⚠ `_data_ctx_take`/`_apply_lrrp_extra` מקבלים `now` מה-`t` של האירוע ולא
+  מ-`time.time()` — אחרת כל בדיקה עם זמנים סינתטיים רואה הקשר "פג".
 - **★ חיוניות: "רשת שקטה" מול "שרשרת מתה" (v0.13.0):** `_feed_tick` נרשם על
   **כל** דאטהגרם — לפני הדיספאץ' ולפני כל פרסור, כדי שגם דאטהגרם בעייתי
   ייספר. `_feed_snapshot` מחזיר עובדות בלבד (חלון `FEED_WINDOW_SEC`=60s פר
@@ -302,7 +315,9 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 ב
   (air-time+שיחות פר-TG + heatmap שעתי 0–23). `_rid_tg_graph` (who-talks-to-whom,
   צירי RID→TG ממושקלים, רק שיחות קבוצה). `_lrrp_snapshot` (מיקום אחרון-ידוע פר-RID
   מהזיכרון — "עכשיו" בלבד, כמו `adsb.aircraft_snapshot` ב-AIR-AM; ריק אם הרשת לא
-  שולחת LRRP סטנדרטי — Motorola proprietary לא מפוענח ע"י DSD-FME).
+  שולחת LRRP על פורט 4001; ר' §5 "שכבת ה-Data" — ⚠ הטענה הקודמת כאן,
+  ש"Motorola proprietary לא מפוענח", **הייתה שגויה**: הקואורדינטות פוענחו כל
+  הזמן ויש דגימה בפיקסצ'ר; מה שנזרק היה השורה שנושאת את ה-RID).
   `_unknown_aliases` (worklist: RID-source+target ו-TG שנצפו בתעבורה אך `aliasdb`
   לא פותר **כרגע** — ממוין לפי count; `/api/aliases/unknown`, פאנל ב-UI).
 - **הקלטות:** `_activity_watcher`/`_sweep_recordings` (retention), `_transcribe_worker`
@@ -333,7 +348,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 ב
 | GET | `/api/analytics/encryption` | ניתוח הצפנה: היסטוגרמת ALG + %מוצפן פר-TG (`?day=`/`?all=1`) |
 | GET | `/api/analytics/traffic` | אנליטיקת תעבורה: air-time/TG + heatmap שעתי (`?day=`/`?all=1`) |
 | GET | `/api/analytics/graph` | גרף RID↔TG (who-talks-to-whom) (`?day=`/`?all=1`) |
-| GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו") |
+| GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו"). ★ v0.14.0: עובד בפועל — ה-RID מגיע מ-`ip_data` |
 | GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge` + `by_channel` (Phase 7, `multi` בלבד) + ★ `parser_miss`/`handler_errors`. **אין dBFS/SNR** |
 | POST | `/api/gain` | נוד-רווח חי (`{direction: up\|down}`) — הקשת g/G, בלי לעצור את DSD-FME |
 | GET | `/api/activity` | הקלטות אחרונות |
@@ -348,7 +363,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (302 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (314 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -545,7 +560,9 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   `/api/analytics/encryption`+`/api/analytics/traffic`, כרטיסייה 📊 ניתוח ב-UI.
 - **Phase 3 (הושלם):** גרף RID↔TG (who-talks-to-whom, `/api/analytics/graph`) + מפת
   GPS/LRRP (`/api/positions` + Leaflet vendored, lazy-load). מוצג ריק בשקט כשהרשת
-  לא שולחת LRRP סטנדרטי (Motorola proprietary אינו מפוענח ע"י DSD-FME).
+  לא שולחת LRRP על פורט 4001. ⚠ תוקן ב-v0.14.0: הריקנות **לא** נבעה מ-
+  "Motorola proprietary" אלא מבאג אצלנו (`_RE_LRRP_POS` דרש src שלא יכול
+  להתאים) — ר' §5 "שכבת ה-Data".
 - **Phase 4 (הושלם):** `parse_dsd_line` נכתב מחדש מול **קליטה אמיתית** (20,000 שורות,
   רשת Cap+/SLCO רב-אתרית) במקום ניחוש — replay מלא מאמת 68/68 צורות (§7). תוקנו:
   סינון housekeeping במקור (~80% מהפלט), סמנטיקת tg/tgt (group call: tgt=tg עצמו),
@@ -742,6 +759,17 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   **Talker Alias** (הרדיואים משדרים את שמם; `dsd_alias.c:744` — ⚠ אפס דגימות
   בקליטה שלנו, נוכחות דורשת חלון-שדה), ו"למצוא ולשמוע" (השמעת הקלטות בפועל,
   חיפוש חוצה-ימים בשרת, click-through מפאנלי הניתוח לשיחות).
+- **v0.14.0 — שכבת ה-Data (קוד+CI+חזותי; תדירות בשטח טרם נמדדה):** הראשון
+  משלושת הכיוונים שנבחרו בסבב v0.13.0. תיקן את `/api/positions` שהיה ריק
+  **מבנית** (`_RE_LRRP_POS` דרש `src` שלא יכול להתאים — ר' §5), והוסיף סיווג
+  PDU לפי פורט UDP, הודעות טקסט (TMS, תוכן דלוק כברירת-מחדל עם
+  `DMR_CAPTURE_TEXT=0` לכיבוי), כרטיס לרישום ARS, ושדות מהירות/כיוון/גובה/
+  רדיוס/זמן-fix. מפת Phase 3 מציגה נקודות בפעם הראשונה. 314 בדיקות (302→314).
+  ⚠ **מה שטרם נמדד בשטח:** האם הרשת שלנו בכלל שולחת TMS/ARS/טלמטריה — בקליטה
+  שנבדקה נצפה **רק** פורט 4001. שאר הפורטים נגזרו מקוד-המקור, והנוכחות שלהם
+  היא שאלת חלון-שדה. אם `data_kind` נשאר תמיד `lrrp` — זו תשובה, לא באג.
+  **הנותרים מהכיוונים שנבחרו:** Talker Alias, ו"למצוא ולשמוע" (השמעת הקלטות,
+  חיפוש חוצה-ימים, click-through) — שהוא גם מה שיסגור את נגן-ההקלטות המת.
 - **⚠ תוקן בתיעוד (v0.13.0) — שתי טענות שהיו נכונות ואינן:**
   1. **מד dBFS *אינו* דורש עוד פטצ' קוד C.** הנימוק ב-§8 ("אין side-channel
      ב-`rsp_tcp`") נכתב לארכיטקטורה של **לפני** v0.4.0, כשהגשר לא היה שלנו.

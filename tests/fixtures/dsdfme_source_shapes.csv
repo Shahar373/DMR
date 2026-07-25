@@ -21,3 +21,11 @@ source:dmr_flco.c:667,voice_call,SLOT 1 TGT=3 SRC=2120 Group Hytera Call,fid == 
 source:dmr_flco.c:668,voice_call,SLOT 1 TGT=3 SRC=2120 Group XPT Call,is_xpt
 source:dmr_flco.c:679,voice_call,SLOT 1 TGT=3 SRC=2120 Group Kenwood Scrambler Call,is_kenwood_sc
 source:dmr_flco.c:511,voice_call,SLOT 1 TGT=3 SRC=2120 FLCO=0x04 FID=0x10 SVC=0x80 Cap+ Group Emergency Call,מצב ‎-Z/payload מוסיף FLCO/FID/SVC לפני Cap+
+source:dmr_pdu.c:735,lrrp_extra, Time: 2026.07.25 10:15:30,חתימת-זמן של ה-fix — מודפסת *לפני* שורת ה-Lat/Lon
+source:dmr_pdu.c:778,lrrp_extra, Radius: 12m,דיוק המיקום
+source:dmr_pdu.c:782,lrrp_extra, Altitude: 45m,גובה
+source:dmr_pdu.c:786,lrrp_extra, Speed: 3.5000 m/s 12.6000 km/h 7.8271 mph,מהירות — נשמר ב-km/h
+source:dmr_pdu.c:791,lrrp_extra, Track: 271,כיוון תנועה במעלות
+source:dmr_pdu.c:377,text_message, Text: מגיע בעוד 5 דקות,תוכן הודעת TMS (פורט 4007) — UTF-16 במקור
+source:dmr_pdu.c:371,ip_data,SRC(24): 00000210; IP: 012.000.000.210; Port: 4005;,ARS — רישום/נוכחות רדיו
+source:dmr_pdu.c:467,ip_data,SRC(24): 00000018; IP: 012.000.000.018; Port: 4008;,טלמטריה

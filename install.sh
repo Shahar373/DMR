@@ -190,6 +190,9 @@ if [[ ! -f /etc/dmr/dmr-web.env ]]; then
 # DMR web control - משתני סביבה.
 # כדי לדרוש PIN לשינוי מצב/מערכת, בטל את ההערה (ואז: systemctl restart dmr-web):
 # DMR_PIN=1234
+# תוכן הודעות טקסט (TMS, פורט 4007) נשמר ומוצג כברירת מחדל. לשמור מטא-דאטה
+# בלבד (מי->מי, פורט) בלי התוכן, בטל את ההערה:
+# DMR_CAPTURE_TEXT=0
 WEBEOF
 fi
 chown -R dmr:dmr /etc/dmr

@@ -406,8 +406,12 @@ button.btn:disabled{ opacity:.5; cursor:default; }
 
     <div class="card">
       <h2>📍 מפת LRRP <span class="muted" style="font-weight:400">(מיקום רדיו אחרון-ידוע)</span></h2>
+      <div class="muted hidden" id="lrrpCloudWarn" style="margin-bottom:6px">
+        ⚠ אריחי הרקע נטענים מ-OpenStreetMap — צפייה במפה חושפת לשרת חיצוני את
+        אזור הקואורדינטות. שאר התחנה מקומית לחלוטין.
+      </div>
       <div id="lrrpMap"></div>
-      <div class="muted" id="lrrpNote" style="margin-top:6px">מוצג רק כשהרשת שולחת LRRP סטנדרטי (לא Motorola proprietary).</div>
+      <div class="muted" id="lrrpNote" style="margin-top:6px">מוצג כשהרשת שולחת LRRP על פורט 4001 (מיקום פר-RID, אחרון-ידוע).</div>
     </div>
   </div>
 
@@ -1055,6 +1059,13 @@ $("gainUp").onclick = ()=>nudgeGain("up");
 $("gainDown").onclick = ()=>nudgeGain("down");
 
 // ---------- call feed ----------
+// סוג ה-PDU לפי פורט ה-UDP (dsd_pty.DATA_PORT_KINDS). lrrp לא מקבל תג כי
+// ה-category שלו כבר אומר "מיקום".
+const DATA_KIND_LABELS = {
+  text: "✉ הודעה", ars: "📋 רישום", telemetry: "📊 טלמטריה",
+  otap: "⬇ תכנות מרחוק", battery: "🔋 סוללה", jobticket: "🎫 משימה",
+  xcmp: "⚙ ניהול-רדיו", cellocator: "🚗 Cellocator",
+};
 function callCard(m){
   const tags=[];
   // ★ v0.13.0 — חירום ראשון בתור: עד עכשיו שיחות Emergency נדחו ע"י הפרסר
@@ -1067,6 +1078,12 @@ function callCard(m){
   if(m.cc!=null) tags.push(`<span class="tag">CC${m.cc}</span>`);
   if(m.encrypted) tags.push(`<span class="tag enc">🔒 ${esc((m.enc&&m.enc.alg_name)||"מוצפן")}</span>`);
   if(m.watchlist) tags.push(`<span class="tag warn">🔔 מעקב</span>`);
+  // ★ v0.14.0 שכבת ה-Data: הסוג נגזר מפורט ה-UDP של ה-PDU, לא מניחוש תוכן.
+  if(m.data_kind && m.data_kind!=="lrrp") tags.push(
+    `<span class="tag">${esc(DATA_KIND_LABELS[m.data_kind]||m.data_kind)}</span>`);
+  if(m.speed_kmh!=null) tags.push(`<span class="tag mono">${esc(m.speed_kmh)} קמ"ש</span>`);
+  if(m.track_deg!=null) tags.push(`<span class="tag mono">↗ ${esc(m.track_deg)}°</span>`);
+  if(m.alt_m!=null) tags.push(`<span class="tag mono">↑ ${esc(m.alt_m)}מ'</span>`);
   if(m.ber!=null) tags.push(`<span class="tag mono">BER ${m.ber}</span>`);
   const tg = m.tg!=null ? `TG ${m.tg}${m.tg_alias?" · "+esc(m.tg_alias):""}` : (m.tgt!=null?`→ ${m.tgt}`:"—");
   const rid = m.src!=null ? `RID ${m.src}${m.src_alias?" · "+esc(m.src_alias):""}` : "";
@@ -1235,7 +1252,12 @@ function ensureLeafletMap(){
     const s=document.createElement("script");
     s.src="/static/vendor/leaflet/leaflet.js";
     s.onload=()=>{ anMap=L.map("lrrpMap").setView([32.0114,34.8867],8);
+      // ⚠ סטייה מודעת מ-§1 ("פרטי-מקומי, בלי ענן"): אריחי הרקע נטענים
+      // מ-tile.openstreetmap.org, כלומר צפייה במפה חושפת לשרת חיצוני את אזור
+      // הקואורדינטות שנצפה. Leaflet עצמו כן vendored (בלי CDN). ההחלטה
+      // להשאיר את זה מתועדת ב-CLAUDE.md §8 + אזהרה גלויה מעל המפה.
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18}).addTo(anMap);
+      const w=$("lrrpCloudWarn"); if(w) w.classList.remove("hidden");
       res(); };
     document.head.appendChild(s);
   });
