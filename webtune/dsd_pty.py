@@ -36,10 +36,34 @@ RSP_FM_BIN = os.environ.get(
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 # --- DSD-FME output parsing -------------------------------------------------
+# ★ v0.13.0 — דגלי Service Option על שורת-השיחה.
+# עד כה ה-regex הרשה רק "TXI" בין Group/Private לבין "Call", כי 20,000 השורות
+# שנקלטו הכילו רק SO=0x00 ו-SO=0x20. אבל dmr_flco.c (audio_work) מדפיס שם עד
+# עשרה טוקנים נוספים — וכל אחד מהם הפיל את **הכרטיס כולו** בשקט, כולל
+# "Emergency" (so & 0x80) ו-"Encrypted" (so & 0x40). סדר ההדפסה, מהמקור:
+#   Group|Private → Emergency → Encrypted → TXI → RPT → Broadcast → OVCM →
+#   Priority 1|2|3|No Priority → Kirisun → Hytera → XPT → [Group|Private שוב,
+#   ל-Hytera FID 0x68] → Kenwood Scrambler → "Call " → [Rest LSN: N]
+# (dmr_flco.c:545,556,616,622,628,634,643-655,666-681)
+_VOICE_MOD_TOKENS = (
+    "Emergency", "Encrypted", "TXI", "RPT", "Broadcast", "OVCM",
+    "Priority 1", "Priority 2", "Priority 3", "No Priority",
+    "Kenwood Scrambler", "Kirisun", "Hytera", "XPT", "Group", "Private",
+)
 _RE_VOICE_CALL = re.compile(
     r"SLOT\s+(?P<slot>\d)\s+TGT=(?P<tgt>\d+)\s+SRC=(?P<src>\d+)\s+"
-    r"(?:Cap\+\s+)?(?P<kind>Group|Private|Unit to Unit)(?:\s+TXI)?\s+Call"
-    r"(?:\s+Rest LSN:\s*(?P<rest_lsn>\d+))?", re.I)
+    # ‎-Z/payload mode מוסיף כאן HASH=/FLCO=/FID=/SVC= (dmr_flco.c:509-511);
+    # אנחנו לא מפעילים אותו, אבל אין סיבה שהכרטיס ייפול אם מישהו יפעיל.
+    r"(?:[A-Z]+=\S+\s+)*"
+    r"(?:Cap\+\s+)?(?P<kind>Group|Private|Unit to Unit)\s+"
+    r"(?P<mods>(?:(?:" + "|".join(_VOICE_MOD_TOKENS) + r")\s+)*)"
+    r"Call(?:\s+Rest LSN:\s*(?P<rest_lsn>\d+))?", re.I)
+# גלאי-החמצה: שורה שנראית כמו שיחה אך לא נתפסה ע"י ה-regex המדויק. הלקח
+# מהבאג הזה הוא לא "להוסיף עוד טוקנים" אלא **שלעולם לא ניפול בשקט** — גרסת
+# DSD-FME אחרת/וונדור אחר יפיקו טוקן שאיננו מכירים, ואז נדע במקום לנחש.
+# נבדק **אחרון** ב-parse_dsd_line, אחרי שכל התבניות האחרות לא התאימו.
+_RE_VOICE_CALL_LOOSE = re.compile(
+    r"SLOT\s+\d+\s+TGT=\d+\s+SRC=\d+\b.*\bCall\b", re.I)
 _RE_DATA_HEADER = re.compile(
     r"Slot\s+(?P<slot>\d)\s+Data Header\s*-\s*(?P<addr>Indiv|Group)\s*-\s*"
     r"(?P<delivery>Confirmed Delivery|Unconfirmed Delivery|Response Packet)"
@@ -93,6 +117,30 @@ _RE_SITE_INFO = re.compile(
     r"\s*-\s*RS:\s*(?P<rs>\d+)", re.I)
 
 
+def parse_voice_flags(mods):
+    """★ טהורה: רצף טוקני ה-Service Option שנתפס ב-_RE_VOICE_CALL → שדות מוקלדים.
+    מחזירה רק את מה שנצפה בשורה (אין ברירות-מחדל מומצאות): `emergency` תמיד
+    bool כי הוא הדגל שמניע התראה, `priority` הוא int או None, ו-`flags` היא
+    רשימת הטוקנים שזוהו כפי-שהם — כדי שהמידע לא ייעלם גם אם עוד לא בנינו לו
+    שדה משלו. `encrypted` נקבע כאן **מהמקור** (SO bit 0x40) ולא מקורלציית
+    ה-`Protected LC` של app.py, שנשארת כ-fallback לרשתות שלא מדפיסות את הדגל."""
+    tokens = [t for t in (mods or "").split() if t]
+    joined = " ".join(tokens)
+    out = {"emergency": "emergency" in joined.lower()}
+    flags = []
+    for token in _VOICE_MOD_TOKENS:
+        if re.search(r"\b" + re.escape(token) + r"\b", joined, re.I):
+            flags.append(token)
+    if flags:
+        out["flags"] = flags
+    if re.search(r"\bEncrypted\b", joined, re.I):
+        out["encrypted"] = True
+    priority = re.search(r"\bPriority\s+(\d)\b", joined, re.I)
+    if priority:
+        out["priority"] = int(priority.group(1))
+    return out
+
+
 def clean_dsd_line(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "").strip()
 
@@ -135,6 +183,7 @@ def parse_dsd_line(text, emit_status=False):
             event["tgt"] = int(match.group("tgt"))
         if match.group("rest_lsn"):
             event["lcn"] = int(match.group("rest_lsn"))
+        event.update(parse_voice_flags(match.group("mods")))
         return event
 
     match = _RE_DATA_HEADER.search(text)
@@ -244,6 +293,11 @@ def parse_dsd_line(text, emit_status=False):
                     {"lsn": int(lsn), "state": state} for lsn, state in states
                 ]
             return event
+
+    # ★ אחרון: שורה שנראית כמו שיחה אך אף תבנית לא תפסה אותה. לא כרטיס — אירוע
+    # אבחון, כדי שהמקרה הזה יופיע ב-/api/rf במקום להיעלם (ר' _RE_VOICE_CALL_LOOSE).
+    if _RE_VOICE_CALL_LOOSE.search(text):
+        return {"type": "voice_miss", "text": text[:200]}
 
     return None
 

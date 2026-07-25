@@ -52,6 +52,7 @@ def test_parse_voice_call_group():
     assert event == {
         "type": "voice_call", "slot": 1, "src": 2120,
         "call_type": "group", "crc_err": False, "tg": 3, "lcn": 5,
+        "emergency": False,
     }
 
 
@@ -1016,3 +1017,356 @@ def test_emit_status_replay_reclassifies_channel_status():
             assert event and event["type"] == "channel_status"
         elif row["orig_type"] == "quality":
             assert event and event["type"] == "quality"
+
+
+# ============================================================================
+#  ★ v0.13.0 — כשלים שקטים: הפרסר, הארכיון, שרידות ה-listener, וחיוניות
+# ============================================================================
+SOURCE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "dsdfme_source_shapes.csv"
+
+
+def _load_source_fixture():
+    """צורות שנגזרו מקוד-המקור של DSD-FME (לא מקליטה) — ר' הכותרת בקובץ.
+    שורות ההסבר (#) מדולגות."""
+    with SOURCE_FIXTURE.open(encoding="utf-8") as handle:
+        return [r for r in csv.DictReader(handle)
+                if r["provenance"] and not r["provenance"].startswith("#")]
+
+
+def test_source_fixture_shapes_all_parse():
+    """★ הבדיקה המרכזית של התיקון: כל 16 וריאציות ה-Service Option מייצרות
+    כרטיס. לפני v0.13.0 שמונה מתוך תשע מהן נדחו ע"י ה-regex — כלומר שיחת
+    חירום, שיחה מוצפנת ושיחת-עדיפות **לא הופיעו בשום מקום** במערכת."""
+    rows = _load_source_fixture()
+    assert len(rows) >= 16
+    dropped = []
+    for row in rows:
+        event = dsd_pty.parse_dsd_line(row["raw_line"])
+        if not event or event["type"] != row["orig_type"]:
+            dropped.append((row["provenance"], row["raw_line"]))
+    assert not dropped
+
+
+def test_source_fixture_provenance_is_explicit():
+    """כל שורה בפיקסצ'ר הזה חייבת לסמן מאיפה היא — כדי שלא תיווצר אשליה
+    שמדובר בקליטה אמיתית (הפרדה מוצהרת מ-capplus_slco_sample.csv)."""
+    for row in _load_source_fixture():
+        assert row["provenance"].startswith("source:")
+        assert ".c:" in row["provenance"]
+
+
+def test_parse_voice_flags_extracts_service_options():
+    """טהורה: רצף הטוקנים → שדות. סדר הטוקנים הוא סדר ההדפסה של dmr_flco.c."""
+    flags = dsd_pty.parse_voice_flags("Emergency Encrypted TXI RPT Broadcast OVCM Priority 2 ")
+    assert flags["emergency"] is True
+    assert flags["encrypted"] is True
+    assert flags["priority"] == 2
+    assert flags["flags"] == ["Emergency", "Encrypted", "TXI", "RPT",
+                              "Broadcast", "OVCM", "Priority 2"]
+
+
+def test_parse_voice_flags_empty_run_is_not_emergency():
+    """שיחה רגילה: emergency=False מפורש (bool ולא None — הוא מניע התראה),
+    ובלי flags/priority/encrypted מומצאים."""
+    flags = dsd_pty.parse_voice_flags("")
+    assert flags == {"emergency": False}
+
+
+def test_voice_miss_event_for_unknown_modifier():
+    """★ הלקח האמיתי מהבאג: טוקן שלא מוכר לנו לא ייעלם בשקט. גרסת DSD-FME
+    אחרת/וונדור אחר יפיקו מודיפיקטור חדש — ואז נדע, במקום לגלות בעוד שנה."""
+    event = dsd_pty.parse_dsd_line("SLOT 1 TGT=3 SRC=2120 Cap+ Group Klingon Call")
+    assert event == {"type": "voice_miss",
+                     "text": "SLOT 1 TGT=3 SRC=2120 Cap+ Group Klingon Call"}
+
+
+def test_voice_miss_does_not_shadow_real_shapes():
+    """גלאי-ההחמצה נבדק אחרון => אינו גונב שורות שתבנית אמיתית תופסת.
+    כל 68 צורות הקליטה האמיתית נשארות מסווגות בדיוק כמו קודם (ר' replay)."""
+    for row in _load_fixture():
+        event = dsd_pty.parse_dsd_line(row["raw_line"])
+        assert not (event and event["type"] == "voice_miss"), row["raw_line"]
+
+
+def test_normalize_carries_service_option_flags(paths):
+    """הדגלים מגיעים לכרטיס, ו-encrypted נקבע מהמקור (SO) ולא מהקורלציה."""
+    app = paths
+    card = app._normalize_dsd(dsd_pty.parse_dsd_line(
+        "SLOT 1 TGT=3 SRC=2120 Cap+ Group Emergency Encrypted Priority 1 Call"))
+    assert card["emergency"] is True
+    assert card["priority"] == 1
+    assert card["encrypted"] is True
+    assert card["enc"]["alg_name"] == "מוצפן"
+    assert card["enc"]["alg"] is None and card["enc"]["key_id"] is None   # §8
+
+
+def test_normalize_plain_call_has_no_invented_flags(paths):
+    app = paths
+    card = app._normalize_dsd(dsd_pty.parse_dsd_line(
+        "SLOT 1 TGT=3 SRC=2120 Cap+ Group Call  Rest LSN: 5"))
+    assert card["emergency"] is False
+    assert card["priority"] is None and card["flags"] is None
+    assert card["encrypted"] is False and card["enc"] is None
+
+
+# --- שרידות ה-listener -------------------------------------------------------
+def test_handler_survives_malformed_intel_datagram(paths):
+    """★ regression לבאג שהרג את הפיד: site לא-מספרי הגיע ל-int() חשוף בענף
+    שלא היה עטוף, ה-thread מת, ו-/api/health המשיך לדווח ok=True. עכשיו
+    הדאטהגרם מדולג וההמשך נקלט."""
+    app = paths
+    app._active_system_id = "s1"
+    ctx = app._new_listener_ctx()
+    app._handle_datagram({"type": "site_info", "site": "abc", "rest_lsn": 5}, ctx)
+    app._handle_datagram({"type": "lsn_status", "channels": {"x": "rest"}}, ctx)
+    app._handle_datagram({"type": "voice_call", "slot": 1, "src": 2120, "tg": 3,
+                          "call_type": "group", "t": time.time()}, ctx)
+    with app._dmr_lock:
+        assert len(app._dmr_msgs) == 1
+
+
+def test_listener_thread_survives_bad_datagram_end_to_end(paths, monkeypatch):
+    """אותו תרחיש דרך ה-socket האמיתי: ה-thread נשאר חי והפיד ממשיך לקלוט."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15981)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    with app._dmr_lock:
+        app._dmr_msgs.clear()
+    thread = threading.Thread(target=app._dmr_listener, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    _send_udp(15981, {"type": "site_info", "site": "not-a-number", "rest_lsn": 5})
+    time.sleep(0.3)
+    for i in range(3):
+        _send_udp(15981, {"type": "voice_call", "slot": 1, "src": 900 + i, "tg": 7,
+                          "call_type": "group", "t": time.time()})
+    time.sleep(0.5)
+    assert thread.is_alive()
+    with app._dmr_lock:
+        assert len(app._dmr_msgs) == 3
+    assert app._feed_stats["handler_errors"] == 0   # דולג בנקיון, לא חריגה
+
+
+def test_voice_miss_is_counted_not_carded(paths):
+    app = paths
+    ctx = app._new_listener_ctx()
+    app._handle_datagram({"type": "voice_miss", "text": "SLOT 1 TGT=1 SRC=2 Xx Call"}, ctx)
+    with app._dmr_lock:
+        assert len(app._dmr_msgs) == 0
+    assert app._feed_stats["voice_miss"] == 1
+    assert app._feed_stats["voice_miss_last"] == "SLOT 1 TGT=1 SRC=2 Xx Call"
+
+
+# --- ארכיון: כתיבה בסגירת השיחה ---------------------------------------------
+def _voice(app, ctx, t, **kw):
+    msg = {"type": "voice_call", "slot": 1, "src": 2120, "tg": 3,
+           "call_type": "group", "t": t}
+    msg.update(kw)
+    app._handle_datagram(msg, ctx)
+
+
+def test_archive_keeps_dur_frames_encrypted_and_id(paths):
+    """★ הבאג המרכזי: הרשומה נכתבה לדיסק בפריים הראשון, ולכן dur/frames/
+    encrypted/id — שכולם נקבעים אחר-כך כמוטציה — לא הגיעו לארכיון אף פעם.
+    התוצאה הייתה `?day=` עם airtime 0 ו-0% מוצפן, לנצח, וייצוא CSV ריק."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    t0 = 1000.0
+    _voice(app, ctx, t0)
+    _voice(app, ctx, t0 + 1.0)
+    _voice(app, ctx, t0 + 2.5)
+    app._handle_datagram({"type": "encryption", "slot": 1, "t": t0 + 3.0}, ctx)
+
+    assert app._read_dmr_log() == []            # עדיין פתוחה — לא נכתבה
+    assert app._close_stale_calls(ctx, now=t0 + 5) == 0     # בתוך חלון הסגירה
+    # חלון הסגירה נמדד מהפריים האחרון (t0+2.5), לא מתחילת השיחה
+    written = app._close_stale_calls(ctx, now=t0 + 2.5 + app.CALL_CLOSE_SEC + 1)
+    assert written == 1
+
+    disk = app._read_dmr_log()
+    assert len(disk) == 1
+    rec = disk[0]
+    assert rec["dur"] == 2.5 and rec["frames"] == 3
+    assert rec["encrypted"] is True and rec["enc"]["alg_name"] == "מוצפן"
+    assert rec["id"] == 1                       # id הגיע לדיסק (היה null)
+    assert "_start" not in rec                  # מפתח-עבודה פנימי לא נכתב
+
+
+def test_archive_and_memory_agree_on_analytics(paths):
+    """אותה שיחה, שני מקורות — חייבים לתת אותה תשובה. זו הבדיקה שהייתה
+    נכשלת קודם: זיכרון החזיר airtime אמיתי, הדיסק החזיר 0."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    t0 = 2000.0
+    _voice(app, ctx, t0)
+    _voice(app, ctx, t0 + 4.0)
+    app._handle_datagram({"type": "encryption", "slot": 1, "t": t0 + 4.5}, ctx)
+    app._close_stale_calls(ctx, force=True)
+
+    with app._dmr_lock:
+        mem = [dict(m) for m in app._dmr_msgs]
+    disk = app._read_dmr_log()
+    assert app._traffic_stats(disk)["by_tg"] == app._traffic_stats(mem)["by_tg"]
+    assert app._encryption_stats(disk)["encrypted_total"] == 1
+    assert (app._encryption_stats(disk)["encrypted_total"]
+            == app._encryption_stats(mem)["encrypted_total"])
+
+
+def test_non_voice_cards_are_written_immediately(paths):
+    """כרטיסי data/lrrp לא עוברים dedup ולא מקבלים תג-הצפנה => אין סיבה
+    לעכב אותם עד סגירת-חלון."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    app._handle_datagram({"type": "data_header", "slot": 1, "src": 191, "tgt": 64250,
+                          "call_type": "data", "delivery": "Confirmed Delivery",
+                          "t": 3000.0}, ctx)
+    assert len(app._read_dmr_log()) == 1
+
+
+def test_close_stale_calls_force_flushes_everything(paths):
+    app = paths
+    ctx = app._new_listener_ctx()
+    _voice(app, ctx, 4000.0)
+    assert app._close_stale_calls(ctx, now=4000.0) == 0
+    assert app._close_stale_calls(ctx, force=True) == 1
+    assert ctx["pending"] == {}
+
+
+def test_close_window_measured_from_last_frame(paths):
+    """שיחה ארוכה לא נכתבת באמצע: כל פריים-המשך דוחה את הסגירה."""
+    app = paths
+    ctx = app._new_listener_ctx()
+    t0 = 5000.0
+    _voice(app, ctx, t0)
+    for i in range(1, 6):
+        _voice(app, ctx, t0 + i * 3.0)          # פריימים בתוך חלון dedup של 8ש'
+    assert app._close_stale_calls(ctx, now=t0 + 16.0) == 0
+    assert app._close_stale_calls(ctx, now=t0 + 15.0 + app.CALL_CLOSE_SEC) == 1
+    assert app._read_dmr_log()[0]["frames"] == 6
+
+
+def test_listener_restart_flushes_pending_calls(paths):
+    """הקמה-מחדש של ה-listener (watchdog) לא מאבדת שיחה שנצפתה וטרם נכתבה."""
+    app = paths
+    _voice(app, app._listener_ctx, 6000.0)
+    assert app._read_dmr_log() == []
+    app._reset_listener_ctx()
+    assert len(app._read_dmr_log()) == 1
+    assert app._listener_ctx["pending"] == {}
+
+
+# --- חיוניות: להבדיל דממה מחירשות ------------------------------------------
+def test_feed_tick_and_snapshot_count_by_type(paths):
+    app = paths
+    now = 7000.0
+    app._feed_tick({"type": "lsn_status"}, now=now)
+    app._feed_tick({"type": "lsn_status"}, now=now + 1)
+    app._feed_tick({"type": "voice_call"}, now=now + 2)
+    snap = app._feed_snapshot(now=now + 3)
+    assert snap["datagrams_window"] == 3
+    assert dict((d["type"], d["count"]) for d in snap["by_type"]) == \
+        {"lsn_status": 2, "voice_call": 1}
+    assert snap["last_voice_at"] == now + 2
+    assert snap["last_datagram_at"] == now + 2
+
+
+def test_feed_snapshot_window_expires_old_ticks(paths):
+    app = paths
+    app._feed_tick({"type": "quality"}, now=8000.0)
+    snap = app._feed_snapshot(now=8000.0 + app.FEED_WINDOW_SEC + 5)
+    assert snap["datagrams_window"] == 0
+    assert snap["last_datagram_at"] == 8000.0      # העובדה נשמרת גם מחוץ לחלון
+
+
+def test_feed_tick_counts_datagram_that_would_crash_handler(paths):
+    """המונה נרשם **לפני** הדיספאץ' => גם דאטהגרם בעייתי נספר, ולכן אי-אפשר
+    "לאבד" זרם שלם בגלל אירוע אחד שנפל."""
+    app = paths
+    app._feed_tick({"type": "site_info"}, now=9000.0)
+    assert app._feed_snapshot(now=9000.0)["datagrams_window"] == 1
+
+
+def test_decode_state_distinguishes_silence_from_deafness(paths):
+    """★ ההבחנה שלא הייתה קיימת. פונקציה טהורה => נבדקת בלי חומרה."""
+    app = paths
+    now = 10000.0
+    voice = {"last_voice_at": now - 5, "datagrams_window": 4, "last_datagram_at": now - 1}
+    assert app._decode_state("dmr", voice, now=now) == "decoding"
+
+    telemetry = {"last_voice_at": None, "datagrams_window": 30, "last_datagram_at": now - 1}
+    assert app._decode_state("dmr", telemetry, now=now) == "chain_alive"
+
+    nothing = {"last_voice_at": None, "datagrams_window": 0, "last_datagram_at": None}
+    assert app._decode_state("dmr", nothing, now=now) == "silent"
+
+    stale = {"last_voice_at": None, "datagrams_window": 0,
+             "last_datagram_at": now - app.DECODE_SILENT_SEC - 1}
+    assert app._decode_state("dmr", stale, now=now) == "silent"
+
+    # standby אינו כשל — אין מפענח שירוץ
+    assert app._decode_state("off", nothing, now=now) == "standby"
+
+
+def test_decode_state_reports_listener_down(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_listener_bound", False)
+    assert app._decode_state("dmr", {"datagrams_window": 5}, now=1.0) == "listener_down"
+
+
+def test_api_health_exposes_feed_and_decode_state(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_sdr_present", lambda: True)
+    monkeypatch.setattr(app, "_is_active", lambda svc: False)
+    body = app.app.test_client().get("/api/health").get_json()
+    assert "feed" in body and "decode_state" in body and "listener_alive" in body
+    assert body["feed"]["window_sec"] == int(app.FEED_WINDOW_SEC)
+
+
+def test_api_rf_exposes_parser_miss(paths):
+    app = paths
+    ctx = app._new_listener_ctx()
+    app._handle_datagram({"type": "voice_miss", "text": "SLOT 9 TGT=1 SRC=2 Zz Call"}, ctx)
+    body = app.app.test_client().get("/api/rf").get_json()
+    assert body["parser_miss"] == 1
+    assert body["parser_miss_last"] == "SLOT 9 TGT=1 SRC=2 Zz Call"
+
+
+# --- מטמון-המודיעין אחרי restart של dmr-web ---------------------------------
+def test_restore_intel_cache_when_decoder_already_running(paths):
+    """★ regression: אחרי `systemctl restart dmr-web` בזמן ש-dmr-dsdfme רץ,
+    _boot_restore יצא מוקדם ו-_active_system_id נשאר None => כל
+    v0.11.0+v0.12.0 צבר אפס, בשקט."""
+    app = paths
+    import json as _json
+    app.SYSTEMS_PATH.write_text(_json.dumps(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 10,
+          "channelmap": []}]))
+    app._active_system_id = None
+    app._active_color_code = None
+    assert app._restore_intel_cache({"app_mode": "multi", "system": "s1"}) == "s1"
+    assert app._intel_system_id() == "s1"
+    assert app._active_color_code == 10
+
+
+def test_restore_intel_cache_ignores_standby_and_unknown(paths):
+    app = paths
+    import json as _json
+    app.SYSTEMS_PATH.write_text(_json.dumps([]))
+    app._active_system_id = None
+    assert app._restore_intel_cache({"app_mode": "off", "system": "s1"}) is None
+    assert app._restore_intel_cache({"app_mode": "dmr", "system": "nope"}) is None
+    assert app._intel_system_id() is None
+
+
+def test_boot_restore_populates_intel_cache_on_early_return(paths, monkeypatch, no_sleep):
+    """דרך _boot_restore עצמו: live == mode => יוצא מוקדם, אבל המטמון מאוכלס."""
+    app = paths
+    import json as _json
+    app.SYSTEMS_PATH.write_text(_json.dumps(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 8,
+          "channelmap": []}]))
+    app.STATE_PATH.write_text(_json.dumps({"app_mode": "dmr", "system": "s1"}))
+    monkeypatch.setattr(app, "_live_mode", lambda: "dmr")
+    app._active_system_id = None
+    app._boot_restore()
+    assert app._intel_system_id() == "s1"

@@ -1,0 +1,23 @@
+provenance,orig_type,raw_line,note
+# ⚠ פיקסצ'ר זה שונה במקורו מ-capplus_slco_sample.csv, ואל תערבבו ביניהם.
+# capplus_slco_sample.csv = 68 צורות שנקלטו **בפועל** מרשת Cap+/SLCO אמיתית.
+# הקובץ הזה = צורות שנגזרו מ**קוד-המקור של DSD-FME** (ענף audio_work), עבור
+# מצבים שהרשת שנקלטה לא שידרה באותו חלון — ולכן ה-regex שלנו הפיל אותם בשקט.
+# כל שורה נושאת provenance מדויק (file:line) כדי שלא תיווצר אשליה שזו קליטה.
+# כשתגיע דגימה אמיתית של אחד מהמצבים האלה — מעבירים אותה לפיקסצ'ר הקליטה.
+source:dmr_flco.c:545,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Emergency Call  Rest LSN: 5,so & 0x80 — שיחת חירום; נפלה לגמרי לפני v0.13.0
+source:dmr_flco.c:556,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Encrypted Call  Rest LSN: 5,so & 0x40 — דגל הצפנה על שורת השיחה עצמה
+source:dmr_flco.c:556,voice_call,SLOT 2 TGT=64250 SRC=191 Cap+ Private Encrypted Call  Rest LSN: 4,שיחת יחיד מוצפנת
+source:dmr_flco.c:622,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group TXI RPT Call  Rest LSN: 5,so & 0x10 — RPT אחרי TXI
+source:dmr_flco.c:628,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Broadcast Call,so & 0x08
+source:dmr_flco.c:634,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group OVCM Call,so & 0x04
+source:dmr_flco.c:643,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Priority 1 Call,so & 0x03 == 1
+source:dmr_flco.c:649,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Priority 2 Call,so & 0x03 == 2
+source:dmr_flco.c:655,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Priority 3 Call,so & 0x03 == 3
+source:dmr_flco.c:661,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group No Priority Call,ענף ה-else ש-DSD-FME מסמן כ"never go here"
+source:dmr_flco.c:545+556+643,voice_call,SLOT 1 TGT=3 SRC=2120 Cap+ Group Emergency Encrypted TXI RPT Broadcast OVCM Priority 2 Call  Rest LSN: 5,כל הדגלים יחד — סדר ההדפסה מהמקור
+source:dmr_flco.c:666,voice_call,SLOT 1 TGT=3 SRC=2120 Group Kirisun Call,fid == 0x0A
+source:dmr_flco.c:667,voice_call,SLOT 1 TGT=3 SRC=2120 Group Hytera Call,fid == 0x68
+source:dmr_flco.c:668,voice_call,SLOT 1 TGT=3 SRC=2120 Group XPT Call,is_xpt
+source:dmr_flco.c:679,voice_call,SLOT 1 TGT=3 SRC=2120 Group Kenwood Scrambler Call,is_kenwood_sc
+source:dmr_flco.c:511,voice_call,SLOT 1 TGT=3 SRC=2120 FLCO=0x04 FID=0x10 SVC=0x80 Cap+ Group Emergency Call,מצב ‎-Z/payload מוסיף FLCO/FID/SVC לפני Cap+

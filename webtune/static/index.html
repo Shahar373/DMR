@@ -183,6 +183,7 @@ button.btn:disabled{ opacity:.5; cursor:default; }
           <div class="count" id="callsToday"></div>
         </div>
       </div>
+      <div id="decodeState" style="margin-top:var(--sp-2)"></div>
       <div class="row hidden" id="powerRow" style="margin-top:var(--sp-2)">
         <span class="pill" id="powerPill">·</span>
       </div>
@@ -842,11 +843,43 @@ async function pollHealth(){
   else if(h.app_mode==="scan"&&h.ok){ p.className="pill on"; p.textContent="סורק"; }
   else if(h.app_mode==="discover"&&h.ok){ p.className="pill on"; p.textContent="🔎 מגלה תדרים"; }
   else { p.className="pill err"; p.textContent="תקלה"; }
+  // ★ v0.13.0 — עד כה שלושה מצבים שונים לגמרי רונדרו זהה ("מאזין"): רשת שקטה,
+  // listener מת, ושרשרת חיה-אך-חירשת. decode_state מגיע מהשרת כעובדה נמדדת
+  // (זרם הדאטהגרמים), ושמרני במכוון — "אין נתונים" ולא "שבור".
+  renderDecodeState(h);
   $("callsToday").textContent = h.last_call_at?`שיחה אחרונה: ${fmtT(h.last_call_at)}`:"";
   if(h.app_mode==="scan"){
     const s=(await api("/api/scan")).body;
     $("scanStatusTxt").textContent = s.leg ? `רגל נוכחית: ${s.leg.system}` : (s.active?"ממתין לחלון הזמן":"");
   } else $("scanStatusTxt").textContent="";
+}
+
+// ---------- מצב הפענוח: דממה מול חירשות (v0.13.0) ----------
+// לתחנת האזנה זו ההבחנה החשובה ביותר, והיא לא הייתה קיימת: "אין תעבורה" ו-
+// "השרשרת נפלה" נראו אותו דבר. הנתון הוא זרם הדאטהגרמים מ-dsd_pty (ב-Cap+
+// טלמטריית ערוץ-הבקרה זורמת רציף גם בלי שיחות, ולכן שקט מוחלט הוא חשוד).
+const DECODE_LABELS = {
+  decoding:      ["ok",   "✅ מפענח",            "שיחות קול מגיעות"],
+  chain_alive:   ["warn", "🟡 שרשרת חיה",        "אירועים מגיעים מהמפענח, אך אין שיחות קול כרגע"],
+  silent:        ["err",  "🔴 אין נתונים",       "המצב פעיל אך לא מגיע שום אירוע מהמפענח — בדקו אנטנה/תדר/CC"],
+  listener_down: ["err",  "🔴 המאזין לא פעיל",   "פורט ה-UDP תפוס או ה-thread נפל — בדקו journalctl -u dmr-web"],
+  standby:       ["off",  "⏻ כבוי",              "אין מפענח פעיל — זה מצב תקין"],
+};
+function renderDecodeState(h){
+  const el=$("decodeState"); if(!el) return;
+  const meta = DECODE_LABELS[h.decode_state];
+  if(!meta){ el.innerHTML=""; return; }
+  const [cls, label, hint] = meta;
+  const f = h.feed||{};
+  const parts = [];
+  if(f.datagrams_window!=null) parts.push(`${f.datagrams_window} אירועים/${f.window_sec||60}ש'`);
+  if(f.last_voice_at) parts.push(`קול אחרון ${fmtT(f.last_voice_at)}`);
+  else if(f.last_datagram_at) parts.push(`אירוע אחרון ${fmtT(f.last_datagram_at)}`);
+  if(f.voice_miss) parts.push(`⚠ ${f.voice_miss} שורות שהפרסר לא זיהה`);
+  if(f.handler_errors) parts.push(`⚠ ${f.handler_errors} שגיאות טיפול`);
+  el.innerHTML = `<span class="tag ${cls==="ok"?"":cls}">${label}</span>
+    <span class="muted">${esc(hint)}</span>
+    ${parts.length?`<div class="muted mono" style="margin-top:4px">${esc(parts.join(" · "))}</div>`:""}`;
 }
 
 // ---------- מתח/טמפ' ה-Pi (undervoltage/throttle — תקלת-Pi-בשטח #1) ----------
@@ -1024,6 +1057,10 @@ $("gainDown").onclick = ()=>nudgeGain("down");
 // ---------- call feed ----------
 function callCard(m){
   const tags=[];
+  // ★ v0.13.0 — חירום ראשון בתור: עד עכשיו שיחות Emergency נדחו ע"י הפרסר
+  // ולא הופיעו בכלל, אז אין טעם שיופיעו עכשיו בלי סימון בולט.
+  if(m.emergency) tags.push(`<span class="tag err">🚨 חירום</span>`);
+  if(m.priority!=null) tags.push(`<span class="tag warn">עדיפות ${esc(m.priority)}</span>`);
   tags.push(`<span class="tag ${esc(m.group||"data")}">${esc(m.category||m.call_type)}</span>`);
   if(m.phys_lcn!=null) tags.push(`<span class="tag mono">LCN${esc(m.phys_lcn)}</span>`);   // multi mode: ערוץ-אמת
   if(m.slot!=null) tags.push(`<span class="tag slot">TS${m.slot}</span>`);

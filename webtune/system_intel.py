@@ -115,9 +115,12 @@ def record_site(system_id, site, t=None):
     if system_id is None or site is None:
         return
     t = t if t is not None else time.time()
+    try:
+        key = str(int(site))
+    except (TypeError, ValueError):
+        return          # ⚠ אין int() חשוף בנתיב-הקליטה: הוא הרג את ה-listener (v0.13.0)
     with _lock:
         p = _profile(system_id)
-        key = str(int(site))
         entry = p["sites"].setdefault(key, {"first_seen": t, "last_seen": t, "count": 0})
         entry["last_seen"] = t
         entry["count"] += 1
@@ -149,7 +152,10 @@ def record_lsn_status(system_id, channels, t=None, phys_freq_hz=None):
     with _lock:
         p = _profile(system_id)
         for lsn, occ in channels.items():
-            key = str(int(lsn))
+            try:
+                key = str(int(lsn))
+            except (TypeError, ValueError):
+                continue    # ⚠ ר' record_site: קלט פגום מדולג, לא מפיל את ה-thread
             entry = p["lsn_directory"].get(key)
             if entry is None or entry.get("occupant") != occ:
                 p["lsn_directory"][key] = {"occupant": occ, "last_seen": t, "last_change": t}

@@ -127,8 +127,11 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 302 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
+  fixtures/dsdfme_source_shapes.csv # ★ 16 צורות שנגזרו מקוד-המקור של DSD-FME
+                            #   (מצבים שהרשת לא שידרה), כל שורה עם provenance.
+                            #   ⚠ קובץ נפרד במוצהר — אל תערבבו עם הקליטה. ר' §7.
 .github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
 ```
 
@@ -188,6 +191,29 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 ב
   לכרטיס עצמו. housekeeping לא מגיע לכאן בכלל — `dsd_pty` כבר סינן במקור (§2).
   `_append_jsonl_log`/`_trim_jsonl_log`/`_read_dmr_log`/`_load_dmr_history`, `_today_start`/
   `_day_bounds` (ארכיון יומי, עמיד DST). רץ תמיד ברקע (גם ב-standby).
+  **⚠ מבנה (v0.13.0):** הלופ עצמו עושה רק recv+json, וכל הטיפול עבר ל-
+  `_handle_datagram(msg, ctx)` שעטוף ב-`try/except` — דאטהגרם בודד **אסור** שיפיל
+  את ה-thread (בעבר `{"type":"site_info","site":"abc"}` עשה בדיוק את זה, ר' §8).
+  `ctx` = `{dedup, slot_open, pending, seen}`, מודולרי (`_listener_ctx`) כדי
+  ש-`_close_stale_calls` ירוץ גם מ-`_activity_watcher`. `_listener_watchdog`
+  מקים את ה-thread מחדש אם בכל זאת מת. **אל תוסיפו לוגיקה לתוך הלופ עצמו** —
+  היא לא תהיה עטופה ולא תהיה נבדקת.
+- **★ כתיבה לארכיון בסגירת-שיחה (v0.13.0) — לא בפריים הראשון:** `dur`/`frames`/
+  `encrypted`/`id` נקבעים **אחרי** יצירת הכרטיס, כמוטציה על האובייקט החי. לכן
+  כתיבה מוקדמת הקפיאה את הרשומה בדיסק בלעדיהם, ו-`?day=`/CSV דיווחו airtime 0
+  ו-0% מוצפן לנצח. שיחות-קול נכנסות ל-`ctx["pending"]` ונכתבות ב-
+  `_close_stale_calls` אחרי `CALL_CLOSE_SEC` (20ש') **מהפריים האחרון**; כרטיסי
+  data/lrrp נכתבים מיד (אינם משתנים). ⚠ `CALL_CLOSE_SEC` חייב להישאר גדול
+  **משני** החלונות שממתתים כרטיס — dedup (8ש') וקורלציית-הצפנה (15ש'); אם
+  משנים אחד מהם, עדכנו גם אותו. מחיר מודע: קריסה מאבדת שיחות פתוחות (≤20ש').
+- **★ חיוניות: "רשת שקטה" מול "שרשרת מתה" (v0.13.0):** `_feed_tick` נרשם על
+  **כל** דאטהגרם — לפני הדיספאץ' ולפני כל פרסור, כדי שגם דאטהגרם בעייתי
+  ייספר. `_feed_snapshot` מחזיר עובדות בלבד (חלון `FEED_WINDOW_SEC`=60s פר
+  טיפוס + `last_datagram_at`/`last_voice_at`), ו-`_decode_state` (טהורה)
+  מכריעה `decoding`/`chain_alive`/`silent`/`listener_down`/`standby`.
+  **שמרנית במכוון:** `silent` ולא "שבור" — בחד-ערוצי non-trunk דממה מלאה היא
+  מצב לגיטימי ואין ראיה להאשים את השרשרת (§8 "לא ממציאים"). האות שמאפשר את
+  ההבחנה הוא `lsn_status` שזורם רציף ב-Cap+ גם בלי שיחות.
 - **★ איכות RF (לא dBFS/SNR!) + נוד-רווח:** `_rf_quality_tick`/`_rf_quality_snapshot`
   (חלון נגלל `RF_WINDOW_SEC`=60s של אירועי CRC/FEC אמיתיים — `errors_per_min` + פילוח
   `by_type`; **לעולם לא ממציאים dB/SNR**, רק סופרים תדירות אמיתית). `_dmr_gain_nudge`
@@ -296,7 +322,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 ב
 | GET/PUT | `/api/watchlist` | מעקב RID/TG להתראה מקומית (GET=רשימה, PUT=החלפה מלאה) |
 | GET | `/api/system-intel` | מודיעין-מערכת נצבר: אתרים/מפת-LSN/CDR/סחיפת-CC + `lsn_map`/`lsn_channelmap` (מיפוי LSN↔תדר שהתגלה) (`?system=<id>`, ברירת מחדל: הפעילה) |
 | POST | `/api/system-intel/apply-lsn` | אימוץ המיפוי שהתגלה כ-`channelmap` של המערכת (יזום-אנושית; הפעולה היחידה שבה intel כותב לקונפיג) |
-| GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
+| GET | `/api/health` | בריאות + `calls_today`/`last_call_at` + ★ `listener_alive`/`feed`/`decode_state` (מבדיל "רשת שקטה" מ"שרשרת מתה") |
 | POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
 | GET | `/api/discover` | סטטוס גילוי חי (שלב/התקדמות/מועמדים) + הדוח האחרון |
@@ -308,7 +334,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 ב
 | GET | `/api/analytics/traffic` | אנליטיקת תעבורה: air-time/TG + heatmap שעתי (`?day=`/`?all=1`) |
 | GET | `/api/analytics/graph` | גרף RID↔TG (who-talks-to-whom) (`?day=`/`?all=1`) |
 | GET | `/api/positions` | מיקום LRRP אחרון-ידוע פר-RID (מהזיכרון בלבד, "עכשיו") |
-| GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge` + `by_channel` (Phase 7, `multi` בלבד). **אין dBFS/SNR** |
+| GET | `/api/rf` | איכות RF: תדירות שגיאות CRC/FEC אמיתית (60ש') + `gain_nudge` + `by_channel` (Phase 7, `multi` בלבד) + ★ `parser_miss`/`handler_errors`. **אין dBFS/SNR** |
 | POST | `/api/gain` | נוד-רווח חי (`{direction: up\|down}`) — הקשת g/G, בלי לעצור את DSD-FME |
 | GET | `/api/activity` | הקלטות אחרונות |
 | GET | `/recordings/<name>` | קובץ WAV |
@@ -322,7 +348,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (275 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (302 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -347,6 +373,13 @@ argv טהור של `build_command`/`build_rsp_tcp_command`/`build_bridge_command
 (שכבת ה-HTTP של `/api/rf`/`/api/gain`), `test_discovery` (גילוי: `validate_sweep_plan`/
 `build_freq_grid`/`detect_candidates`/`aggregate_probe`/`discovery_to_system` הטהורים +
 שכבת Flask `/api/discover[/save]` + `_discover_loop` e2e ממוקף + collector-via-listener).
+**★ `tests/fixtures/dsdfme_source_shapes.csv` (v0.13.0) — פיקסצ'ר שני, מופרד
+במוצהר:** 16 צורות שנגזרו מ**קוד-המקור** של DSD-FME (`audio_work`) עבור מצבים
+שהרשת שנקלטה לא שידרה — כל שורה עם עמודת `provenance` (`source:dmr_flco.c:545`)
+ש-`test_source_fixture_provenance_is_explicit` אוכף. ⚠ **אל תערבבו בין השניים:**
+`capplus_slco_sample.csv` הוא קליטה אמיתית ונשאר קודש; כשמגיעה דגימה אמיתית של
+מצב שיושב כאן, מעבירים אותה לשם. ר' §8 להסבר למה הכלל הורחב.
+
 **הוסף בדיקה לכל שינוי backend.** CI: pytest (Python 3.11, כולל NumPy) + `bash -n`.
 
 **UI (`static/index.html`) — ללא סוויטת בדיקות (כמו AIR-AM: אין build step, אין JS
@@ -390,6 +423,22 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   נקיים. **לעומת זאת** — שרשרת האותות (rsp_tcp→rsp_fm.py→DSD-FME) היא תלוית-hardware
   אמיתית ולא נבדקת ב-CI (`dsd_pty._run`/`rsp_fm.run` הם `pragma: no cover`); שינוי בה
   דורש בדיקה על RSP1B אמיתי, לא רק pytest ירוק.
+- **⚠ הפיקסצ'ר מוכיח מה *יש*, לא מה *יבוא* (v0.13.0) — הרחבה של כלל "לא מנחשים":**
+  הכלל המקורי ("שנה תבניות **רק** לפי דגימות אמיתיות") נכון, ובכל זאת הוא הוליד
+  באג חמור: ה-regex של שורת-השיחה הותאם ל-68 הצורות שנקלטו, ובהן היו רק
+  `SO=0x00` ו-`SO=0x20` — אז **8 מתוך 9** וריאציות ה-Service Option הפילו את
+  הכרטיס כולו בשקט, כולל `Emergency`. לכן הכלל עודכן: תבנית מותר לתקן לפי
+  **קליטה אמיתית או קוד-המקור של DSD-FME**, ובמקרה השני חובה (א) פיקסצ'ר
+  **נפרד** — `tests/fixtures/dsdfme_source_shapes.csv`, עם עמודת `provenance`
+  (`source:dmr_flco.c:545`) שנאכפת בבדיקה, ו-(ב) לא לזהם את
+  `capplus_slco_sample.csv`, שנשאר קליטה-בלבד. כשמגיעה דגימה אמיתית של אחד
+  המצבים — היא **עוברת** לפיקסצ'ר הקליטה.
+- **⚠ ולעולם לא ליפול בשקט: `voice_miss` (v0.13.0).** שורה שנראית כמו שיחה
+  (`_RE_VOICE_CALL_LOOSE`) ולא נתפסה ע"י ה-regex המדויק מייצרת אירוע-אבחון
+  שנספר ומופיע ב-`/api/rf` (`parser_miss`). נבדק **אחרון** ב-`parse_dsd_line`
+  כדי לא לגנוב שורות מתבניות אמיתיות. אם מוסיפים תבנית חדשה — שמרו על
+  הסדר הזה, והוסיפו גלאי מקביל אם התבנית קריטית. הלקח מהבאג הוא לא "להוסיף
+  טוקנים" אלא שהחמצה תהיה **גלויה**.
 - **⚠ `scaled_taps` ב-multi הוא opt-in (`DSD_MULTI_SCALED_TAPS`, כבוי כברירת-מחדל,
   v0.7.3):** רוחב-המעבר של פילטר ה-anti-alias הוא ~3.3·fs/taps, אז 121 taps קבוע
   נותן סלקטיביות גרועה יותר ככל ש-iq_rate גדל (ב-672kHz של multi זה חשוד ל"רק
@@ -668,9 +717,55 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   **הצעד הבא אם הכיסוי יתגלה חלקי:** קורלטור שני — occupant-id של `lsn_status`
   מול TG/יעד של שיחה שנשמעה בו-זמנית על ערוץ פיזי ידוע (הנתונים כבר זורמים;
   לא מומש בכוונה כדי לא להוסיף מקור-אי-ודאות שני לפני שהראשון נמדד בשטח).
-- **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
-  קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
+- **v0.13.0 — כשלים שקטים (מנת-תיקונים, לא פיצ'רים; CI+חזותי, 302 בדיקות):**
+  נולד מסבב-חשיבה שבו ארבעה סוכנים נשלחו לטעון עמדות מנוגדות על "הפיצ'ר הבא",
+  ושלושה מהם הגיעו **בנפרד** לאותה מסקנה: יש כאן באגים שמשמידים נתונים בשקט.
+  כל ארבעתם שוחזרו בהרצה לפני התיקון והם עכשיו בדיקות-רגרסיה:
+  (1) דאטהגרם פגום בודד הרג את ה-listener לנצח (`int()` חשוף בענף שלא היה
+  עטוף) בזמן ש-`/api/health` דיווח `ok=True`; (2) 8/9 וריאציות SO של שורת-
+  השיחה נדחו ⇒ **שיחות חירום לא הופיעו בשום מקום**; (3) `dur`/`frames`/
+  `encrypted`/`id` לא הגיעו לדיסק אף פעם ⇒ `?day=` ו-CSV דיווחו אפס לנצח;
+  (4) `systemctl restart dmr-web` השתיק את כל מודיעין-המערכת (v0.11+v0.12).
+  נוסף גם מה שכל הסוכנים סימנו כפער החמור ביותר לתחנת-האזנה: **הבחנה בין
+  "רשת שקטה" ל"שרשרת מתה"** (`_decode_state`, ר' §5), וגלאי-החמצה בפרסר
+  (`voice_miss` → `/api/rf`) כדי שהבאג מסוג (2) לא יחזור בשקט.
+  **⚠ נשאר פתוח בהחלטה (אומת בסבב, לא תוקן):** נגן ההקלטות ב-UI הוא קוד מת
+  (`wav` לעולם לא מוצב, בניגוד להבטחה ב-README); `/api/positions` ריק מבנית
+  (`_RE_LRRP_POS` — קבוצת `src` שלא יכולה להתאים, כי `dmr_pdu.c` מדפיס SRC רק
+  כשאין lat; התיעוד תולה את זה בטעות ב"Motorola proprietary" — **הקואורדינטות
+  כן מפוענחות**, יש דגימה בפיקסצ'ר); ה-UI לא שולח `X-DMR-PIN` ⇒ ה-PIN המתועד
+  הופך את התחנה לקריאה-בלבד; אין CRUD למערכות ב-UI; `rsp_fm.py:583` מחזיר
+  `-50.0` **מומצא**; ו-`index.html:1201` טוען אריחי-מפה מ-OSM — תלות-ענן חיה
+  שסותרת §1. וריאציות `data_header` (UDT/Short Data) עדיין נדחות.
+- **הכיוונים שנבחרו להמשך (מסבב v0.13.0):** שכבת ה-Data (סיווג לפי פורט —
+  4001=LRRP, 4005=ARS, 4007=הודעות טקסט; + תיקון המפה + מהירות/כיוון/גובה),
+  **Talker Alias** (הרדיואים משדרים את שמם; `dsd_alias.c:744` — ⚠ אפס דגימות
+  בקליטה שלנו, נוכחות דורשת חלון-שדה), ו"למצוא ולשמוע" (השמעת הקלטות בפועל,
+  חיפוש חוצה-ימים בשרת, click-through מפאנלי הניתוח לשיחות).
+- **⚠ תוקן בתיעוד (v0.13.0) — שתי טענות שהיו נכונות ואינן:**
+  1. **מד dBFS *אינו* דורש עוד פטצ' קוד C.** הנימוק ב-§8 ("אין side-channel
+     ב-`rsp_tcp`") נכתב לארכיטקטורה של **לפני** v0.4.0, כשהגשר לא היה שלנו.
+     היום `webtune/rsp_fm.py` מחזיק כל דגימת IQ ב-NumPy (`baseband` ב-
+     `NfmDemodulator.process`, שורות 283-291) ⇒ RMS→dBFS **פר-ערוץ** הוא
+     תוספת קטנה במודול שאנחנו כותבים, ונבדקת ב-`test_rsp_fm` הקיים. מה
+     שנשאר נכון: המספר חייב להיות **נמדד** ולא מומצא, וצריך אימות על חומרה
+     לפני שסומכים על הכיול שלו.
+     ⚠ ובינתיים יש **קבוע מומצא בקוד שלנו**: `rsp_fm.py:583` מחזיר
+     `"-50.0\n"` ל-verb `l` של rigctl. כרגע אין לו קורא (`GetSignalLevel`
+     ב-`dsd_rigctl.c` מוגדר ולא נקרא), אבל זו הפרה של §8 שממתינה — למחוק
+     או להחליף במדידה אמיתית.
+  2. **lockout/hold דרך הזרקת מקשים ל-PTY אינו אפשרי.** `ncurses_input_handler`
+     נקרא **רק** מ-`dsd_ncurses_printer.c:1704`, וכל קריאה ל-`ncursesPrinter`
+     מגודרת ב-`opts->use_ncurses_terminal == 1` — כלומר דורשת `-N`, שתהרוס
+     את הפרסור השורתי שלנו. בלי `-N` אף מקש לא נקרא. (ערוץ ה-`DSD_CTRL_SOCK`
+     שלנו ממילא מנותב מ-v0.4.0 ל-`rsp_fm.py` ולא ל-DSD-FME — ר' §8.) הדרך
+     האמיתית למדיניות פר-TG היא דגל `-G` (group list עם allow/block) ו-`-I`
+     (TG hold), כלומר קונפיג + restart.
+- **נדחה במכוון (דורש חומרה לאימות):** כיול מד dBFS/SNR — המימוש עצמו כבר
+  אפשרי בלי פטצ' C (ר' הסעיף שמעל), אבל הערך המדווח חייב אימות על RSP1B
+  אמיתי לפני שמסתמכים עליו. ר' §8.
 - **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —
-  lockout/hold/whitelist דרך הזרקת מקשים ל-PTY (`dsd_pty` כבר תומך בערוץ `DSD_CTRL_SOCK`,
-  אותו ערוץ ששמש לנוד-הרווח — ניתן להרחיב), Web Push להתראות watchlist, ייבוא/ייצוא
-  מערכת כ-QR, מעקב multi-site (שדה `site` נצפה בקליטה אמיתית אך לא מומש).
+  מדיניות פר-TG דרך `-G`/`-I` (**לא** דרך הזרקת-מקשים, ר' התיקון שמעל),
+  Web Push להתראות watchlist (סותר §1 — ר' §8), ייבוא/ייצוא מערכת כ-QR,
+  מעקב multi-site (`Capacity Plus Adjacent Sites`, `dmr_csbk.c:1291` — מפת
+  השכנים קיימת בפרוטוקול ולא נצפתה ב-68 הדגימות שלנו; דורש חלון-שדה).

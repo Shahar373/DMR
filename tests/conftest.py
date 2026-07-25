@@ -39,6 +39,20 @@ def paths(tmp_path, monkeypatch):
     system_intel._intel.clear()
     system_intel._dirty = False
     system_intel._last_flush = 0.0
+
+    # מצב ה-listener הוא מודולרי מ-v0.13.0 (כדי ש-_close_stale_calls ירוץ גם
+    # מ-watcher) => חייב איפוס פר-בדיקה, אחרת חלון-dedup מבדיקה קודמת בולע
+    # שיחה של הבאה. אותו דבר למוני-החיוניות.
+    monkeypatch.setattr(app, "_listener_ctx", app._new_listener_ctx())
+    monkeypatch.setattr(app, "_listener_bound", None)
+    monkeypatch.setattr(app, "_listener_thread", None)
+    monkeypatch.setattr(app, "_dmr_seq", 0)
+    app._dmr_msgs.clear()
+    app._rf_ticks.clear()
+    app._feed_ticks.clear()
+    app._feed_stats.update(last_datagram_at=None, last_voice_at=None,
+                           handler_errors=0, voice_miss=0, voice_miss_last=None,
+                           total=0)
     return app
 
 

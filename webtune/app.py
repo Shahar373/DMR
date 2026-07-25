@@ -558,6 +558,112 @@ _dmr_lock = threading.Lock()
 _dmr_msgs = collections.deque(maxlen=DMR_BUF_MAX)
 _dmr_seq = 0                    # מזהה רץ גלובלי (cursor ל-UI)
 
+# ★ v0.13.0 — מצב ה-listener וחיוניותו.
+# CALL_CLOSE_SEC חייב להיות גדול **משני** החלונות שמְמַתְּתים כרטיס אחרי יצירתו:
+# dedup (8ש', מצטבר ל-dur/frames) וקורלציית ההצפנה (15ש'). כתיבה מוקדמת מדי
+# הייתה מקפיאה את הכרטיס בדיסק לפני שהמידע הזה נוסף — הבאג שתוקן כאן.
+# המחיר המודע: קריסת-listener מאבדת שיחות שטרם נסגרו (≤ CALL_CLOSE_SEC).
+CALL_CLOSE_SEC = 20.0
+CLOSE_SWEEP_INTERVAL_SEC = 2.0    # מְמוּתָן — ר' הלופ ב-_dmr_listener
+FEED_WINDOW_SEC = 60.0
+_LISTENER_INTERNAL_KEYS = ("_start",)   # מפתחות-עבודה שלא נכתבים לארכיון
+
+
+def _new_listener_ctx():
+    return {"dedup": {}, "slot_open": {}, "pending": {}, "seen": 0, "last_sweep": 0.0}
+
+
+_listener_ctx = _new_listener_ctx()   # מודולרי (לא לוקאלי ל-thread) כדי ש-
+_listener_bound = None                # _close_stale_calls יוכל לרוץ גם מ-watcher
+_listener_thread = None               # None=לא הופעל, False=bind נכשל
+_feed_lock = threading.Lock()
+_feed_stats = {"last_datagram_at": None, "last_voice_at": None,
+               "handler_errors": 0, "voice_miss": 0, "voice_miss_last": None,
+               "total": 0}
+_feed_ticks = collections.deque()     # (t, type) — נגזם לחלון FEED_WINDOW_SEC
+
+
+def _feed_tick(msg, now=None):
+    """מונה-חיוניות: נרשם על **כל** דאטהגרם, לפני הדיספאץ' ולפני כל פרסור —
+    כדי שגם דאטהגרם שמפיל את הטיפול ייספר. זה האות שמבדיל "הרשת שקטה"
+    מ"שרשרת-הפענוח מתה", שעד כה לא היה קיים בשום נקודת-API (ר' §8)."""
+    now = now if now is not None else time.time()
+    mtype = str(msg.get("type") or "unknown") if isinstance(msg, dict) else "unknown"
+    with _feed_lock:
+        _feed_stats["total"] += 1
+        _feed_stats["last_datagram_at"] = now
+        if mtype == "voice_call":
+            _feed_stats["last_voice_at"] = now
+        _feed_ticks.append((now, mtype))
+        cutoff = now - FEED_WINDOW_SEC
+        while _feed_ticks and _feed_ticks[0][0] < cutoff:
+            _feed_ticks.popleft()
+
+
+def _feed_snapshot(now=None):
+    """עובדות בלבד על זרם הדאטהגרמים — בלי לאבחן. ההבחנה הנגזרת
+    (decode_state) נעשית ב-api_health, ואפילו שם היא שמרנית: "silent" ולא
+    "שבור", כי בחד-ערוצי non-trunk דממה אמיתית היא מצב לגיטימי."""
+    now = now if now is not None else time.time()
+    with _feed_lock:
+        cutoff = now - FEED_WINDOW_SEC
+        by_type = collections.Counter(t for ts, t in _feed_ticks if ts >= cutoff)
+        stats = dict(_feed_stats)
+    return {
+        "window_sec": int(FEED_WINDOW_SEC),
+        "datagrams_window": int(sum(by_type.values())),
+        "by_type": [{"type": t, "count": c} for t, c in by_type.most_common()],
+        "last_datagram_at": stats["last_datagram_at"],
+        "last_voice_at": stats["last_voice_at"],
+        "handler_errors": stats["handler_errors"],
+        "voice_miss": stats["voice_miss"],
+        "voice_miss_last": stats["voice_miss_last"],
+        "total": stats["total"],
+    }
+
+
+def _listener_alive():
+    """True/False/None — None כשה-thread מעולם לא הופעל (למשל בבדיקות)."""
+    if _listener_bound is False:
+        return False
+    if _listener_thread is None:
+        return None
+    return bool(_listener_thread.is_alive())
+
+
+def _reset_listener_ctx():
+    """מתקין ctx נקי ל-listener, אחרי שסגר (וכתב לדיסק) שיחות תלויות מהקודם.
+    נקרא בעליית ה-listener: הקמה-מחדש ע"י ה-watchdog לא צריכה לירוש חלון-dedup
+    ישן — ובוודאי לא לאבד שיחות שכבר נצפו אך טרם נכתבו."""
+    global _listener_ctx
+    try:
+        _close_stale_calls(_listener_ctx, force=True)
+    except Exception:
+        log.exception("סגירת שיחות תלויות בעליית ה-listener נכשלה")
+    _listener_ctx = _new_listener_ctx()
+    return _listener_ctx
+
+
+def _archive_record(rec):
+    """עותק לכתיבה לדיסק, בלי מפתחות-העבודה הפנימיים."""
+    return {k: v for k, v in rec.items() if k not in _LISTENER_INTERNAL_KEYS}
+
+
+def _close_stale_calls(ctx, now=None, force=False):
+    """כותב ל-dmr.jsonl שיחות שכבר לא ישתנו (עבר CALL_CLOSE_SEC מהפריים
+    האחרון), עם dur/frames/encrypted/id הסופיים. force=True סוגר את הכל
+    (כיבוי נקי/בדיקות). מחזיר את מספר הרשומות שנכתבו.
+    הסנפשוט נלקח תחת _dmr_lock (הרשומה חיה גם ב-_dmr_msgs) והכתיבה לדיסק
+    נעשית **מחוץ** לנעילה, כדי שקורא-API לא ייחסם על I/O."""
+    now = now if now is not None else time.time()
+    pending = ctx["pending"]
+    with _dmr_lock:
+        due = [k for k, (ts, _) in pending.items() if force or now - ts >= CALL_CLOSE_SEC]
+        records = [_archive_record(pending.pop(k)[1]) for k in due]
+    for rec in records:
+        _append_dmr_log(rec)
+    return len(records)
+
 
 def _int_or_none(v):
     try:
@@ -577,6 +683,10 @@ def _float_or_none(v):
 
 
 _CARD_EVENT_TYPES = frozenset({"voice_call", "data_header", "lrrp_position", "lrrp_request"})
+# תג-ההצפנה הגנרי. DSD-FME לא הדפיס ALG/KEY בקליטה שנבדקה => alg/key_id
+# נשארים None (CLAUDE.md §8). מקור אחד לשני המסלולים: דגל ה-SO על שורת
+# השיחה (_normalize_dsd) וקורלציית ה-Protected LC (_dmr_listener).
+ENC_TAG = {"alg": None, "alg_name": "מוצפן", "key_id": None}
 
 
 def _channelmap_freq(lcn):
@@ -652,7 +762,13 @@ def _normalize_dsd(m):
         "src": src, "src_alias": aliasdb.rid_name(src),
         "tgt": tgt, "tgt_alias": aliasdb.rid_name(tgt),
         "call_type": ct, "category": category, "group": group,
-        "encrypted": False, "enc": None,   # מתואם בהמשך ע"י ה-listener אם רלוונטי
+        # ★ v0.13.0 — דגלי Service Option מ-dsd_pty.parse_voice_flags. `encrypted`
+        # מגיע עכשיו מהמקור המדויק (SO bit) כשהוא נוכח; קורלציית ה-Protected LC
+        # ב-_dmr_listener נשארת כ-fallback ויכולה רק להדליק, לא לכבות.
+        "emergency": bool(m.get("emergency")),
+        "priority": _int_or_none(m.get("priority")),
+        "flags": list(m.get("flags") or ()) or None,
+        "encrypted": bool(m.get("encrypted")), "enc": None,
         "ber": None, "level": None,        # DSD-FME לא מדפיס — אף פעם לא ממציאים
         "watchlist": watchlist.match(tg, src, tgt),   # None אם אין התאמה
         "dur": None, "event": typ,
@@ -661,6 +777,8 @@ def _normalize_dsd(m):
         "text": None, "wav": None,
         "delivery": m.get("delivery"),   # אופציונלי (data_header בלבד)
     }
+    if card["encrypted"]:
+        card["enc"] = dict(ENC_TAG)
     return card
 
 
@@ -871,16 +989,16 @@ def _dmr_listener():
     Phase 2). בלי זה, שתי שיחות בו-זמנית על שני ערוצים שונים עם אותו slot
     (1/2 — יש רק 2 אפשריים לכל ערוץ) היו מתמזגות/מקבלות תג-הצפנה בטעות
     מערוץ אחר — לא רק קוסמטי, שחיתות-נתונים בין-ערוצית אמיתית."""
-    global _dmr_seq
+    global _listener_bound
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.bind((DMR_UDP_HOST, DMR_UDP_PORT))
     except OSError:
         log.warning("DMR listener: port %d busy - /api/dmr יחזיר ריק", DMR_UDP_PORT)
+        _listener_bound = False
         return
-    seen = 0
-    _dedup: dict = {}           # (phys_lcn, tg, src, slot, call_type) → (timestamp, rec)
-    _slot_open_call: dict = {}  # (phys_lcn, slot) → (timestamp, rec) — לקורלציית encryption
+    _listener_bound = True
+    ctx = _reset_listener_ctx()
     while True:
         try:
             data, _ = sock.recvfrom(65535)
@@ -893,119 +1011,172 @@ def _dmr_listener():
         if not isinstance(msg, dict):
             continue
 
-        if _discover_active:   # side-tap: מזין את צובר הגילוי (כולל sync/channel_status)
-            _discover_collect(msg)
-
-        mtype = msg.get("type")
-        msg_phys_lcn = _int_or_none(msg.get("phys_lcn"))
-        if mtype == "decoder_status":   # Phase 7 partial-restart: מפענח בודד קם-מחדש/ויתרנו עליו
-            _channel_status_tick(msg)
-            continue
-        if mtype == "quality":
-            _rf_quality_tick(msg.get("error_type") or "UNKNOWN", phys_lcn=msg_phys_lcn)
-            cc = _int_or_none(msg.get("cc"))
-            sid = _intel_system_id()
-            if cc is not None and sid:
-                system_intel.record_cc(sid, cc, _active_color_code, t=msg.get("t"))
-            continue
-        # --- Phase 8: system radar (control-channel telemetry, always-on --
-        # never cards, only enriches system_intel; §5 "multi"/§10). Filtered
-        # to real user systems only (_intel_system_id() is None during
-        # standby/discovery-probe __probe__/__sweep__).
-        # ★ v0.12.0: phys_freq_hz (multi mode, מוחתם ע"י dsd_pty.tag_event) מועבר
-        # הלאה במקום להיזרק. טלמטריית CSBK מגיעה רק מהערוץ הפיזי שנושא את
-        # ה-Rest LSN => (rest_lsn, phys_freq_hz) הוא ground-truth למיפוי
-        # LSN↔תדר. ר' system_intel.record_rest_channel. בחד-ערוצי זה None ⇒
-        # אין שינוי התנהגות.
-        msg_phys_freq_hz = _int_or_none(msg.get("phys_freq_hz"))
-        if mtype == "lsn_status":
-            sid = _intel_system_id()
-            if sid:
-                system_intel.record_lsn_status(sid, msg.get("channels") or {},
-                                               t=msg.get("t"),
-                                               phys_freq_hz=msg_phys_freq_hz)
-            continue
-        if mtype == "site_info":
-            sid = _intel_system_id()
-            if sid:
-                system_intel.record_site(sid, msg.get("site"), t=msg.get("t"))
-                system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
-                                                 msg_phys_freq_hz, t=msg.get("t"))
-            continue
-        if mtype == "preamble_csbk":
-            sid = _intel_system_id()
-            if sid:
-                system_intel.record_private_call(
-                    sid, src=msg.get("src"), tgt=msg.get("tgt"), kind=msg.get("kind"),
-                    rest_lsn=msg.get("rest_lsn"), t=msg.get("t"))
-                system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
-                                                 msg_phys_freq_hz, t=msg.get("t"))
-            continue
-        if mtype == "bank_call":
-            sid = _intel_system_id()
-            if sid:
-                for entry in (msg.get("entries") or []):
-                    system_intel.record_private_call(
-                        sid, src=None, tgt=entry.get("tgt"), kind="bank",
-                        rest_lsn=entry.get("lsn"), t=msg.get("t"))
-            continue
-        if mtype == "encryption":
-            entry = _slot_open_call.get((msg_phys_lcn, msg.get("slot")))
-            ts = msg.get("t") or time.time()
-            if entry is not None and ts - entry[0] < 15:
-                with _dmr_lock:   # open_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
-                    entry[1]["encrypted"] = True
-                    entry[1]["enc"] = entry[1].get("enc") or {"alg": None, "alg_name": "מוצפן", "key_id": None}
-            continue
-
+        # ★ v0.13.0 — הלופ הזה חייב לשרוד **כל** דאטהגרם. עד כה ענפי
+        # רדאר-המערכת לא היו עטופים, ו-`{"type":"site_info","site":"abc"}` בודד
+        # (int() על טקסט) הרג את ה-thread לתמיד — בשקט, בזמן ש-/api/health
+        # ממשיך לדווח ok=True. הטיפול בדאטהגרם עבר לפונקציה נפרדת שגם עטופה
+        # וגם נבדקת ישירות ב-CI (השכבה ה-stateful הזאת לא הייתה בדיקה לפני).
+        _feed_tick(msg)
         try:
-            rec = _normalize_dsd(msg)
+            _handle_datagram(msg, ctx)
         except Exception:
-            log.exception("DMR: נרמול נכשל על דאטהגרם — מדולג")
-            continue
-        if mtype == "voice_call" and msg.get("crc_err"):
-            _rf_quality_tick("VOICE_CRC", phys_lcn=msg_phys_lcn)   # פריים קול שנכשל => גם מד ה-RF, גם (אם יש) הכרטיס
-        if rec is None:
-            continue
+            with _feed_lock:
+                _feed_stats["handler_errors"] += 1
+            log.exception("DMR listener: דאטהגרם הפיל את הטיפול — מדולג, ה-thread ממשיך")
+        # סגירת שיחות מְמוּתָנת: `lsn_status` לבדו הוא ~חצי מהפלט האמיתי, ואין
+        # סיבה לתפוס את _dmr_lock (שגם קוראי-API מחזיקים) על כל דאטהגרם.
+        # ה-watcher התקופתי מכסה את המקרה שבו התעבורה נעצרת לגמרי.
+        now = time.time()
+        if now - ctx["last_sweep"] >= CLOSE_SWEEP_INTERVAL_SEC:
+            ctx["last_sweep"] = now
+            try:
+                _close_stale_calls(ctx, now=now)
+            except Exception:
+                log.exception("DMR listener: סגירת שיחות נכשלה")
 
-        # dedup: אותה שיחה (ערוץ+tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים
-        # (משך/wav), לא כרטיס חדש. שיחות voice ב-DMR משדרות מסגרות רבות.
-        key = (rec.get("phys_lcn"), rec.get("tg"), rec.get("src"), rec.get("slot"), rec.get("call_type"))
-        ts = rec.get("t") or time.time()
-        is_voice = rec.get("call_type") in ("group", "private") and (rec.get("tg") or rec.get("src"))
-        if is_voice:
-            prev_ts, prev_rec = _dedup.get(key, (0, None))
-            if prev_rec is not None and ts - prev_ts < 8:
-                with _dmr_lock:   # prev_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
-                    prev_rec["dur"] = round(ts - prev_rec.get("_start", prev_ts), 1)
-                    if rec.get("wav"):
-                        prev_rec["wav"] = rec["wav"]
-                    prev_rec["frames"] = prev_rec.get("frames", 1) + 1
-                _dedup[key] = (ts, prev_rec)
-                if rec.get("slot") is not None:
-                    _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, prev_rec)
-                continue
-            rec["_start"] = ts
-            _dedup[key] = (ts, rec)
-            if len(_dedup) > 500:
-                cutoff = ts - 30
-                for k in [k for k, (t0, _) in _dedup.items() if t0 < cutoff]:
-                    del _dedup[k]
 
-        _append_dmr_log(rec)
-        with _dmr_lock:
-            _dmr_seq += 1
-            rec["id"] = _dmr_seq
-            _dmr_msgs.append(rec)
-        if is_voice and rec.get("slot") is not None:
-            _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, rec)
-            if len(_slot_open_call) > 2 * MULTI_CHANNELS_MAX:   # עד 2 slots × N ערוצים ב-multi
-                cutoff = ts - 15
-                for k in [k for k, (t0, _) in _slot_open_call.items() if t0 < cutoff]:
-                    del _slot_open_call[k]
-        seen += 1
-        if seen % 200 == 0:
-            _trim_dmr_log()
+def _handle_datagram(msg, ctx):
+    """טיפול בדאטהגרם בודד מ-dsd_pty. הופרד מ-_dmr_listener כדי שיהיה גם עטוף
+    (כל חריגה נבלמת ב-listener) וגם נבדק-ישירות ב-CI. ctx מחזיק את המצב
+    הנגלל: dedup, slot_open (קורלציית הצפנה), pending (שיחות פתוחות שטרם
+    נכתבו לדיסק) ו-seen."""
+    global _dmr_seq
+    _dedup = ctx["dedup"]
+    _slot_open_call = ctx["slot_open"]
+
+    if _discover_active:   # side-tap: מזין את צובר הגילוי (כולל sync/channel_status)
+        _discover_collect(msg)
+
+    mtype = msg.get("type")
+    msg_phys_lcn = _int_or_none(msg.get("phys_lcn"))
+    if mtype == "decoder_status":   # Phase 7 partial-restart: מפענח בודד קם-מחדש/ויתרנו עליו
+        _channel_status_tick(msg)
+        return
+    if mtype == "quality":
+        _rf_quality_tick(msg.get("error_type") or "UNKNOWN", phys_lcn=msg_phys_lcn)
+        cc = _int_or_none(msg.get("cc"))
+        sid = _intel_system_id()
+        if cc is not None and sid:
+            system_intel.record_cc(sid, cc, _active_color_code, t=msg.get("t"))
+        return
+    # --- Phase 8: system radar (control-channel telemetry, always-on --
+    # never cards, only enriches system_intel; §5 "multi"/§10). Filtered
+    # to real user systems only (_intel_system_id() is None during
+    # standby/discovery-probe __probe__/__sweep__).
+    # ★ v0.12.0: phys_freq_hz (multi mode, מוחתם ע"י dsd_pty.tag_event) מועבר
+    # הלאה במקום להיזרק. טלמטריית CSBK מגיעה רק מהערוץ הפיזי שנושא את
+    # ה-Rest LSN => (rest_lsn, phys_freq_hz) הוא ground-truth למיפוי
+    # LSN↔תדר. ר' system_intel.record_rest_channel. בחד-ערוצי זה None ⇒
+    # אין שינוי התנהגות.
+    msg_phys_freq_hz = _int_or_none(msg.get("phys_freq_hz"))
+    if mtype == "lsn_status":
+        sid = _intel_system_id()
+        if sid:
+            system_intel.record_lsn_status(sid, msg.get("channels") or {},
+                                           t=msg.get("t"),
+                                           phys_freq_hz=msg_phys_freq_hz)
+        return
+    if mtype == "site_info":
+        sid = _intel_system_id()
+        if sid:
+            system_intel.record_site(sid, msg.get("site"), t=msg.get("t"))
+            system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
+                                             msg_phys_freq_hz, t=msg.get("t"))
+        return
+    if mtype == "preamble_csbk":
+        sid = _intel_system_id()
+        if sid:
+            system_intel.record_private_call(
+                sid, src=msg.get("src"), tgt=msg.get("tgt"), kind=msg.get("kind"),
+                rest_lsn=msg.get("rest_lsn"), t=msg.get("t"))
+            system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
+                                             msg_phys_freq_hz, t=msg.get("t"))
+        return
+    if mtype == "bank_call":
+        sid = _intel_system_id()
+        if sid:
+            for entry in (msg.get("entries") or []):
+                system_intel.record_private_call(
+                    sid, src=None, tgt=entry.get("tgt"), kind="bank",
+                    rest_lsn=entry.get("lsn"), t=msg.get("t"))
+        return
+    if mtype == "encryption":
+        entry = _slot_open_call.get((msg_phys_lcn, msg.get("slot")))
+        ts = msg.get("t") or time.time()
+        if entry is not None and ts - entry[0] < 15:
+            with _dmr_lock:   # open_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
+                entry[1]["encrypted"] = True
+                entry[1]["enc"] = entry[1].get("enc") or dict(ENC_TAG)
+        return
+
+    if mtype == "voice_miss":
+        # שורה שנראתה כמו שיחה ולא נתפסה ע"י ה-regex (ר' dsd_pty).
+        # לא כרטיס — מונה גלוי ב-/api/rf, כדי שהמקרה לא ייעלם בשקט שוב.
+        with _feed_lock:
+            _feed_stats["voice_miss"] += 1
+            _feed_stats["voice_miss_last"] = msg.get("text")
+        log.warning("DMR: שורת-שיחה לא נתפסה ע\"י הפרסר: %s", msg.get("text"))
+        return
+
+    try:
+        rec = _normalize_dsd(msg)
+    except Exception:
+        log.exception("DMR: נרמול נכשל על דאטהגרם — מדולג")
+        return
+    if mtype == "voice_call" and msg.get("crc_err"):
+        _rf_quality_tick("VOICE_CRC", phys_lcn=msg_phys_lcn)   # פריים קול שנכשל => גם מד ה-RF, גם (אם יש) הכרטיס
+    if rec is None:
+        return
+
+    # dedup: אותה שיחה (ערוץ+tg+src+slot) בתוך 8ש' => עדכון הכרטיס הקיים
+    # (משך/wav), לא כרטיס חדש. שיחות voice ב-DMR משדרות מסגרות רבות.
+    key = (rec.get("phys_lcn"), rec.get("tg"), rec.get("src"), rec.get("slot"), rec.get("call_type"))
+    ts = rec.get("t") or time.time()
+    is_voice = rec.get("call_type") in ("group", "private") and (rec.get("tg") or rec.get("src"))
+    if is_voice:
+        prev_ts, prev_rec = _dedup.get(key, (0, None))
+        if prev_rec is not None and ts - prev_ts < 8:
+            with _dmr_lock:   # prev_rec חי גם ב-_dmr_msgs => מוטציה תחת הנעילה
+                prev_rec["dur"] = round(ts - prev_rec.get("_start", prev_ts), 1)
+                if rec.get("wav"):
+                    prev_rec["wav"] = rec["wav"]
+                prev_rec["frames"] = prev_rec.get("frames", 1) + 1
+            _dedup[key] = (ts, prev_rec)
+            if key in ctx["pending"]:   # חלון הסגירה נמדד מהפריים האחרון, לא הראשון
+                ctx["pending"][key] = (ts, prev_rec)
+            if rec.get("slot") is not None:
+                _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, prev_rec)
+            return
+        rec["_start"] = ts
+        _dedup[key] = (ts, rec)
+        if len(_dedup) > 500:
+            cutoff = ts - 30
+            for k in [k for k, (t0, _) in _dedup.items() if t0 < cutoff]:
+                del _dedup[k]
+
+    with _dmr_lock:
+        _dmr_seq += 1
+        rec["id"] = _dmr_seq
+        _dmr_msgs.append(rec)
+    # ★ v0.13.0 — כתיבה לדיסק **בסגירת השיחה**, לא בפריים הראשון.
+    # קודם נכתב כאן מיד, ולכן dur/frames/encrypted/id — שכולם נקבעים אחר-כך
+    # כמוטציה על האובייקט החי — לא הגיעו לארכיון **אף פעם**: `?day=` דיווח
+    # airtime 0 ו-0% מוצפן לנצח, וה-CSV ייצא עמודות ריקות בסתירה למסך.
+    # שיחות voice נכנסות ל-pending ונכתבות ב-_close_stale_calls; שאר הכרטיסים
+    # (data/lrrp) אינם עוברים dedup ואינם מקבלים תג-הצפנה => נכתבים מיד.
+    if is_voice:
+        ctx["pending"][key] = (ts, rec)
+    else:
+        _append_dmr_log(_archive_record(rec))
+    if is_voice and rec.get("slot") is not None:
+        _slot_open_call[(rec.get("phys_lcn"), rec["slot"])] = (ts, rec)
+        if len(_slot_open_call) > 2 * MULTI_CHANNELS_MAX:   # עד 2 slots × N ערוצים ב-multi
+            cutoff = ts - 15
+            for k in [k for k, (t0, _) in _slot_open_call.items() if t0 < cutoff]:
+                del _slot_open_call[k]
+    ctx["seen"] += 1
+    if ctx["seen"] % 200 == 0:
+        _trim_dmr_log()
 
 
 # --- מצב סריקה/סבב: מחזור אוטומטי בין מערכות DMR ----------------------------
@@ -1714,8 +1885,15 @@ def api_rf():
     **אין dBFS/SNR** — נדחה במכוון (ר' CLAUDE.md §8: דורש פטצ' rsp_tcp).
     by_channel: פירוט פר-ערוץ ב-multi mode (Phase 2) — [] בחד-ערוצי."""
     st = load_state()
+    feed = _feed_snapshot()
     return jsonify(ok=True, gain_nudge=int(st.get("gain_nudge", 0)),
-                   by_channel=_rf_quality_by_channel(), **_rf_quality_snapshot())
+                   by_channel=_rf_quality_by_channel(),
+                   # ★ v0.13.0: שורות-שיחה שהפרסר לא תפס, ושגיאות-טיפול —
+                   # שני מונים שקודם לא היו קיימים ולכן נפלו בשקט.
+                   parser_miss=feed["voice_miss"],
+                   parser_miss_last=feed["voice_miss_last"],
+                   handler_errors=feed["handler_errors"],
+                   **_rf_quality_snapshot())
 
 
 @app.route("/api/system-intel")
@@ -1895,7 +2073,34 @@ def _activity_watcher():
             _sweep_recordings()
         except Exception:
             log.exception("activity watcher")
+        try:
+            # ★ v0.13.0: סגירת שיחות תלויות גם כשהתעבורה נעצרה. בלי טיק תקופתי,
+            # השיחה האחרונה לפני דממה הייתה נשארת ב-pending ולא מגיעה לארכיון —
+            # ה-listener מסיים סבב רק כשמגיע דאטהגרם נוסף.
+            _close_stale_calls(_listener_ctx)
+        except Exception:
+            log.exception("סגירת שיחות תלויות נכשלה")
         time.sleep(WATCH_INTERVAL)
+
+
+def _listener_watchdog():
+    """★ v0.13.0 — חגורה-ובנוסף-שלייקס. אחרי ה-try/except ב-_dmr_listener מוות
+    של ה-thread אמור להיות בלתי-אפשרי, אבל "אמור" הוא בדיוק מה שהיה נכון גם
+    לפני שדאטהגרם אחד הרג אותו. אם ה-thread מת — מקימים אותו מחדש ומתעדים.
+    ה-bind נכשל (פורט תפוס) הוא מצב אחר ולא מנסים אותו שוב בלופ."""
+    global _listener_thread
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            if _listener_bound is False:
+                continue     # הפורט תפוס — לא thread שמת; מדווח דרך /api/health
+            thread = _listener_thread
+            if thread is not None and not thread.is_alive():
+                log.error("DMR listener מת — מקים מחדש")
+                _listener_thread = threading.Thread(target=_dmr_listener, daemon=True)
+                _listener_thread.start()
+        except Exception:
+            log.exception("listener watchdog")
 
 
 def _intel_flush_watcher():
@@ -2045,9 +2250,41 @@ def api_health():
         today = [m for m in _dmr_msgs if (m.get("t") or 0) >= floor]
         calls_today = len(today)
         last_call = max((m.get("t") or 0 for m in _dmr_msgs), default=0) or None
+    feed = _feed_snapshot()
     return jsonify(ok=ok, app_mode=mode, services=services,
                    sdr_present=_sdr_present(), calls_today=calls_today,
-                   last_call_at=last_call)
+                   last_call_at=last_call,
+                   listener_alive=_listener_alive(), feed=feed,
+                   decode_state=_decode_state(mode, feed))
+
+
+DECODE_SILENT_SEC = 180.0   # בלי אף דאטהגרם כל-כך הרבה זמן במצב פעיל => "שקט"
+DECODE_VOICE_SEC = 900.0    # שיחת-קול בטווח הזה => "מפענח" בוודאות
+
+
+def _decode_state(mode, feed, now=None):
+    """★ v0.13.0 — ההבחנה שלא הייתה קיימת: "הרשת שקטה" מול "השרשרת מתה".
+    עד כה שלושת המצבים — רשת שקטה, listener מת, ושרשרת חיה-אך-חירשת — רונדרו
+    בממשק **זהה** (פיל ירוק, "מאזין"), ו-errors_per_min=0 של מד ה-RF דו-משמעי
+    בין הטוב ביותר לגרוע ביותר.
+
+    פונקציה טהורה (mode + סנפשוט-פיד) => נבדקת ב-CI. שמרנית במכוון: מדווחת
+    `silent` ולא "שבור", כי בחד-ערוצי non-trunk דממה מלאה היא מצב לגיטימי —
+    אין לנו ראיה להאשים את השרשרת, ולא ממציאים אבחנה (§8)."""
+    now = now if now is not None else time.time()
+    if _listener_alive() is False:
+        return "listener_down"
+    if mode not in MODE_SERVICE:
+        return "standby"
+    last_voice = feed.get("last_voice_at")
+    if last_voice and now - last_voice <= DECODE_VOICE_SEC:
+        return "decoding"
+    if feed.get("datagrams_window"):
+        return "chain_alive"        # מגיעים אירועים (טלמטריה/איכות) אך לא קול
+    last_dg = feed.get("last_datagram_at")
+    if last_dg is None or now - last_dg > DECODE_SILENT_SEC:
+        return "silent"             # אין שום נתון מהמפענח — דורש בדיקה
+    return "chain_alive"
 
 
 # --- פיד DMR + ייצוא + ארכיון -----------------------------------------------
@@ -2334,6 +2571,25 @@ def api_discover_save():
 BOOT_SDR_WAIT_SEC = 90
 
 
+def _restore_intel_cache(st):
+    """ממלא את מטמון-המודיעין (_active_system_id/_active_color_code) מ-state
+    שמור, בלי לגעת בשרשרת האותות. נחוץ כשהמפענח כבר רץ ו-_enter_dmr לא
+    ייקרא — אחרת ה-listener מסנן כל אירוע-מודיעין. פונקציה נפרדת (ולא שורה
+    ב-_boot_restore) כדי שתהיה נבדקת ישירות."""
+    global _active_system_id, _active_color_code
+    mode = st.get("app_mode", "off")
+    if mode not in MODE_SERVICE:
+        return None
+    system = _find_system(load_systems(), st.get("system"))
+    if not system:
+        return None
+    _active_system_id = system.get("id")
+    _active_color_code = system.get("color_code")
+    log.info("boot-restore: מטמון-מודיעין שוחזר למערכת %s (מצב %s)",
+             _active_system_id, mode)
+    return _active_system_id
+
+
 def _boot_restore():
     """אורקסטרציית אתחול: dmr-dsdfme אינו enabled ב-systemd — dmr-web (שעולה תמיד)
     קורא את state.json ומחזיר את המצב השמור (dmr/off/scan). רץ ב-thread daemon;
@@ -2343,6 +2599,12 @@ def _boot_restore():
         mode = st.get("app_mode", "off")
         live = _live_mode()
         if live == mode:
+            # ★ v0.13.0 — המצב הזה (dmr-dsdfme כבר רץ, למשל אחרי
+            # `systemctl restart dmr-web` או Restart=always) יצא מכאן בלי
+            # לאכלס את מטמון-המודיעין, ש-נקבע **רק** ב-_enter_dmr. התוצאה:
+            # _intel_system_id() החזיר None לתמיד וכל v0.11.0+v0.12.0
+            # (אתרים/LSN/CDR/CC/הצבעות-מיפוי) צבר אפס — בשקט מוחלט.
+            _restore_intel_cache(st)
             return
         if mode == "off":
             if live:
@@ -2404,7 +2666,9 @@ if __name__ == "__main__":
     threading.Thread(target=_activity_watcher, daemon=True).start()
     threading.Thread(target=_intel_flush_watcher, daemon=True).start()
     _load_dmr_history()                                            # היסטוריית היום שורדת restart (לפני ה-listener)
-    threading.Thread(target=_dmr_listener, daemon=True).start()    # פיד UDP מ-dsd_pty (שקט ב-standby)
+    _listener_thread = threading.Thread(target=_dmr_listener, daemon=True)
+    _listener_thread.start()                                       # פיד UDP מ-dsd_pty (שקט ב-standby)
+    threading.Thread(target=_listener_watchdog, daemon=True).start()
     if TRANSCRIBE:
         threading.Thread(target=_transcribe_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
