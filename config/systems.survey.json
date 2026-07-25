@@ -231,7 +231,7 @@
     "id": "multi_164cluster",
     "name": "רב-ערוצי — אשכול 164MHz (הכי פעיל + ראיות ID)",
     "control": 164.10625,
-    "color_code": 8,
+    "color_code": 10,
     "channelmap": [
       {
         "lcn": 1,

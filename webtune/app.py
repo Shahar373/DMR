@@ -316,22 +316,48 @@ def _sanitize_freq(val, default=None):
     return s if _FREQ_RE.match(s) else default
 
 
-def render_channelmap(channelmap):
+CHANNELMAP_HEADER = "# LCN,FREQ_HZ"
+
+
+def render_channelmap(channelmap, lsn_pairs=False):
     """בונה את תוכן channelmap.csv (LCN,FREQ_HZ) ל-DSD-FME (‎-C). התדרים ב-Hz.
-    פורמט DSD-FME: כל שורה 'lcn,freq_hz'. פונקציה טהורה => נבדקת בלי חומרה."""
-    lines = []
+    פורמט DSD-FME: כל שורה 'lcn,freq_hz'. פונקציה טהורה => נבדקת בלי חומרה.
+
+    ⚠ שורת-הכותרת אינה קוסמטית — היא **חובה**. csvChanImport של DSD-FME
+    (src/dsd_import.c: `if (row_count == 1) continue; //don't want labels`)
+    מדלג על השורה הראשונה **תמיד**, בלי לבדוק אם היא כותרת. בלעדיה הערוץ
+    הראשון במפה נזרק בשקט בכל הרצת-טראנקינג. הכותרת מתחילה ב-'#' כדי
+    שגם dsd_pty.parse_channelmap_hz/rsp_fm.parse_channelmap_hz (שקוראים את
+    *אותו* קובץ ב-multi mode) ידלגו עליה — שם היא כן צריכה להיות מדולגת-במפורש.
+
+    lsn_pairs=True (מצב טראנקינג חד-ערוצי): ב-Cap+ המפה של DSD-FME מאונדקסת
+    ב-**LSN** ולא בערוץ פיזי, וכל תדר נושא שני LSN-ים — LSN 1+2 על הערוץ
+    הפיזי הראשון, 3+4 על השני וכן הלאה (אומת מול dmr_csbk.c, שמאנדקס
+    trunk_chan_map[LSN] וגוזר את ה-slot מזוגיות ה-LSN, ומול תיעוד ה-upstream).
+    לכן ערוץ פיזי n מתפרש לשתי שורות: LSN 2n-1 ו-LSN 2n, שתיהן אותו תדר.
+    בלי ההרחבה DSD-FME מכוון לתדר הלא-נכון בכל מעקב-שיחה (הוא קורא את
+    השורה שמספרה = ה-LSN, ואצלנו שם ישב ערוץ פיזי אחר לגמרי).
+    ⚠ ההרחבה מתקנת את ה**פורמט**; ה**סדר** (איזה תדר הוא הערוץ הפיזי הראשון)
+    נשאר השערה עד שרדאר-המערכת מגלה אותו בפועל — ר' system_intel.derive_lsn_map.
+    ב-multi mode ההרחבה **אסורה**: שם אותו קובץ הוא רשימת הערוצים הפיזיים
+    שרוצים לדמודל, ושורות כפולות היו מייצרות מדמודלטורים כפולים."""
+    lines = [CHANNELMAP_HEADER]
     for ch in channelmap or []:
         try:
             lcn = int(ch["lcn"])
             hz = int(round(float(ch["freq"]) * 1e6))
         except (KeyError, TypeError, ValueError):
             continue
-        lines.append(f"{lcn},{hz}")
-    return "\n".join(lines) + ("\n" if lines else "")
+        if lsn_pairs:
+            lines.append(f"{lcn * 2 - 1},{hz}")
+            lines.append(f"{lcn * 2},{hz}")
+        else:
+            lines.append(f"{lcn},{hz}")
+    return "\n".join(lines) + "\n"
 
 
-def write_channelmap(channelmap):
-    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap))
+def write_channelmap(channelmap, lsn_pairs=False):
+    _atomic_write(CHANNELMAP_PATH, render_channelmap(channelmap, lsn_pairs=lsn_pairs))
 
 
 def render_dmr_env(system, multi=False):
@@ -435,8 +461,12 @@ def _enter_dmr(system, multi=False):
     """כותב env + channelmap ומריץ את dmr-dsdfme (DSD-FME תחת PTY). מחזיר
     (error, detail). מבנה זהה ל-_enter_acars ב-AIR-AM: write-env → restart → poll
     לקריסה מאוחרת (השירות יכול לעלות ואז לקרוס על תדר/מפה רעים ~2ש' אחר-כך).
-    multi=True: מצב רב-ערוצי (Phase 2) — ר' render_dmr_env."""
-    write_channelmap(system.get("channelmap"))
+    multi=True: מצב רב-ערוצי (Phase 2) — ר' render_dmr_env.
+
+    ⚠ אותו קובץ channelmap.csv משרת שתי סמנטיקות שונות, ולכן lsn_pairs תלוי-מצב:
+    בחד-ערוצי הוא מפת ה-LSN של DSD-FME (זוגות — ר' render_channelmap), ב-multi
+    הוא רשימת הערוצים הפיזיים לדמודולציה (שורה לערוץ, בלי הכפלה)."""
+    write_channelmap(system.get("channelmap"), lsn_pairs=not multi)
     write_dmr_env(system, multi=multi)
     try:
         r = _sysctl("restart", DMR_SERVICE, timeout=45)
@@ -882,15 +912,25 @@ def _dmr_listener():
         # never cards, only enriches system_intel; §5 "multi"/§10). Filtered
         # to real user systems only (_intel_system_id() is None during
         # standby/discovery-probe __probe__/__sweep__).
+        # ★ v0.12.0: phys_freq_hz (multi mode, מוחתם ע"י dsd_pty.tag_event) מועבר
+        # הלאה במקום להיזרק. טלמטריית CSBK מגיעה רק מהערוץ הפיזי שנושא את
+        # ה-Rest LSN => (rest_lsn, phys_freq_hz) הוא ground-truth למיפוי
+        # LSN↔תדר. ר' system_intel.record_rest_channel. בחד-ערוצי זה None ⇒
+        # אין שינוי התנהגות.
+        msg_phys_freq_hz = _int_or_none(msg.get("phys_freq_hz"))
         if mtype == "lsn_status":
             sid = _intel_system_id()
             if sid:
-                system_intel.record_lsn_status(sid, msg.get("channels") or {}, t=msg.get("t"))
+                system_intel.record_lsn_status(sid, msg.get("channels") or {},
+                                               t=msg.get("t"),
+                                               phys_freq_hz=msg_phys_freq_hz)
             continue
         if mtype == "site_info":
             sid = _intel_system_id()
             if sid:
                 system_intel.record_site(sid, msg.get("site"), t=msg.get("t"))
+                system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
+                                                 msg_phys_freq_hz, t=msg.get("t"))
             continue
         if mtype == "preamble_csbk":
             sid = _intel_system_id()
@@ -898,6 +938,8 @@ def _dmr_listener():
                 system_intel.record_private_call(
                     sid, src=msg.get("src"), tgt=msg.get("tgt"), kind=msg.get("kind"),
                     rest_lsn=msg.get("rest_lsn"), t=msg.get("t"))
+                system_intel.record_rest_channel(sid, msg.get("rest_lsn"),
+                                                 msg_phys_freq_hz, t=msg.get("t"))
             continue
         if mtype == "bank_call":
             sid = _intel_system_id()
@@ -1685,6 +1727,41 @@ def api_system_intel():
     כרגע); ברירת מחדל: המערכת הפעילה. ריק בשקט אם המערכת עוד לא נצפתה."""
     sid = request.args.get("system") or _active_system_id
     return jsonify(ok=True, system=sid, intel=system_intel.export_for(sid))
+
+
+@app.route("/api/system-intel/apply-lsn", methods=["POST"])
+def api_system_intel_apply_lsn():
+    """★ אימוץ מיפוי ה-LSN שהתגלה (v0.12.0) כ-channelmap של המערכת.
+
+    זו **הפעולה היחידה** שבה מודיעין-מערכת נוגע ב-systems.json, והיא יזומה-
+    אנושית במפורש (POST דרך _guard, כפתור ב-UI) — system_intel עצמו לעולם לא
+    כותב לקונפיג (CLAUDE.md §5). הערך המוסף: ה-lcn מפסיק להיות אינדקס-שרירותי
+    (מספור לפי סדר-תדרים, כפי שהגיע מסקר-השדה) ונהיה מספר-הערוץ-הפיזי האמיתי
+    שנגזר מה-LSN שנצפה בפועל — וזה מה שהופך את מצב הטראנקינג החד-ערוצי לנכון,
+    כי render_channelmap(lsn_pairs=True) מרחיב אותו חזרה למפת-LSN אמיתית.
+
+    שמרני במכוון: מחליף channelmap **רק** למערכת המבוקשת, ומסרב אם המיפוי
+    ריק/סתור. שאר המערכות ושאר שדות המערכת נשארים כמו-שהם."""
+    data = request.get_json(silent=True) or {}
+    sid = data.get("system") or _active_system_id
+    if not sid:
+        return jsonify(ok=False, error="אין מערכת פעילה — ציין system"), 400
+    channelmap = system_intel.lsn_map_to_channelmap(system_intel.lsn_map_for(sid))
+    if not channelmap:
+        return jsonify(ok=False, error="אין עדיין מיפוי LSN מוכרע למערכת הזו — "
+                                      "הרץ multi על ערוץ-בקרה פעיל וחזור"), 400
+    systems = load_systems()
+    if not _find_system(systems, sid):
+        return jsonify(ok=False, error=f"מערכת {sid} לא קיימת"), 404
+    merged = [{**s, "channelmap": channelmap} if s.get("id") == sid else s
+              for s in systems]
+    ok, cleaned = _validate_systems(merged)
+    if not ok:
+        return jsonify(ok=False, error="המיפוי שהתגלה לא עבר ולידציה"), 400
+    _atomic_write(SYSTEMS_PATH, json.dumps(cleaned, ensure_ascii=False))
+    log.info("system-intel: channelmap של %s אומץ ממיפוי LSN (%d ערוצים, מ-%s)",
+             sid, len(channelmap), request.remote_addr)
+    return jsonify(ok=True, system=sid, channelmap=channelmap, systems=cleaned)
 
 
 @app.route("/api/gain", methods=["POST"])

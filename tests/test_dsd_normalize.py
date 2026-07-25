@@ -793,12 +793,120 @@ def test_api_system_intel_explicit_system_param(paths, monkeypatch):
     assert "4" in body["intel"]["sites"]
 
 
+def test_listener_lsn_status_maps_rest_lsn_to_physical_freq(paths, monkeypatch):
+    """★ v0.12.0 e2e: אירוע lsn_status ב-multi נושא phys_freq_hz (חתימת
+    dsd_pty.tag_event). ה-LSN שמסומן 'rest' בתוכו מתמפה לתדר הזה — ground-truth,
+    לא ניחוש. עד v0.11.0 phys_freq_hz נזרק כאן."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15571)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel._intel.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    for _ in range(3):
+        _send_udp(15571, {"type": "lsn_status", "channels": {"5": "rest", "6": 3},
+                          "phys_lcn": 3, "phys_freq_hz": 164_537_500, "t": time.time()})
+    time.sleep(0.4)
+    intel = app.system_intel.export_for("s1")
+    assert intel["lsn_freq"] == {"5": {"164537500": 3}}
+    assert intel["lsn_map"]["5"] == {
+        "freq_hz": 164_537_500, "votes": 3, "total": 3, "confidence": 1.0,
+        "source": "rest", "physical_channel": 3, "pair_lsn": 6, "pair_conflict": False}
+    assert intel["lsn_channelmap"] == [{"lcn": 3, "freq": 164.5375}]
+
+
+def test_listener_site_info_also_votes_for_rest_lsn(paths, monkeypatch):
+    """site_info נושא rest_lsn גם הוא, ומגיע רק מערוץ-הבקרה => אותה הסקה."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15572)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel._intel.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    for _ in range(3):
+        _send_udp(15572, {"type": "site_info", "site": 2, "rest_lsn": 1, "rs": 0,
+                          "phys_lcn": 1, "phys_freq_hz": 164_106_250, "t": time.time()})
+    time.sleep(0.4)
+    intel = app.system_intel.export_for("s1")
+    assert intel["sites"]["2"]["count"] == 3          # ההתנהגות הקיימת נשמרה
+    assert intel["lsn_map"]["1"]["freq_hz"] == 164_106_250
+    assert intel["lsn_map"]["2"]["source"] == "pair"  # LSN 1+2 = אותו ערוץ פיזי
+
+
+def test_listener_single_channel_creates_no_lsn_map(paths, monkeypatch):
+    """חד-ערוצי (בלי phys_freq_hz): אפס שינוי התנהגות מול v0.11.0 —
+    מפת-התפוסה נצברת, מיפוי-תדר לא נוצר (אין ממה להסיק)."""
+    app = paths
+    monkeypatch.setattr(app, "DMR_UDP_PORT", 15573)
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel._intel.clear()
+    threading.Thread(target=app._dmr_listener, daemon=True).start()
+    time.sleep(0.3)
+    for _ in range(5):
+        _send_udp(15573, {"type": "lsn_status", "channels": {"5": "rest", "6": 3},
+                          "t": time.time()})
+    time.sleep(0.4)
+    intel = app.system_intel.export_for("s1")
+    assert intel["lsn_directory"]["5"]["occupant"] == "rest"
+    assert intel["lsn_freq"] == {} and intel["lsn_map"] == {}
+
+
+def test_api_apply_lsn_writes_discovered_channelmap(paths, monkeypatch):
+    """כפתור "אמץ מיפוי": ה-lcn מפסיק להיות אינדקס-שרירותי ונהיה מספר-הערוץ-
+    הפיזי שנגזר מה-LSN שנצפה. יזום-אנושית (POST) — לא כתיבה אוטומטית."""
+    app = paths
+    import json
+    app.SYSTEMS_PATH.write_text(json.dumps(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 10,
+          "channelmap": [{"lcn": 1, "freq": 164.10625}, {"lcn": 2, "freq": 164.3}]}]))
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel._intel.clear()
+    for _ in range(4):
+        app.system_intel.record_rest_channel("s1", 5, 164_537_500, t=1.0)
+        app.system_intel.record_rest_channel("s1", 1, 164_106_250, t=1.0)
+    body = app.app.test_client().post("/api/system-intel/apply-lsn", json={}).get_json()
+    assert body["ok"] is True
+    assert body["channelmap"] == [{"lcn": 1, "freq": 164.10625},
+                                  {"lcn": 3, "freq": 164.5375}]
+    assert app.load_systems()[0]["channelmap"] == body["channelmap"]
+
+
+def test_api_apply_lsn_refuses_without_a_decided_map(paths, monkeypatch):
+    """אין מיפוי מוכרע => 400, ולא כתיבה חלקית/ריקה על ה-channelmap הקיים."""
+    app = paths
+    import json
+    app.SYSTEMS_PATH.write_text(json.dumps(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 10,
+          "channelmap": [{"lcn": 1, "freq": 164.10625}]}]))
+    monkeypatch.setattr(app, "_active_system_id", "s1")
+    app.system_intel._intel.clear()
+    resp = app.app.test_client().post("/api/system-intel/apply-lsn", json={})
+    assert resp.status_code == 400
+    assert app.load_systems()[0]["channelmap"] == [{"lcn": 1, "freq": 164.10625}]
+
+
+def test_api_apply_lsn_unknown_system_is_404(paths, monkeypatch):
+    app = paths
+    import json
+    app.SYSTEMS_PATH.write_text(json.dumps(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 10,
+          "channelmap": []}]))
+    app.system_intel._intel.clear()
+    for _ in range(4):
+        app.system_intel.record_rest_channel("nope", 1, 164_106_250, t=1.0)
+    resp = app.app.test_client().post("/api/system-intel/apply-lsn",
+                                      json={"system": "nope"})
+    assert resp.status_code == 404
+
+
 def test_api_system_intel_no_active_system_returns_blank(paths, monkeypatch):
     app = paths
     monkeypatch.setattr(app, "_active_system_id", None)
     body = app.app.test_client().get("/api/system-intel").get_json()
     assert body["system"] is None
-    assert body["intel"] == {"sites": {}, "lsn_directory": {}, "cc": None, "private_calls": []}
+    assert body["intel"] == {"sites": {}, "lsn_directory": {}, "cc": None,
+                             "private_calls": [], "lsn_freq": {}, "lsn_freq_seen": None,
+                             "lsn_map": {}, "lsn_channelmap": []}
 
 
 def test_listener_dedup_keys_on_phys_lcn(paths, monkeypatch):

@@ -100,6 +100,8 @@ webtune/
                             #   שיחות-יחיד/סחיפת-CC, נצבר מ-lsn_status/bank_call/
                             #   preamble_csbk/site_info. record_* טהורות; flush debounced
                             #   (lsn_status תכוף מדי לכתיבה בכל אירוע). ר' §5/§8/§10.
+                            #   + ★ v0.12.0: גילוי מיפוי LSN↔תדר (multi בלבד) —
+                            #   record_rest_channel/derive_lsn_map (טהורה). ר' §5/§8.
   discovery.py              # ★ גילוי רשתות (טהור): ולידציית טווח, גריד, זיהוי מועמדים
                             #   (סף אדפטיבי FFT), סיכום בדיקה, רשומה→מערכת. ר' §5/§10.
   dsd_export.py             # ייצוא CSV(BOM)/JSON לפיד.
@@ -125,7 +127,7 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 275 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
 .github/workflows/ci.yml    # pytest + bash -n על install.sh ו-dmr-wait-sdrplay.
 ```
@@ -145,7 +147,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | `/var/lib/dmr/systems.json` | מערכות DMR (נערכות מה-UI) | app.py |
 | `/var/lib/dmr/aliases.json` | עריכות אליאס ידניות | aliases.py |
 | `/var/lib/dmr/watchlist.json` | רשימת RID/TG במעקב (התראה מקומית) | watchlist.py |
-| `/var/lib/dmr/system_intel.json` | מודיעין-מערכת נצבר (אתרים/LSN/CDR/CC), debounced | system_intel.py |
+| `/var/lib/dmr/system_intel.json` | מודיעין-מערכת נצבר (אתרים/LSN/CDR/CC + הצבעות LSN↔תדר), debounced | system_intel.py |
 | `/var/lib/dmr/discovery.json` | דוח הגילוי האחרון (מועמדים + רשתות שהתגלו) | _discover_loop |
 | `/var/lib/dmr/dmr.jsonl` | היסטוריית שיחות (retention 8000) | _dmr_listener |
 | `/var/lib/dmr/activity.jsonl` | יומן הקלטות | _activity_watcher |
@@ -253,6 +255,19 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
   ה-listener **לעולם לא** קורא `load_state()`/`load_systems()` (דיסק) פר-
   אירוע UDP, כי `lsn_status` תכוף מדי לזה. `GET /api/system-intel` חושף
   את הפרופיל הנצבר (אין PUT — זה לא config נערך-ידנית).
+- **★ מיפוי LSN↔תדר (v0.12.0) — הנתון היה שם ונזרק:** טלמטריית CSBK
+  (`lsn_status`/`site_info`/`preamble_csbk`) אומרת איזה LSN הוא ה-**Rest**,
+  אבל לא באיזה תדר. `dsd_pty.tag_event` כבר מחתים **כל** אירוע ב-multi
+  ב-`phys_freq_hz` של המפענח שהפיק אותו, וטלמטריית בקרה יכולה להגיע **רק**
+  מהערוץ הפיזי שנושא את ה-Rest LSN ⇒ `(rest_lsn, phys_freq_hz)` הוא
+  ground-truth. עד v0.11.0 ה-listener זרק את `phys_freq_hz` בענפים האלה.
+  `system_intel.record_rest_channel` צובר **הצבעות** (לא קובע מתצפית בודדת),
+  `derive_lsn_map` (טהורה) מכריעה לפי `LSN_FREQ_MIN_VOTES`/`_DOMINANCE`,
+  ומסיקה את ה-LSN השותף (`source="pair"`, כי זוג LSN חולק ערוץ פיזי) או
+  מסמנת `pair_conflict` אם שני החצאים נצפו על תדרים שונים — **לא מתקנים
+  הנחה שבורה בשקט**. `POST /api/system-intel/apply-lsn` הוא **המקום היחיד**
+  שבו מודיעין-מערכת נוגע ב-`systems.json`, ורק בפעולה יזומה-אנושית.
+  ⚠ עובד **רק ב-multi** — בחד-ערוצי `phys_freq_hz` הוא None ואין ממה להסיק.
 - **רוסטר:** `_dmr_identity` (RID קודם, אחרת TG) + `_build_roster` (היתוך, כולל אילו
   TG-ים כל RID דיבר — בסיס לגרף RID↔TG). חי בכל מצב.
 - **אנליטיקה (Phase 2/3):** `_analytics_source(day, show_all)` — מקור אחיד (היום/
@@ -279,7 +294,8 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 | GET/PUT | `/api/aliases` | אליאסים TG/RID (GET=מיזוג+ספירות, PUT=עריכות ידניות) |
 | GET | `/api/aliases/unknown` | תור לא-מזוהים: RID/TG שנצפו בתעבורה אך בלי שם, ממוין לפי count (`?day=`/`?all=1`) |
 | GET/PUT | `/api/watchlist` | מעקב RID/TG להתראה מקומית (GET=רשימה, PUT=החלפה מלאה) |
-| GET | `/api/system-intel` | מודיעין-מערכת נצבר: אתרים/מפת-LSN/CDR/סחיפת-CC (`?system=<id>`, ברירת מחדל: הפעילה) |
+| GET | `/api/system-intel` | מודיעין-מערכת נצבר: אתרים/מפת-LSN/CDR/סחיפת-CC + `lsn_map`/`lsn_channelmap` (מיפוי LSN↔תדר שהתגלה) (`?system=<id>`, ברירת מחדל: הפעילה) |
+| POST | `/api/system-intel/apply-lsn` | אימוץ המיפוי שהתגלה כ-`channelmap` של המערכת (יזום-אנושית; הפעולה היחידה שבה intel כותב לקונפיג) |
 | GET | `/api/health` | בריאות + `calls_today` + `last_call_at` ("האם אני מפענח") |
 | POST | `/api/mode` | **מעבר מצב** dmr/off/scan/discover/multi. דרך `_guard`. כישלון ⇒ off + 500 |
 | GET | `/api/scan` | סטטוס סבב (רגל, ספירה לאחור) |
@@ -306,7 +322,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 177 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (177 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (275 בדיקות). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -324,7 +340,9 @@ argv טהור של `build_command`/`build_rsp_tcp_command`/`build_bridge_command
 `test_rsp_fm` (הגשר IQ→PCM: דמודולטור, DC-blocker stateful, timeout על `RtlTcpClient`,
 `AudioSender`, `RigctlServer`), `test_mode`, `test_boot`, `test_scan`, `test_aliases`,
 `test_watchlist` (מעקב RID/TG + `_normalize_dsd` tagging), `test_system_intel` (record_*
-טהורות: אתרים/LSN/CDR/CC-drift/debounced-flush — בלי UDP/Flask), `test_recordings`,
+טהורות: אתרים/LSN/CDR/CC-drift/debounced-flush + ★ הכרעת מיפוי LSN↔תדר
+`derive_lsn_map`/`lsn_map_to_channelmap`: מכסת-הצבעות, רוב, הסקת-זוג,
+סתירת-זוג — בלי UDP/Flask), `test_recordings`,
 `test_security`, `test_archive`, `test_analytics` (הצפנה/תעבורה/גרף/LRRP), `test_rf_gain`
 (שכבת ה-HTTP של `/api/rf`/`/api/gain`), `test_discovery` (גילוי: `validate_sweep_plan`/
 `build_freq_grid`/`detect_candidates`/`aggregate_probe`/`discovery_to_system` הטהורים +
@@ -399,9 +417,28 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   כל אלה `pragma: no cover`, מתאמתים רק על RSP1B אמיתי (כמו הגשר של v0.4.0). רק
   `discovery.py` (טהור) + `compute_power_spectrum` + שינויי ה-parser נבדקים ב-CI.
   **הסף בזיהוי מועמדים הוא יחסי בלבד** (median+k·MAD עם מרווח-מינימום מעל רצפת
-  הרעש) — לעולם לא dBFS מוחלט (rsp_tcp נותן dBFS יחסי בלבד). **מיפוי LCN↔תדר מלא
-  אינו בר-גילוי אוטומטי:** Cap+ משדר LSN לוגי (לא תדר), ו-SDR יחיד לא יכול לצפות
-  בבקרה ובקול בו-זמנית — הדוח נותן תדר-בקרה+CC+LSN-ים-שנצפו; מפת הערוצים המלאה ידנית.
+  הרעש) — לעולם לא dBFS מוחלט (rsp_tcp נותן dBFS יחסי בלבד). **מיפוי LCN↔תדר
+  אינו בר-גילוי ממצב `discover` עצמו:** Cap+ משדר LSN לוגי (לא תדר), ו-SDR יחיד
+  במצב סריקה לא יכול לצפות בבקרה ובקול בו-זמנית — הדוח נותן תדר-בקרה+CC+
+  LSN-ים-שנצפו, בלי מפת-ערוצים. ⚠ **אבל זה כבר לא נכון לגבי המערכת כולה** —
+  מ-v0.12.0 מצב `multi` **כן** מגלה את המיפוי (מפענח לכל ערוץ ⇒ בקרה וקול
+  יחד), ר' הגוצ'ה הבאה ו-§5 "מיפוי LSN↔תדר".
+- **⚠ מפת הערוצים ל-DSD-FME מאונדקסת ב-LSN, ושורת-הכותרת בה היא חובה
+  (v0.12.0):** שתי עובדות שאומתו מול קוד-המקור של DSD-FME (`audio_work`), לא
+  מול ניחוש, ושתיהן היו שגויות אצלנו:
+  1. `csvChanImport` (`src/dsd_import.c`) עושה `if (row_count == 1) continue;`
+     — **מדלג על השורה הראשונה תמיד**, בלי לבדוק אם היא כותרת. בלי
+     `CHANNELMAP_HEADER` הערוץ הראשון נזרק בשקט בכל הרצת-טראנקינג.
+  2. ב-Cap+ כל תדר נושא **שני** LSN-ים (1+2 = ערוץ פיזי ראשון, 3+4 = השני...)
+     — `dmr_csbk.c` מאנדקס `trunk_chan_map[LSN]` וגוזר את ה-slot מזוגיות
+     ה-LSN. לכן `render_channelmap(lsn_pairs=True)` מרחיב ערוץ פיזי n לשתי
+     שורות. **`lsn_pairs` תלוי-מצב ואסור להפעילו ב-multi:** שם אותו קובץ הוא
+     רשימת הערוצים לדמודולציה, והכפלה תייצר מדמודלטורים/מפענחים כפולים.
+     `_enter_dmr` מעביר `lsn_pairs=not multi` — אל תשנו את זה בלי לקרוא את
+     שתי הסמנטיקות של הקובץ.
+  ההרחבה מתקנת את ה**פורמט**; את ה**סדר** (איזה תדר הוא הערוץ הפיזי הראשון)
+  מגלה `system_intel.derive_lsn_map` בפועל — עד אז ה-`lcn` שב-`systems.json`
+  הוא השערה (בסקר-השדה: מספור לפי סדר-תדרים עולה, לא LSN אמיתי).
 - **⚠ אירועי `sync`/`channel_status` ב-`parse_dsd_line` הם opt-in (`emit_status`):**
   ברירת המחדל (dmr/scan רגיל) משאירה אותם `None` — שומר על "סינון housekeeping
   במקור" (§2) ועל ה-fixture replay (68/68). רק בדיקת גילוי (`_probe_system` מגדיר
@@ -613,6 +650,24 @@ tests).** אימות שינויי UI: `node --check` על ה-JS המחולץ מ-
   אוטומטית** — `cp config/systems.survey.json /var/lib/dmr/systems.json` בפי
   כדי להפעיל. מועמד-הספייק הראשון המומלץ ל-Phase 7: `multi_164cluster` (תעבורה
   אמיתית מאומתת, לא תדרים בדויים).
+  ⚠ **ה-`lcn` בקובץ הזה הוא אינדקס-סריקה, לא LSN אמיתי** (v0.12.0): הסקר מדד
+  נוכחות-DMR + CC פר-תדר, הוא לא קרא Rest LSN מערוץ-בקרה מעולם — המספור הוא
+  פשוט סדר-תדרים עולה. במצב `multi` זה לא מזיק (ה-LCN הוא תווית; התדרים הם
+  מה שקובע, והם נמדדו), אבל במצב `dmr` עם טראנקינג זו מפת-LSN שגויה. תוקן ב-
+  `multi_164cluster` גם `color_code` (8→10 — הסקר מדד CC=10 על תדר-הבקרה
+  המוגדר). המיפוי האמיתי מתגלה בהרצת `multi` — ר' §5 "מיפוי LSN↔תדר".
+- **v0.12.0 — מיפוי LSN↔תדר אמיתי + תיקון מפת-הערוצים של DSD-FME (קוד+CI
+  ירוקים + אימות חזותי; תדירות-הגילוי בשטח טרם נמדדה):** התחיל משאלת-משתמש
+  על ה-LCN בקונפיג-הסקר, והוליד שני תיקונים שאומתו מול **קוד-המקור של
+  DSD-FME** (`audio_work`): (1) שורת-כותרת חסרה ⇒ הערוץ הראשון במפה נזרק
+  בשקט תמיד (`csvChanImport`: `if (row_count == 1) continue;`); (2) מפת Cap+
+  מאונדקסת ב-LSN וכל תדר נושא שני LSN-ים ⇒ `render_channelmap(lsn_pairs=True)`.
+  ובנוסף הפיצ'ר עצמו: `system_intel.record_rest_channel`/`derive_lsn_map`
+  מגלים את המיפוי מהצבעות ground-truth ב-multi (ר' §5/§8), עם
+  `POST /api/system-intel/apply-lsn` לאימוץ יזום-אנושית. 275 בדיקות (254→275).
+  **הצעד הבא אם הכיסוי יתגלה חלקי:** קורלטור שני — occupant-id של `lsn_status`
+  מול TG/יעד של שיחה שנשמעה בו-זמנית על ערוץ פיזי ידוע (הנתונים כבר זורמים;
+  לא מומש בכוונה כדי לא להוסיף מקור-אי-ודאות שני לפני שהראשון נמדד בשטח).
 - **נדחה במכוון (דורש חומרה לאימות):** מד dBFS/SNR רציף עצמאי מה-SDR — דורש פטצ'
   קוד C על `rsp_tcp` (RSPTCPServer), לא ניתן לממש/לבדוק בלי RSP1B אמיתי. ר' §8.
 - **הבא (לא מתוכנן עדיין):** רעיונות שעלו בסיעור-המוחות המקורי ולא נכנסו ל-scope —

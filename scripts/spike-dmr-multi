@@ -97,11 +97,14 @@ cmap = sysd.get("channelmap") or []
 if len(cmap) < 2:
     print(f"'{sid}' אינה רב-ערוצית ({len(cmap)} ערוצים)", file=sys.stderr); sys.exit(1)
 with open(out, "w") as f:
+    # שורת-כותרת כמו ב-app.py:render_channelmap — DSD-FME מדלג על השורה
+    # הראשונה תמיד (csvChanImport), ו-parse_channelmap_hz מדלג על '#'.
+    f.write("# LCN,FREQ_HZ\n")
     for ch in cmap:
         f.write(f"{int(ch['lcn'])},{int(round(float(ch['freq'])*1e6))}\n")
 print(f"{len(cmap)} ערוצים: " + ", ".join(f"lcn{ch['lcn']}={ch['freq']}MHz" for ch in cmap))
 PY
-NCH=$(grep -c . "$CHANMAP")
+NCH=$(grep -cv '^\s*\(#\|$\)' "$CHANMAP")
 echo; echo "channelmap ($NCH ערוצים): $CHANMAP"
 
 # ── 3. מריצים את מנוע ה-multi של DMR ישירות (dsd_pty → _run_multi) ──────────

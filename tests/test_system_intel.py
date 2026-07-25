@@ -86,7 +86,9 @@ def test_record_cc_no_mismatch_flag_when_configured_unknown(paths):
 def test_export_for_unknown_system_returns_blank_profile_not_none(paths):
     import system_intel
     p = system_intel.export_for("never-seen")
-    assert p == {"sites": {}, "lsn_directory": {}, "cc": None, "private_calls": []}
+    assert p == {"sites": {}, "lsn_directory": {}, "cc": None, "private_calls": [],
+                 "lsn_freq": {}, "lsn_freq_seen": None,
+                 "lsn_map": {}, "lsn_channelmap": []}
 
 
 def test_record_ignores_none_system_id(paths):
@@ -135,3 +137,110 @@ def test_load_handles_corrupt_file_silently(paths):
     system_intel.INTEL_PATH.write_text("not json{{{")
     system_intel.load()
     assert system_intel._intel == {}
+
+
+# --- ★ מיפוי LSN↔תדר (v0.12.0) -----------------------------------------------
+# הלוגיקה הטהורה: הצבעות → הכרעה → channelmap. בלי UDP/Flask/חומרה.
+def test_derive_lsn_map_needs_min_votes():
+    """תצפית בודדת אינה מפה — מתחת ל-LSN_FREQ_MIN_VOTES לא מכריעים בכלל."""
+    import system_intel
+    assert system_intel.derive_lsn_map({"5": {"164106250": 2}}) == {}
+
+
+def test_derive_lsn_map_decides_and_infers_pair():
+    """3 הצבעות עקביות ל-LSN 5 => הכרעה (source=rest), וה-LSN השותף (6)
+    מוסק לאותו תדר (source=pair) — ב-Cap+ זוג LSN חולק ערוץ פיזי אחד."""
+    import system_intel
+    m = system_intel.derive_lsn_map({"5": {"164106250": 4}})
+    assert m[5]["freq_hz"] == 164_106_250
+    assert m[5]["source"] == "rest" and m[5]["confidence"] == 1.0
+    assert m[5]["physical_channel"] == 3        # LSN 5,6 => ערוץ פיזי 3
+    assert m[6]["freq_hz"] == 164_106_250
+    assert m[6]["source"] == "pair" and m[6]["votes"] == 0
+    assert m[6]["physical_channel"] == 3
+
+
+def test_derive_lsn_map_rejects_when_no_dominance():
+    """הצבעות מפוצלות ~50/50 => אין רוב ברור, לא מכריעים (לא בוחרים 'הכי גדול')."""
+    import system_intel
+    m = system_intel.derive_lsn_map({"3": {"164300000": 5, "164325000": 4}})
+    assert m == {}
+
+
+def test_derive_lsn_map_flags_pair_conflict():
+    """שני חצאי-זוג הוכרעו לתדרים שונים => הנחת-המבנה שבורה. מסמנים
+    pair_conflict ולא 'מתקנים' בשקט, ו-lsn_map_to_channelmap משמיט אותם."""
+    import system_intel
+    m = system_intel.derive_lsn_map({"3": {"164300000": 9}, "4": {"164725000": 9}})
+    assert m[3]["pair_conflict"] and m[4]["pair_conflict"]
+    assert system_intel.lsn_map_to_channelmap(m) == []
+
+
+def test_lsn_map_to_channelmap_builds_physical_channels():
+    """המיפוי המוכרע → channelmap פיזי: lcn = מספר הערוץ הפיזי האמיתי
+    (נגזר מה-LSN), התדר ב-MHz, ממוין. זוג LSN = שורה אחת."""
+    import system_intel
+    votes = {"1": {"164106250": 5}, "5": {"164537500": 5}}
+    cmap = system_intel.lsn_map_to_channelmap(system_intel.derive_lsn_map(votes))
+    assert cmap == [{"lcn": 1, "freq": 164.10625}, {"lcn": 3, "freq": 164.5375}]
+
+
+def test_lsn_map_to_channelmap_output_passes_systems_validation(paths):
+    """הפלט חייב לעבור את _validate_systems — זו הצורה שנכתבת ל-systems.json."""
+    app = paths
+    import system_intel
+    cmap = system_intel.lsn_map_to_channelmap(
+        system_intel.derive_lsn_map({"1": {"164106250": 5}, "3": {"164300000": 5}}))
+    ok, cleaned = app._validate_systems(
+        [{"id": "s1", "name": "T", "control": 164.10625, "color_code": 10,
+          "channelmap": cmap}])
+    assert ok and cleaned[0]["channelmap"] == cmap
+
+
+def test_record_rest_channel_ignores_single_channel_mode(paths):
+    """phys_freq_hz=None (חד-ערוצי — אין ground-truth) => אין הצבעה בכלל."""
+    import system_intel
+    system_intel.record_rest_channel("s1", 5, None, t=1.0)
+    assert system_intel.export_for("s1")["lsn_freq"] == {}
+
+
+def test_record_rest_channel_rejects_out_of_range(paths):
+    import system_intel
+    system_intel.record_rest_channel("s1", 0, 164_106_250, t=1.0)
+    system_intel.record_rest_channel("s1", 999, 164_106_250, t=1.0)
+    system_intel.record_rest_channel("s1", 5, 0, t=1.0)
+    assert system_intel.export_for("s1")["lsn_freq"] == {}
+
+
+def test_record_lsn_status_votes_only_for_the_rest_lsn(paths):
+    """מתוך שורת lsn_status שלמה, רק ה-LSN שמסומן 'rest' מקבל הצבעה —
+    התפוסים/הפנויים יושבים על תדרים אחרים שאיננו יודעים מהשורה הזו."""
+    import system_intel
+    channels = {5: "rest", 6: 3, 7: "idle", 8: "idle"}
+    for _ in range(3):
+        system_intel.record_lsn_status("s1", channels, t=1.0, phys_freq_hz=164_537_500)
+    intel = system_intel.export_for("s1")
+    assert intel["lsn_freq"] == {"5": {"164537500": 3}}
+    assert intel["lsn_map"]["5"]["freq_hz"] == 164_537_500
+    assert intel["lsn_map"]["6"]["source"] == "pair"
+
+
+def test_record_lsn_status_without_phys_freq_records_no_votes(paths):
+    """אותה שורה בחד-ערוצי: מפת-התפוסה נשמרת כרגיל, מיפוי-תדר לא נוצר."""
+    import system_intel
+    system_intel.record_lsn_status("s1", {5: "rest", 6: 3}, t=1.0)
+    intel = system_intel.export_for("s1")
+    assert intel["lsn_directory"]["5"]["occupant"] == "rest"
+    assert intel["lsn_freq"] == {}
+
+
+def test_profile_upgrades_schema_from_older_file(paths):
+    """system_intel.json שנכתב ע"י v0.11.0 (בלי lsn_freq) — record_* לא קורס."""
+    import json
+    import system_intel
+    system_intel.INTEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    system_intel.INTEL_PATH.write_text(json.dumps(
+        {"s1": {"sites": {}, "lsn_directory": {}, "cc": None, "private_calls": []}}))
+    system_intel.load()
+    system_intel.record_rest_channel("s1", 5, 164_106_250, t=1.0)
+    assert system_intel.export_for("s1")["lsn_freq"] == {"5": {"164106250": 1}}

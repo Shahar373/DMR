@@ -280,6 +280,7 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       </div>
       <div id="intelCc"></div>
       <div id="intelSites" style="margin-top:var(--sp-2)"></div>
+      <div id="intelLsnMap" style="margin-top:var(--sp-2)"></div>
       <div id="intelLsn" style="margin-top:var(--sp-2)"></div>
       <div style="margin-top:var(--sp-2)" id="intelCdrWrap">
         <b>שיחות-יחיד אחרונות (CDR)</b>
@@ -904,6 +905,10 @@ async function pollSystemIntel(){
         `<span class="tag">אתר ${esc(site)} · ${s.count}× · ${fmtT(s.last_seen)}</span>`).join(" ")
     : `<div class="muted">אין אתרים שנצפו (site_info) עדיין.</div>`;
 
+  // ★ מיפוי LSN↔תדר שהתגלה (v0.12.0). מגיע רק ממצב multi — שם כל אירוע
+  // חתום בתדר הפיזי של המפענח שהפיק אותו, ולכן ה-Rest LSN מתמפה לתדר ודאי.
+  renderLsnMap(sid, d);
+
   const lsns=Object.entries(d.lsn_directory||{}).sort((a,b)=>(+a[0])-(+b[0]));
   $("intelLsn").innerHTML = lsns.length
     ? `<b>מפת-תפוסה (LSN):</b>` + lsns.map(([lsn,e])=>{
@@ -919,6 +924,49 @@ async function pollSystemIntel(){
         return `<div class="roster-row"><span class=mono>${esc(who)}</span><span class=muted>${esc(c.kind)} · ${fmtT(c.t)}</span></div>`;
       }).join("")
     : `<div class="muted">אין שיחות-יחיד שנצפו עדיין.</div>`;
+}
+
+// ---------- מיפוי LSN↔תדר שהתגלה (v0.12.0) ----------
+// ה-lcn ב-channelmap הוא אינדקס-שרירותי כל עוד לא נמדד (מספור לפי סדר-תדרים).
+// כאן מוצג המיפוי האמיתי שנצבר מהתעבורה, וכפתור שמאמץ אותו לקונפיג המערכת.
+// source="rest" = נצפה ישירות; source="pair" = הוסק מה-LSN השותף (ב-Cap+ זוג
+// LSN חולק ערוץ פיזי אחד). pair_conflict = הנחת-המבנה נשברה, לא מאמצים.
+function renderLsnMap(sid, d){
+  const map = d.lsn_map||{}, keys = Object.keys(map).sort((a,b)=>(+a)-(+b));
+  const el = $("intelLsnMap");
+  if(!keys.length){
+    el.innerHTML = `<div class="muted">מיפוי LSN↔תדר: אין עדיין. נצבר <b>רק במצב רב-ערוצי</b>
+      (שם נשמעים ערוץ-הבקרה והקול יחד) — הריצו multi על מערכת עם ערוץ-בקרה פעיל.</div>`;
+    return;
+  }
+  const conflict = keys.some(k=>map[k].pair_conflict);
+  const rows = keys.map(k=>{
+    const e=map[k], mhz=(e.freq_hz/1e6).toFixed(5);
+    const src = e.source==="rest" ? `נצפה · ${e.votes}/${e.total} הצבעות`
+                                  : `הוסק מ-LSN ${esc(e.pair_lsn)}`;
+    return `<div class="roster-row"><span><b class=mono>LSN ${esc(k)}</b>
+      <span class=mono>${mhz} MHz</span>
+      <span class="tag">ערוץ פיזי ${esc(e.physical_channel)}</span>
+      ${e.pair_conflict?'<span class="tag err">סתירת-זוג</span>':''}</span>
+      <span class=muted>${esc(src)}</span></div>`;
+  }).join("");
+  const cmap = d.lsn_channelmap||[];
+  const btn = cmap.length
+    ? `<button class="btn ghost" id="intelApplyLsn">אמץ כ-channelmap (${cmap.length} ערוצים)</button>`
+    : "";
+  el.innerHTML = `<b>מיפוי LSN↔תדר שהתגלה:</b>${rows}
+    ${conflict?`<div class="muted">⚠ סתירת-זוג: שני חצאי זוג-LSN נצפו על תדרים שונים —
+      הרשת אינה Cap+ סטנדרטי או שהקליטה מזוהמת. הזוגות הסותרים לא ייאומצו.</div>`:""}
+    <div class="row" style="margin-top:var(--sp-2)">${btn}<span class="muted" id="intelLsnMsg"></span></div>`;
+  const b=$("intelApplyLsn");
+  if(b) b.onclick=async()=>{
+    $("intelLsnMsg").textContent="שומר…";
+    const r=await api("/api/system-intel/apply-lsn",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({system:sid})});
+    $("intelLsnMsg").textContent = (r.ok&&r.body.ok)?"אומץ ✓ (הפעילו מחדש את המצב)"
+                                                   :("שגיאה: "+((r.body&&r.body.error)||""));
+    if(r.ok&&r.body.ok&&r.body.systems) SYSTEMS=r.body.systems;
+  };
 }
 
 // ---------- לוח פר-ערוץ (multi mode) ----------

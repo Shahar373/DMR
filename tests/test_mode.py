@@ -183,6 +183,50 @@ def test_render_channelmap(paths):
     assert "1,461037500" in txt and "2,461062500" in txt
 
 
+def test_render_channelmap_always_has_header_row(paths):
+    """★ באג אמיתי שתוקן ב-v0.12.0: csvChanImport של DSD-FME מדלג **תמיד** על
+    השורה הראשונה (`if (row_count == 1) continue;` ב-src/dsd_import.c) — בלי
+    שורת-כותרת הערוץ הראשון נזרק בשקט בכל הרצת-טראנקינג."""
+    app = paths
+    lines = app.render_channelmap([{"lcn": 1, "freq": 461.0375}]).splitlines()
+    assert lines[0] == app.CHANNELMAP_HEADER
+    assert lines[0].startswith("#")        # כדי ש-parse_channelmap_hz שלנו ידלג גם
+    assert lines[1] == "1,461037500"       # הערוץ הראשון שורד את דילוג-השורה
+    # גם מפה ריקה מקבלת כותרת (אחרת ‎-C על קובץ ריק מתנהג שונה)
+    assert app.render_channelmap([]).splitlines() == [app.CHANNELMAP_HEADER]
+
+
+def test_render_channelmap_lsn_pairs_expansion(paths):
+    """מצב טראנקינג: מפת DSD-FME ל-Cap+ מאונדקסת ב-LSN, וכל תדר נושא שני
+    LSN-ים (1+2 = ערוץ פיזי 1, 3+4 = השני...). ערוץ פיזי n => LSN 2n-1, 2n."""
+    app = paths
+    txt = app.render_channelmap([{"lcn": 1, "freq": 461.0375},
+                                 {"lcn": 2, "freq": 461.0625}], lsn_pairs=True)
+    assert txt.splitlines() == [app.CHANNELMAP_HEADER,
+                                "1,461037500", "2,461037500",
+                                "3,461062500", "4,461062500"]
+
+
+def test_render_channelmap_multi_must_not_expand_pairs(paths):
+    """ב-multi אותו קובץ הוא רשימת הערוצים הפיזיים לדמודולציה — הכפלה כאן
+    הייתה מייצרת שני מדמודלטורים/מפענחים על אותו תדר."""
+    app = paths
+    cmap = [{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}]
+    assert app.render_channelmap(cmap).splitlines()[1:] == ["1,461037500", "2,461062500"]
+
+
+def test_channelmap_header_is_skipped_by_our_own_parsers(paths):
+    """שני הצדדים של אותו קובץ: DSD-FME מדלג על שורה 1, ו-dsd_pty/rsp_fm
+    (multi) חייבים לדלג עליה גם — אחרת ‎--multi-channelmap נופל על הכותרת."""
+    app = paths
+    import dsd_pty
+    import rsp_fm
+    app.write_channelmap([{"lcn": 1, "freq": 461.0375}, {"lcn": 2, "freq": 461.0625}])
+    expected = [{"lcn": 1, "freq_hz": 461_037_500}, {"lcn": 2, "freq_hz": 461_062_500}]
+    assert dsd_pty.parse_channelmap_hz(str(app.CHANNELMAP_PATH)) == expected
+    assert rsp_fm.parse_channelmap_hz(str(app.CHANNELMAP_PATH)) == expected
+
+
 # --- multi mode (Phase 2) ----------------------------------------------------
 def _multi_system():
     return {"id": "s1", "name": "T", "control": 461.0375, "color_code": 1,
