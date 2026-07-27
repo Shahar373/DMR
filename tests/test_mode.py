@@ -433,3 +433,31 @@ def test_non_trunking_system_channelmap_is_not_lsn_doubled(paths, sysctl, no_sle
     app._enter_dmr(system)
     rows = [r for r in app.CHANNELMAP_PATH.read_text().splitlines() if r.strip()]
     assert len(rows) == 2          # שורת-כותרת + ערוץ אחד (לא שניים)
+
+
+def test_api_systems_accepts_a_system_created_from_the_ui(paths):
+    """★ v0.15.0: הצורה המדויקת שכפתור "+ מערכת" בונה — id סינתטי מחותמת-זמן
+    (השם עשוי להיות עברי לגמרי ולכן לא נגזר ממנו), שם חופשי, ומפת-ערוצים
+    שנוצרה מהדבקת תדרים. חייבת לעבור את _validate_systems כמו שהיא."""
+    app = paths
+    created = {"id": "sysm5k2j3n", "name": "אשכול 164 · חצי עליון",
+               "control": 164.5375, "color_code": 7,
+               "channelmap": [{"lcn": 1, "freq": 164.5375},
+                              {"lcn": 2, "freq": 164.6375},
+                              {"lcn": 3, "freq": 164.725}]}
+    r = app.app.test_client().put("/api/systems", json=[created])
+    assert r.status_code == 200, r.get_json()
+    saved = r.get_json()["systems"][0]
+    assert saved["name"] == "אשכול 164 · חצי עליון"
+    assert [c["freq"] for c in saved["channelmap"]] == [164.5375, 164.6375, 164.725]
+    assert saved["trunk"] is True          # 3 ערוצים ⇒ טראנקינג כברירת מחדל
+
+
+def test_api_systems_rejects_a_draft_with_no_control_frequency(paths):
+    """מערכת חדשה נוצרת ב-UI עם control=0 עד שממלאים אותה. השרת חייב לדחות
+    אותה — ולכן ה-UI מסנן טיוטות לפני PUT (completeSystems), אחרת טיוטה אחת
+    הייתה מונעת שמירה של *כל* המערכות."""
+    app = paths
+    draft = {"id": "sysdraft", "name": "מערכת חדשה", "control": 0,
+             "color_code": 1, "channelmap": []}
+    assert app.app.test_client().put("/api/systems", json=[draft]).status_code == 400
