@@ -586,6 +586,34 @@ def _install_shutdown_handler() -> None:
     signal.signal(signal.SIGINT, _handler)
 
 
+def _bind_control_socket(path: str):
+    """Bind the gain-control UDP unix socket, world-writable.
+
+    dmr-dsdfme.service runs as root (SDR access); dmr-web.service (the one
+    calling send_gain_command -- app.py's /api/gain) runs as the unprivileged
+    `dmr` user. bind() alone leaves the socket special file at whatever the
+    root process's umask dictates -- typically 0755, i.e. group/other get
+    read+execute but NOT write. A non-root sendto() to that path then fails
+    with EACCES, deterministically, on every single gain/AGC command,
+    regardless of direction (confirmed on hardware, 27.07.2026: both "AGC
+    off" and "AGC on" failed identically with no server-side crash anywhere).
+    Returns the bound socket, or None if bind/chmod fails (unavailable, not
+    fatal -- gain control just won't work, same as before this existed)."""
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(path)
+        os.chmod(path, 0o666)
+        sock.setblocking(False)
+        return sock
+    except OSError as exc:
+        sys.stderr.write(f"dsd_pty: control socket unavailable: {exc}\n")
+        sys.stderr.flush()
+        return None
+
+
 def _terminate(process) -> None:
     if process is None or process.poll() is not None:
         return
@@ -718,17 +746,7 @@ def _run():  # pragma: no cover - hardware runtime
         os.close(slave)
         processes.insert(0, dsd)
 
-        try:
-            if os.path.exists(CTRL_SOCK_PATH):
-                os.unlink(CTRL_SOCK_PATH)
-            os.makedirs(os.path.dirname(CTRL_SOCK_PATH), exist_ok=True)
-            ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            ctrl.bind(CTRL_SOCK_PATH)
-            ctrl.setblocking(False)
-        except OSError as exc:
-            sys.stderr.write(f"dsd_pty: control socket unavailable: {exc}\n")
-            sys.stderr.flush()
-            ctrl = None
+        ctrl = _bind_control_socket(CTRL_SOCK_PATH)
 
         buffer = b""
         forced_failure = False
@@ -885,17 +903,7 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
         # DSD_BRIDGE_CTRL_SOCK), ששולח פקודות rtl_tcp אמיתיות ל-rsp_tcp. הרווח
         # פועל על ה-front-end הרחב-פס => משפיע על כל הערוצים יחד (אין gain
         # פר-ערוץ — יש front-end אחד). בלי זה /api/gain מחזיר 500 ב-multi.
-        try:
-            if os.path.exists(CTRL_SOCK_PATH):
-                os.unlink(CTRL_SOCK_PATH)
-            os.makedirs(os.path.dirname(CTRL_SOCK_PATH), exist_ok=True)
-            ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            ctrl.bind(CTRL_SOCK_PATH)
-            ctrl.setblocking(False)
-        except OSError as exc:
-            sys.stderr.write(f"dsd_pty: control socket unavailable: {exc}\n")
-            sys.stderr.flush()
-            ctrl = None
+        ctrl = _bind_control_socket(CTRL_SOCK_PATH)
 
         while True:
             if rsp.poll() is not None:

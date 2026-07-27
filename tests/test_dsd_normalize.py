@@ -536,6 +536,39 @@ def test_send_gain_nudge_no_listener_returns_false(tmp_path):
     )
 
 
+def test_bind_control_socket_is_world_writable(tmp_path):
+    """★ regression (27.07.2026, hardware): dmr-dsdfme.service runs as root,
+    dmr-web.service (the /api/gain caller) runs as the unprivileged `dmr`
+    user. bind() alone leaves the socket at the root process's umask --
+    typically 0755, which has no write bit for non-owners, so every single
+    gain/AGC command failed with EACCES regardless of direction, with no
+    crash anywhere to explain it. _bind_control_socket must chmod it
+    world-writable so cross-user sendto() actually works."""
+    path = str(tmp_path / "dsd-ctrl.sock")
+    sock = dsd_pty._bind_control_socket(path)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        assert mode == 0o666, oct(mode)
+    finally:
+        sock.close()
+
+
+def test_bind_control_socket_removes_stale_file_first(tmp_path):
+    path = str(tmp_path / "dsd-ctrl.sock")
+    (tmp_path / "dsd-ctrl.sock").write_text("stale, not a socket")
+    sock = dsd_pty._bind_control_socket(path)
+    assert sock is not None
+    sock.close()
+
+
+def test_bind_control_socket_returns_none_on_failure():
+    # ספרייה שלא קיימת ואי-אפשר ליצור (רכיב-נתיב הוא קובץ, לא תיקייה)
+    # -> os.makedirs נכשל -> None, לא חריגה שמפילה את dsd_pty.
+    import tempfile
+    with tempfile.NamedTemporaryFile() as f:
+        assert dsd_pty._bind_control_socket(f.name + "/sub/ctrl.sock") is None
+
+
 def test_normalize_voice_call_group(paths):
     app = paths
     card = app._normalize_dsd({
