@@ -6,6 +6,34 @@
 
 ## [Unreleased]
 
+## [0.13.2] - תוקן: `_terminate_all` (v0.13.1) הייתה קוד מת — dsd_pty מת מיד על SIGTERM, בלי handler
+
+**נתפס בשטח מיד אחרי 0.13.1:** גם עם `_terminate_all`, `sudo systemctl status
+dmr-dsdfme` המשיך להראות `Active: failed (Result: timeout)` אחרי `restart`/
+`stop` במצב `multi`. ה-journal חשף את הסיבה: ל-`dsd_pty.py` **אין בכלל
+handler ל-SIGTERM** (ולא היה גם קודם) — ברירת המחדל של Python ל-SIGTERM
+(כשלא רשמו handler) היא **הריגת התהליך מיידית ע"י המערכת**, בלי להריץ שום
+קוד Python — כולל בלי להריץ את ה-`finally:` block. systemd דיווח על ה-Main
+PID כ-`code=killed, signal=TERM` **בלי אף שורת-לוג אחת** מהניקוי של dsd_pty
+עצמו, בזמן ש-rsp_tcp (שכן רושם handler משלו ב-C, מודפס "Signal caught, ask
+for exit!") נשאר בחיים עוד 8 שניות עד ש-systemd הרג אותו בכוח
+(`KillMode=control-group`) ודיווח `Result: timeout`. כלומר: `_terminate_all`
+מ-0.13.1 היה נכון כקוד, אבל **מעולם לא רץ** — התהליך שמקבל את האות מת לפני
+שהגיע ל-`finally:` בכלל.
+
+### Fixed
+- **★ `_install_shutdown_handler()` חדש** רושם handler ל-SIGTERM/SIGINT
+  שזורק `_ShutdownRequested` (יורש מ-`SystemExit`, לא `Exception` — כדי
+  שלא ייתפס ב-`except (OSError, RuntimeError, ValueError)` שעוטף את הלולאה
+  הראשית ב-`_run`/`_run_multi`). נקרא כשורה הראשונה של `_run()` (מכסה גם את
+  `_run_multi` שהוא מפעיל). עכשיו SIGTERM/SIGINT באמת מפסיקים את
+  `select.select()` הפעיל, מגיעים ל-`finally:`, ו-`_terminate_all` (0.13.1)
+  סוף-סוף רץ ומזרז את מות rsp_tcp (SIGKILL תוך ~3ש' מהקוד שלנו) **לפני**
+  ש-`TimeoutStopSec=8` של systemd פוקע. נבדק (`test_install_shutdown_
+  handler_raises_on_sigterm`/`..._sigint_too`) ע"י שליחת האות בפועל לתהליך
+  הבדיקה עצמו ווידוא `_ShutdownRequested`, + בדיקה מפורשת שהמחלקה לא נבלעת
+  ע"י ה-`except` הקיים.
+
 ## [0.13.1] - תוקן: `dmr-dsdfme` (multi) נכשל ב-restart עם `Result: timeout`
 
 **נתפס בשטח (27.07.2026):** משתמש דיווח על מצב רב-ערוצי (6 ערוצים) שלא הפיק
