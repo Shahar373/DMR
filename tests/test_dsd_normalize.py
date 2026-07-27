@@ -429,6 +429,62 @@ def test_send_gain_nudge(tmp_path):
     server.close()
 
 
+class _FakeProc:
+    """Stand-in for subprocess.Popen in _terminate_all tests. `dies_after`
+    names the call that kills it off ("terminate"/"kill"/None=never)."""
+    def __init__(self, dies_after="terminate"):
+        self.dies_after = dies_after
+        self.terminated = False
+        self.killed = False
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def terminate(self):
+        self.terminated = True
+        if self.dies_after == "terminate":
+            self._dead = True
+
+    def kill(self):
+        self.killed = True
+        if self.dies_after == "kill":
+            self._dead = True
+
+    def wait(self, timeout=None):
+        if not self._dead:
+            raise TimeoutError("still running")
+
+
+def test_terminate_all_sends_sigterm_to_everyone_before_waiting():
+    procs = [_FakeProc(), _FakeProc(), _FakeProc()]
+    dsd_pty._terminate_all(procs, term_timeout=1, kill_timeout=1)
+    assert all(p.terminated for p in procs)
+
+
+def test_terminate_all_falls_back_to_kill_for_stragglers():
+    # ★ regression for the multi-mode shutdown hang (27.07.2026, hardware):
+    # dmr-dsdfme.service has TimeoutStopSec=8; the old code called _terminate()
+    # once per process (up to 3s+2s wait *each*), so a 6-channel system (8
+    # child processes) could take 40s to stop and got SIGKILLed by systemd as
+    # `Active: failed (Result: timeout)` instead of stopping cleanly. Wall time
+    # here must stay bounded by term_timeout+kill_timeout regardless of how
+    # many processes refuse the first SIGTERM.
+    procs = [_FakeProc(dies_after="kill") for _ in range(8)]
+    started = time.monotonic()
+    dsd_pty._terminate_all(procs, term_timeout=0.2, kill_timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.5
+    assert all(p.terminated and p.killed for p in procs)
+
+
+def test_terminate_all_skips_already_dead_processes():
+    already_dead = _FakeProc(dies_after=None)
+    already_dead._dead = True
+    dsd_pty._terminate_all([already_dead, None], term_timeout=0.1, kill_timeout=0.1)
+    assert already_dead.terminated is False
+
+
 def test_send_gain_nudge_no_listener_returns_false(tmp_path):
     assert not dsd_pty.send_gain_nudge(
         "up", sock_path=str(tmp_path / "nobody.sock")

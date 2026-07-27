@@ -567,6 +567,47 @@ def _terminate(process) -> None:
             pass
 
 
+def _terminate_all(processes, term_timeout=3.0, kill_timeout=2.0) -> None:
+    """SIGTERM every process up-front, then wait on all of them against one
+    shared deadline -- not one-at-a-time like _terminate() looping. In multi
+    mode `processes` holds rsp_tcp + rsp_fm.py + one dsd-fme per channel (up
+    to 8 for a 6-channel system); waiting up to 3s+2s *per process serially*
+    can take 40s+ on shutdown, blowing past dmr-dsdfme.service's
+    TimeoutStopSec=8 and getting the whole cgroup SIGKILLed by systemd as a
+    timed-out (failed) stop instead of a clean one -- confirmed on hardware
+    (27.07.2026): `Active: failed (Result: timeout)` after a multi restart.
+    Doing it in two shared-deadline passes keeps the worst case at
+    term_timeout+kill_timeout regardless of process count."""
+    alive = [p for p in processes if p is not None and p.poll() is None]
+    for p in alive:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    deadline = time.monotonic() + term_timeout
+    for p in alive:
+        if p.poll() is not None:
+            continue
+        try:
+            p.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            pass
+    stubborn = [p for p in alive if p.poll() is None]
+    for p in stubborn:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    deadline = time.monotonic() + kill_timeout
+    for p in stubborn:
+        if p.poll() is not None:
+            continue
+        try:
+            p.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            pass
+
+
 def _pdeathsig_term():  # pragma: no cover - Linux-only, exercised post-fork
     """preexec_fn for the three supervised children: ask the kernel to send
     them SIGTERM the instant this process dies for *any* reason (including an
@@ -709,8 +750,7 @@ def _run():  # pragma: no cover - hardware runtime
         sys.stderr.flush()
         return 1
     finally:
-        for process in processes:
-            _terminate(process)
+        _terminate_all(processes)
         if ctrl is not None:
             ctrl.close()
         try:
@@ -905,8 +945,7 @@ def _run_multi(env):  # pragma: no cover - hardware runtime
         sys.stderr.flush()
         return 1
     finally:
-        for process in processes:
-            _terminate(process)
+        _terminate_all(processes)
         for c in dsd_procs.values():
             try:
                 os.close(c["master"])

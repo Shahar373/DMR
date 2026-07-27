@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+## [0.13.1] - תוקן: `dmr-dsdfme` (multi) נכשל ב-restart עם `Result: timeout`
+
+**נתפס בשטח (27.07.2026):** משתמש דיווח על מצב רב-ערוצי (6 ערוצים) שלא הפיק
+אף שיחה ו"רק שגיאות" — `sudo systemctl status dmr-dsdfme` הראה
+`Active: failed (Result: timeout)`, ו-`/api/gain` נכשל עם "dmr-dsdfme רץ?"
+(ה-control-socket כבר לא היה שם כי dsd_pty כבר לא רץ).
+
+### Fixed
+- **★ עצירת/restart של `dmr-dsdfme` במצב `multi` הייתה עלולה לחרוג מ-
+  `TimeoutStopSec=8` של היחידה ולהיכשל.** ה-`finally` block ב-`dsd_pty._run`/
+  `_run_multi` סגר את כל תהליכי-הבן **בזה-אחר-זה** דרך `_terminate()`
+  (עד 3ש' המתנה ל-SIGTERM + עד 2ש' ל-SIGKILL, **פר תהליך**). ברב-ערוצי זה
+  rsp_tcp+rsp_fm.py+N מפענחי DSD-FME — עד 8 תהליכים באשכול 6-ערוצים, כלומר
+  עד 40ש' תיאורטית לעצירה מלאה, בעוד `TimeoutStopSec=8` נותן ל-systemd לחכות
+  רק 8 שניות לפני ש-`KillMode=control-group` הורג את כל ה-cgroup בכוח ומסמן
+  את השירות כ-`failed` (עצירה שנכשלה, לא קריסה). התיקון: `_terminate_all`
+  חדש שולח SIGTERM **לכולם קודם**, ואז ממתין על כולם מול **deadline משותף
+  אחד** (ואותו דבר ל-SIGKILL) — זמן ההמתנה הכולל נשאר קבוע (~5ש') בלי קשר
+  למספר הערוצים. נבדק עם תהליכים מדומים (`test_terminate_all_falls_back_to_
+  kill_for_stragglers`) שממחיש בדיוק את המקרה שנצפה בשטח.
+
 ## [0.13.0] - כשלים שקטים: שיחות חירום שנעלמו, ארכיון שמאבד נתונים, ו-listener שמת מדאטהגרם אחד
 
 **המנה הזאת לא הוסיפה יכולת — היא החזירה יכולות שהיו אמורות לעבוד ולא עבדו.**
