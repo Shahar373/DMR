@@ -514,15 +514,22 @@ def build_command(env):
 GAIN_UP_KEY, GAIN_DOWN_KEY = b"G", b"g"
 
 
-def send_gain_nudge(direction, sock_path=None):
-    key = GAIN_UP_KEY if direction == "up" else GAIN_DOWN_KEY
+def send_gain_command(payload, sock_path=None):
+    """Send one raw control datagram to the supervisor's control socket, which
+    forwards it verbatim to rsp_fm's GainControlServer. Accepts the two nudge
+    keys plus (v0.14.0) `agc:on`/`agc:off`/`gain:N`."""
     path = sock_path or CTRL_SOCK_PATH
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-            sock.sendto(key, path)
+            sock.sendto(payload, path)
         return True
     except OSError:
         return False
+
+
+def send_gain_nudge(direction, sock_path=None):
+    return send_gain_command(GAIN_UP_KEY if direction == "up" else GAIN_DOWN_KEY,
+                             sock_path)
 
 
 def _send_bridge_control(keys: bytes, path: str) -> None:

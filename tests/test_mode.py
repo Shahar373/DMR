@@ -378,3 +378,58 @@ def test_live_mode_distinguishes_multi_from_dmr(paths, sysctl, no_sleep):
     assert app._live_mode() == "dmr"
 
 
+
+
+# --- ★ v0.14.0: טראנקינג הוא ברירת-מחדל רק למערכת רב-ערוצית -----------------
+
+def test_single_channel_system_does_not_trunk_by_default(paths):
+    """★ מערכת חד-ערוצית (16 מערכות סקר-השדה) היא תדר בודד — אין Rest-LSN
+    לעקוב אחריו. עד v0.14.0 נכפה עליה `-T`, ו-DSD-FME נשלח לרדוף אחרי מפת-
+    טראנקינג מדומה. עכשיו זה פשוט "כוונן ופענח"."""
+    app = paths
+    system = {"id": "one", "name": "ערוץ יחיד", "control": 164.325,
+              "color_code": 6, "channelmap": [{"lcn": 1, "freq": 164.325}]}
+    assert app._system_trunks(system) is False
+    assert "DSD_TRUNK=0" in app.render_dmr_env(system)
+
+
+def test_multi_channel_system_still_trunks_by_default(paths):
+    app = paths
+    system = {"id": "many", "name": "אשכול", "control": 164.10625, "color_code": 10,
+              "channelmap": [{"lcn": 1, "freq": 164.10625}, {"lcn": 2, "freq": 164.3}]}
+    assert app._system_trunks(system) is True
+    assert "DSD_TRUNK=1" in app.render_dmr_env(system)
+
+
+def test_explicit_trunk_field_overrides_the_default(paths):
+    app = paths
+    one = {"id": "a", "name": "כפוי", "control": 164.3, "color_code": 6,
+           "channelmap": [{"lcn": 1, "freq": 164.3}], "trunk": "1"}
+    many = {"id": "b", "name": "מבוטל", "control": 164.3, "color_code": 6,
+            "channelmap": [{"lcn": 1, "freq": 164.3}, {"lcn": 2, "freq": 164.5}],
+            "trunk": False}
+    assert "DSD_TRUNK=1" in app.render_dmr_env(one)
+    assert "DSD_TRUNK=0" in app.render_dmr_env(many)
+
+
+def test_validate_systems_fills_in_trunk_flag(paths):
+    app = paths
+    ok, cleaned = app._validate_systems([
+        {"id": "solo", "name": "יחיד", "control": 164.3, "color_code": 6,
+         "channelmap": [{"lcn": 1, "freq": 164.3}]},
+        {"id": "pair", "name": "זוג", "control": 164.3, "color_code": 6,
+         "channelmap": [{"lcn": 1, "freq": 164.3}, {"lcn": 2, "freq": 164.5}]},
+    ])
+    assert ok
+    assert cleaned[0]["trunk"] is False and cleaned[1]["trunk"] is True
+
+
+def test_non_trunking_system_channelmap_is_not_lsn_doubled(paths, sysctl, no_sleep):
+    """`lsn_pairs` קיים כדי להאכיל את מפת-הטראנקינג של DSD-FME. בלי טראנקינג
+    הכפלת הערוץ היחיד לשתי שורות-LSN היא רק זיהום."""
+    app = paths
+    system = {"id": "solo", "name": "יחיד", "control": 164.325, "color_code": 6,
+              "channelmap": [{"lcn": 1, "freq": 164.325}]}
+    app._enter_dmr(system)
+    rows = [r for r in app.CHANNELMAP_PATH.read_text().splitlines() if r.strip()]
+    assert len(rows) == 2          # שורת-כותרת + ערוץ אחד (לא שניים)

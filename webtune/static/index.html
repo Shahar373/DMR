@@ -138,6 +138,14 @@ button.btn:disabled{ opacity:.5; cursor:default; }
   border-radius:var(--r-sm); padding:10px var(--sp-3); }
 .stat-tile .n{ font-size:22px; font-weight:700; font-family:var(--mono); }
 .stat-tile .l{ font-size:12px; color:var(--faint); }
+/* מד-עוצמה: סקאלה קבועה −80..0 dBFS, אזור-יעד מסומן. הצבע נגזר מהמדידה. */
+.level-wrap{ position:relative; height:14px; border-radius:7px; background:var(--panel-2);
+  border:1px solid var(--border); overflow:hidden; margin-top:var(--sp-2); }
+.level-fill{ height:100%; width:0; border-radius:7px 0 0 7px; background:var(--accent);
+  transition:width .25s ease, background .25s ease; }
+/* אזור-היעד −35..−15 dBFS על סקאלת −80..0 (RTL: 0 dBFS בקצה הימני). */
+.level-wrap::before{ content:""; position:absolute; top:0; bottom:0; right:56.25%; width:25%;
+  background:rgba(127,127,127,.22); pointer-events:none; }
 .abar-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:7px; font-size:13px; }
 .abar-label{ min-width:110px; max-width:150px; color:var(--dim); white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; }
@@ -256,20 +264,38 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     </div>
 
     <div class="card">
-      <h2>📶 איכות RF ובקרת רווח</h2>
+      <h2>📶 עוצמת קליטה ובקרת רווח</h2>
       <div class="stat-row">
+        <!-- dir="ltr": ערך חתום (‎-24.3) בתוך דף RTL מרונדר אחרת כ-"24.3-" —
+             סימן המינוס הוא תו ניטרלי ונודד לקצה השני. -->
+        <div class="stat-tile"><div class="n" id="rfLevel" dir="ltr">–</div><div class="l">עוצמת כניסה (dBFS)</div></div>
         <div class="stat-tile"><div class="n" id="rfErrPerMin">–</div><div class="l">שגיאות CRC/FEC לדקה</div></div>
-        <div class="stat-tile"><div class="n" id="rfGainVal">0</div><div class="l">נוד-רווח (יחסי)</div></div>
       </div>
-      <div id="rfByType"></div>
-      <div class="row" style="margin-top:var(--sp-3)">
+      <div id="levelBar" class="level-wrap"><div id="levelFill" class="level-fill"></div></div>
+      <div class="muted mono" id="levelVerdict" style="margin-top:6px">אין מדידה — הגשר לא רץ.</div>
+
+      <div class="row" style="margin-top:var(--sp-3);align-items:center;gap:8px;flex-wrap:wrap">
+        <label class="row" style="gap:6px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="agcToggle"> <span>AGC אוטומטי</span>
+        </label>
+        <span class="tag" id="gainStateTag">–</span>
+      </div>
+      <div class="row" id="gainManualRow" style="margin-top:var(--sp-2);align-items:center;gap:8px">
         <button class="btn ghost" id="gainDown">− רווח</button>
+        <input type="range" id="gainSlider" min="0" max="28" step="1" value="14" style="flex:1;min-width:120px">
         <button class="btn ghost" id="gainUp">+ רווח</button>
-        <span class="muted" id="gainMsg"></span>
       </div>
+      <div class="row"><span class="muted" id="gainMsg"></span></div>
+
+      <div id="rfByType" style="margin-top:var(--sp-3)"></div>
+      <div id="levelChannels"></div>
       <div class="muted" style="margin-top:8px;font-size:12px">
-        תדירות שגיאות אמיתית מ-DSD-FME (CRC/FEC) — אין מד dBFS/SNR רציף (DSD-FME
-        לא מספק כזה). נוד-הרווח יחסי בלבד וללא קריאה חוזרת — כוונו לפי מדד השגיאות.
+        <b>העוצמה נמדדת בפועל</b> מדגימות ה-IQ (0 dBFS = מלוא סקאלת הממיר).
+        כוונו כך שהעוצמה תהיה בערך בין ‎−35‎ ל-‎−15 dBFS <b>בלי</b> חיתוך (clip).
+        חיתוך = רווח גבוה מדי (יפגע בפענוח אפילו כשהאות "חזק"). שגיאות CRC/FEC
+        גבוהות + עוצמה נמוכה = אות חלש/אנטנה — לא רווח.
+        ⚠ מדד ה-AGC/אינדקס הוא מה ש<b>אנחנו פקדנו</b>, לא קריאה-חוזרת מה-SDR
+        (הפרוטוקול לא מספק כזו).
       </div>
     </div>
 
@@ -903,12 +929,62 @@ async function pollPower(){
 // ---------- איכות RF + נוד-רווח ----------
 // abarRow מוגדר בהמשך (סעיף האנליטיקה) — hoisting של function declaration.
 let lastRF = null;   // נשמר גלובלית — renderChannelsBoard() קורא ממנו בלי fetch נוסף
+// מד-עוצמה: הכל נגזר ממדידה אמיתית (/api/rf → rsp_fm). אין ערך מומצא —
+// כשאין מדידה מציגים "אין מדידה", לא מספר.
+const LEVEL_MIN=-80, LEVEL_TARGET_LO=-35, LEVEL_TARGET_HI=-15;
+function renderLevel(d){
+  const lv = d.level, fill=$("levelFill");
+  if(!lv || lv.rms_dbfs==null){
+    $("rfLevel").textContent="–"; fill.style.width="0";
+    $("levelVerdict").textContent="אין מדידה — הגשר לא רץ.";
+    $("levelChannels").innerHTML=""; return;
+  }
+  const db=lv.rms_dbfs, clip=lv.clip_frac||0;
+  $("rfLevel").textContent = db.toFixed(1);
+  const pct = Math.max(0, Math.min(100, (db-LEVEL_MIN)/(0-LEVEL_MIN)*100));
+  fill.style.width = pct+"%";
+  let verdict, color;
+  // ⚠ טוקני-מדידה (--st-good/--st-critical), לא --green/--red של התגיות —
+  // ר' ההערה ב-:root. --amber לאזור-הביניים (מחוץ ליעד אך בלי חיתוך).
+  if(clip > 0.0005){ verdict=`⚠ חיתוך (clip ${(clip*100).toFixed(2)}%) — הורידו רווח`; color="var(--st-critical)"; }
+  else if(db > LEVEL_TARGET_HI){ verdict="חזק מדי — שקלו להוריד רווח"; color="var(--amber)"; }
+  else if(db < LEVEL_TARGET_LO){ verdict="חלש — העלו רווח, או בדקו אנטנה/כיוון"; color="var(--amber)"; }
+  else { verdict="✓ בתחום היעד"; color="var(--st-good)"; }
+  fill.style.background = color;
+  // FSI/PDI (U+2068/U+2069) מבודדים את הריצה ה-LTR: בלעדיהם "‎-0.2 dBFS"
+  // מתפרק בדף RTL (המינוס והיחידה נודדים). עובר דרך esc() בלי פגע, בניגוד
+  // לתגית <bdi>.
+  const iso = t => `⁨${t}⁩`;
+  $("levelVerdict").textContent =
+    `${verdict} · שיא ${iso((lv.peak_dbfs!=null?lv.peak_dbfs.toFixed(1):"–")+" dBFS")}`;
+
+  const chans = d.level_by_channel||[];
+  $("levelChannels").innerHTML = chans.length>1
+    ? `<div class="muted" style="margin-top:8px">עוצמה פר-ערוץ:</div>` + chans.map(c=>{
+        const cdb = c.dbfs==null ? null : c.dbfs;
+        const cpct = cdb==null?0:Math.max(0,Math.min(100,(cdb-LEVEL_MIN)/(0-LEVEL_MIN)*100));
+        return abarRow(`LCN${c.lcn} · ${(c.freq_hz/1e6).toFixed(4)}`,
+                       cpct, 100, iso(cdb==null?"–":cdb.toFixed(1)+" dBFS"));
+      }).join("")
+    : "";
+}
+function renderGainState(d){
+  const g=d.gain;
+  if(!g){ $("gainStateTag").textContent="לא זמין"; $("agcToggle").disabled=true; return; }
+  $("agcToggle").disabled=false;
+  if(!gainTouched) $("agcToggle").checked = !!g.agc;
+  $("gainSlider").value = g.index;
+  $("gainSlider").disabled = !!g.agc;
+  $("gainStateTag").textContent = g.agc
+    ? "AGC פעיל (הרווח נקבע אוטומטית)"
+    : `ידני · אינדקס ${g.index}/${g.index_max}`;
+}
 async function pollRF(){
   const r=await api("/api/rf"); if(!r.ok||!r.body.ok)return;
   const d=r.body;
   lastRF = d;
   $("rfErrPerMin").textContent = d.errors_per_min;
-  $("rfGainVal").textContent = (d.gain_nudge>0?"+":"")+d.gain_nudge;
+  renderLevel(d); renderGainState(d);
   const max = Math.max(1, ...d.by_type.map(t=>t.count), 0);
   $("rfByType").innerHTML = d.by_type.length
     ? d.by_type.map(t=>abarRow(t.error_type, t.count, max)).join("")
@@ -1040,19 +1116,24 @@ function renderChannelsBoard(){
     showView("calls"); $("callFilter").value = "lcn:"+el.dataset.boardLcn; renderFeed();
   });
 }
-async function nudgeGain(direction){
+// gainTouched: אחרי שהמשתמש נגע בטוגל, אל תדרסו את בחירתו ב-poll הבא לפני
+// שהגשר הספיק לדווח את המצב החדש (אותו לקח כמו wlSeeded ב-watchlist).
+let gainTouched = false;
+async function sendGain(payload){
   $("gainMsg").textContent = "…";
-  const r = await post("/api/gain", {direction});
+  const r = await post("/api/gain", payload);
   if(!r.ok || r.body.ok===false){
     $("gainMsg").textContent = "שגיאה: "+(r.body.error||"");
-    return;
+    return false;
   }
-  $("rfGainVal").textContent = (r.body.gain_nudge>0?"+":"")+r.body.gain_nudge;
   $("gainMsg").textContent = "נשלח ✓";
-  setTimeout(()=>$("gainMsg").textContent="", 1500);
+  setTimeout(()=>{ $("gainMsg").textContent=""; gainTouched=false; pollRF(); }, 1200);
+  return true;
 }
-$("gainUp").onclick = ()=>nudgeGain("up");
-$("gainDown").onclick = ()=>nudgeGain("down");
+$("gainUp").onclick = ()=>sendGain({direction:"up"});
+$("gainDown").onclick = ()=>sendGain({direction:"down"});
+$("agcToggle").onchange = ()=>{ gainTouched=true; sendGain({agc:$("agcToggle").checked}); };
+$("gainSlider").onchange = ()=>{ gainTouched=true; sendGain({index:+$("gainSlider").value}); };
 
 // ---------- call feed ----------
 function callCard(m){
