@@ -412,3 +412,159 @@ def test_rigctl_spectrum_verb():
     assert resp["center_hz"] == 461_000_000 and resp["power_db"][1] == -50.0
     # בלי spectrum => לא נתמך
     assert rsp_fm.RigctlServer("127.0.0.1", 0, tuner).handle_command("SPECTRUM") == "RPRT 1\n"
+
+
+# --- ★ v0.14.0: פאזת דצימציה, מדידת עוצמה אמיתית, ובקרת AGC -----------------
+
+def _u8_noise(complex_samples, seed=0):
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, complex_samples * 2, dtype=np.uint8).tobytes()
+
+
+def test_decimation_phase_carries_across_chunks_at_multi_rate():
+    """★ regression for the multi-mode FEC failure (27.07.2026, hardware).
+
+    `filtered[::D]` used to restart at index 0 on every chunk, which is only
+    correct when the chunk length is an exact multiple of D. Single-channel
+    got away with it (240000/48000=5, chunk 24000 % 5 == 0); multi did not
+    (672000/48000=14, chunk 24000 % 14 == 4), so the sampling grid slipped 10
+    samples (~15us of a 208us symbol) at every chunk boundary and the stream
+    ran at 48,020 Hz instead of 48,000 (+417 ppm). DSD-FME found `Sync: +DMR`
+    and then failed every single CACH/Burst FEC. The output sample count must
+    now track iq_rate/audio_rate exactly, with no accumulating drift.
+    """
+    chunk = 24_000                      # complex samples; 24000 % 14 == 4
+    demod = rsp_fm.NfmDemodulator(iq_rate=672_000, audio_rate=48_000)
+    produced = sum(len(demod.process(_u8_noise(chunk, seed=i))) // 2
+                   for i in range(40))
+    expected = 40 * chunk * 48_000 / 672_000
+    assert abs(produced - expected) <= 1, (produced, expected)
+
+
+def test_decimation_phase_is_noop_when_chunk_divides_evenly():
+    """The single-channel path (240kHz, decimation 5, chunk 24000) was already
+    phase-aligned, so the fix must not perturb it: phase stays 0 throughout."""
+    demod = rsp_fm.NfmDemodulator(iq_rate=240_000, audio_rate=48_000)
+    for i in range(5):
+        assert len(demod.process(_u8_noise(24_000, seed=i))) // 2 == 4_800
+        assert demod._decim_phase == 0
+
+
+def test_decimation_phase_reset_clears_grid():
+    demod = rsp_fm.NfmDemodulator(iq_rate=672_000, audio_rate=48_000)
+    demod.process(_u8_noise(24_000))
+    assert demod._decim_phase != 0
+    demod.reset()
+    assert demod._decim_phase == 0
+
+
+def test_iq_level_dbfs_full_scale_is_about_zero_dbfs():
+    """A carrier filling the u8 range measures ~0 dBFS -- the scale the UI
+    shows must be anchored to something real, not an arbitrary offset."""
+    n = 4_096
+    phase = 2 * np.pi * np.arange(n) / 16.0
+    iq = np.empty(n * 2, dtype=np.uint8)
+    # amplitude 126 (not 127) so the waveform peaks just inside the 0/255
+    # rails -- otherwise this "clean full-scale" reference would itself
+    # register as clipping, which is exactly what clip_frac is meant to catch.
+    iq[0::2] = np.round(np.cos(phase) * 126 + 127.5).astype(np.uint8)
+    iq[1::2] = np.round(np.sin(phase) * 126 + 127.5).astype(np.uint8)
+    level = rsp_fm.iq_level_dbfs(iq.tobytes())
+    assert -1.0 < level["rms_dbfs"] < 0.5
+    assert level["clip_frac"] == 0.0
+
+
+def test_iq_level_dbfs_flags_clipping_as_over_gain():
+    """clip_frac is the honest over-gain tell: bytes pinned at the 0/255 rail."""
+    railed = np.full(4_096, 255, dtype=np.uint8)
+    railed[1::2] = 0
+    level = rsp_fm.iq_level_dbfs(railed.tobytes())
+    assert level["clip_frac"] == 1.0
+
+
+def test_iq_level_dbfs_quiet_input_is_far_below_full_scale():
+    quiet = np.full(4_096, 128, dtype=np.uint8)
+    level = rsp_fm.iq_level_dbfs(quiet.tobytes())
+    assert level["rms_dbfs"] < -40.0
+    assert level["clip_frac"] == 0.0
+
+
+def test_iq_level_dbfs_handles_empty_input():
+    assert rsp_fm.iq_level_dbfs(b"")["rms_dbfs"] is None
+
+
+def test_demodulator_measures_channel_level():
+    demod = rsp_fm.NfmDemodulator(iq_rate=240_000, audio_rate=48_000)
+    assert demod.level_dbfs is None
+    demod.process(_u8_noise(24_000))
+    assert demod.level_dbfs is not None and demod.level_dbfs < 0.0
+
+
+def test_gain_state_reports_agc_and_never_claims_readback(monkeypatch):
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: None)
+    assert tuner.gain_state() == {"agc": True, "index": 14,
+                                  "index_max": 28, "readback": False}
+    tuner.set_fixed_gain(20)
+    assert tuner.gain_state()["agc"] is False
+    assert tuner.gain_state()["index"] == 20
+
+
+def test_set_agc_can_return_to_automatic(monkeypatch):
+    """★ Before v0.14.0 the first gain nudge switched the SDR to manual gain
+    permanently -- there was no command to re-enable AGC at all, only a full
+    service restart."""
+    sent = []
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: sent.append((cmd, val)))
+    tuner.nudge_gain(+1)
+    assert tuner.agc is False
+    sent.clear()
+    tuner.set_agc(True)
+    assert tuner.agc is True
+    assert (rsp_fm.RTL_CMD_SET_GAIN_MODE, 0) in sent
+
+
+def test_gain_control_server_applies_agc_and_absolute_gain(monkeypatch):
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: None)
+    server = rsp_fm.GainControlServer("/tmp/unused-dmr-test.sock", tuner)
+    server._apply(b"agc:off")
+    assert tuner.agc is False
+    server._apply(b"gain:22")
+    assert tuner.gain_index == 22
+    server._apply(b"agc:on")
+    assert tuner.agc is True
+    server._apply(b"G")
+    assert tuner.gain_index == 23 and tuner.agc is False
+
+
+def test_rigctl_level_verb_reports_measured_values(monkeypatch):
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: None)
+    snapshot = {"frontend": {"rms_dbfs": -22.5, "peak_dbfs": -9.0, "clip_frac": 0.0},
+                "channels": [{"lcn": 3, "freq_hz": 164_325_000,
+                              "dbfs": -41.2, "peak_dbfs": -38.0}]}
+    server = rsp_fm.RigctlServer("127.0.0.1", 0, tuner, levels=lambda: snapshot)
+    import json
+    body = json.loads(server.handle_command("LEVEL"))
+    assert body["frontend"]["rms_dbfs"] == -22.5
+    assert body["channels"][0]["lcn"] == 3
+    assert body["gain"] == {"agc": True, "index": 14, "index_max": 28,
+                            "readback": False}
+
+
+def test_rigctl_l_verb_is_measured_not_the_invented_constant(monkeypatch):
+    """`l` used to return a hardcoded "-50.0" -- an invented metric
+    (CLAUDE.md §8). It must now be the measured front-end level, and must
+    refuse rather than fabricate one when nothing has been measured."""
+    tuner = rsp_fm.RtlTcpClient("127.0.0.1", 1234, 461_000_000, 240_000)
+    monkeypatch.setattr(tuner, "send_command", lambda cmd, val: None)
+    measured = rsp_fm.RigctlServer(
+        "127.0.0.1", 0, tuner,
+        levels=lambda: {"frontend": {"rms_dbfs": -33.25}})
+    assert measured.handle_command("l") == "-33.2\n"
+    assert rsp_fm.RigctlServer("127.0.0.1", 0, tuner).handle_command("l") == "RPRT 1\n"
+    blank = rsp_fm.RigctlServer("127.0.0.1", 0, tuner,
+                                levels=lambda: {"frontend": {"rms_dbfs": None}})
+    assert blank.handle_command("l") == "RPRT 1\n"

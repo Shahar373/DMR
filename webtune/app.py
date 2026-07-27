@@ -180,6 +180,24 @@ CHANNELMAP_MAX = 64
 COLOR_CODE_MIN, COLOR_CODE_MAX = 0, 15
 
 
+def _default_trunk(channelmap):
+    """★ v0.14.0: מעקב-טראנקינג (`-T -C -U`) הוא ברירת-מחדל **רק** למערכת עם
+    ≥2 ערוצים במפה. מערכת חד-ערוצית (כמו 16 מערכות סקר-השדה) היא תדר בודד —
+    אין לאן "לעקוב", ואכיפת טראנקינג עליה הזיקה בפועל: DSD-FME נשלח לרדוף
+    אחרי Rest-LSN שלא קיים, ו-`render_channelmap(lsn_pairs=True)` שכפל את
+    הערוץ היחיד לשתי שורות-LSN מדומות. עכשיו ברירת המחדל היא פשוט "כוונן
+    לתדר הזה ופענח" — בדיוק כמו מסרוק. אפשר לכפות ידנית דרך שדה `trunk`."""
+    return len(channelmap or []) >= 2
+
+
+def _system_trunks(system):
+    """האם להפעיל מעקב-טראנקינג למערכת נתונה (שדה מפורש גובר על ברירת המחדל)."""
+    raw = system.get("trunk")
+    if raw is None:
+        return _default_trunk(system.get("channelmap"))
+    return str(raw).lower() in ("1", "true", "yes")
+
+
 def _validate_systems(lst):
     """(ok, cleaned) - מנרמל ומאמת רשימת מערכות DMR מהלקוח/מהדיסק."""
     if not isinstance(lst, list) or len(lst) > SYSTEMS_MAX:
@@ -224,7 +242,9 @@ def _validate_systems(lst):
                 return False, None
             cmap.append({"lcn": lcn, "freq": freq})
         out.append({"id": sid, "name": name, "control": control,
-                    "color_code": cc, "channelmap": cmap})
+                    "color_code": cc, "channelmap": cmap,
+                    "trunk": _default_trunk(cmap) if s.get("trunk") is None
+                    else str(s.get("trunk")).lower() in ("1", "true", "yes")})
     return True, out
 
 
@@ -378,7 +398,7 @@ def render_dmr_env(system, multi=False):
     וגם ל-rsp_fm.py — שני תהליכי-בן נפרדים) עלול לסטות מברירות-מחדל אחרות)."""
     control_hz = int(round(float(system["control"]) * 1e6))
     cc = int(system.get("color_code", 1))
-    trunk = "1" if str(system.get("trunk", 1)).lower() in ("1", "true", "yes") else "0"
+    trunk = "1" if _system_trunks(system) else "0"
     sweep = bool(system.get("sweep"))
     iq_rate = int(system.get("iq_rate", DMR_BRIDGE_IQ_RATE))
     lines = [
@@ -466,7 +486,11 @@ def _enter_dmr(system, multi=False):
     ⚠ אותו קובץ channelmap.csv משרת שתי סמנטיקות שונות, ולכן lsn_pairs תלוי-מצב:
     בחד-ערוצי הוא מפת ה-LSN של DSD-FME (זוגות — ר' render_channelmap), ב-multi
     הוא רשימת הערוצים הפיזיים לדמודולציה (שורה לערוץ, בלי הכפלה)."""
-    write_channelmap(system.get("channelmap"), lsn_pairs=not multi)
+    # lsn_pairs (הכפלת ערוץ פיזי לשני LSN-ים) רלוונטי **רק** למפת-טראנקינג של
+    # DSD-FME. ב-multi הקובץ הוא רשימת ערוצים לדמודולציה, ובמערכת לא-מטראנקת
+    # הוא לא נקרא בכלל — בשני המקרים הכפלה רק מזיקה (ר' _default_trunk).
+    write_channelmap(system.get("channelmap"),
+                     lsn_pairs=_system_trunks(system) and not multi)
     write_dmr_env(system, multi=multi)
     try:
         r = _sysctl("restart", DMR_SERVICE, timeout=45)
@@ -1447,6 +1471,22 @@ def _rigctl_command(command, timeout=3.0):  # pragma: no cover - hardware runtim
         return buf.decode("utf-8", "replace").strip()
 
 
+def _bridge_levels():
+    """קורא את מדידות-העוצמה האמיתיות מ-rsp_fm (verb `LEVEL`, v0.14.0):
+    `frontend` (rms/peak dBFS + clip_frac של הקליטה הרחבה — מדד ה-over-gain)
+    ו-`channels` (dBFS פר ערוץ). מחזיר `None` כשהגשר לא רץ — **לא** ערך מומצא
+    (CLAUDE.md §8: הקבוע `-50.0` שהיה כאן פעם היה בדיוק ההפרה הזאת)."""
+    try:
+        raw = _rigctl_command("LEVEL", timeout=1.5)
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _sweep_read(center_hz):  # pragma: no cover - hardware runtime
     """מכוונן את הסורק למרכז נתון (rigctl F) וקורא את הספקטרום הממוצע (SPECTRUM),
     ממתין להתייצבות. מחזיר snapshot {center_hz, bin_hz, power_db} או None."""
@@ -1882,11 +1922,21 @@ def api_positions():
 @app.route("/api/rf")
 def api_rf():
     """איכות RF: תדירות שגיאות CRC/FEC אמיתית מ-DSD-FME (חלון RF_WINDOW_SEC).
-    **אין dBFS/SNR** — נדחה במכוון (ר' CLAUDE.md §8: דורש פטצ' rsp_tcp).
+    ★ v0.14.0: **יש עכשיו dBFS אמיתי** — `level` (frontend+channels) נמדד
+    ב-`rsp_fm.py` מדגימות ה-IQ עצמן (`iq_level_dbfs`/`_measure_level`) ומגיע
+    דרך verb `LEVEL`. זה לא סותר את §8 — האיסור היה על **המצאת** מדד, לא על
+    מדידתו; ההערה הישנה ("דורש פטצ' rsp_tcp") נכתבה לארכיטקטורה של לפני
+    v0.4.0, כשהגשר עוד לא היה שלנו. `level=None` כשהגשר לא רץ — לא ערך מומצא.
+    `gain` = מצב AGC/אינדקס כפי ש**אנחנו** פקדנו (`readback:false` — לפרוטוקול
+    אין קריאה-חוזרת, וזה מוצהר במפורש ולא מוסתר).
     by_channel: פירוט פר-ערוץ ב-multi mode (Phase 2) — [] בחד-ערוצי."""
     st = load_state()
     feed = _feed_snapshot()
+    levels = _bridge_levels() or {}
     return jsonify(ok=True, gain_nudge=int(st.get("gain_nudge", 0)),
+                   level=levels.get("frontend"),
+                   level_by_channel=levels.get("channels") or [],
+                   gain=levels.get("gain"),
                    by_channel=_rf_quality_by_channel(),
                    # ★ v0.13.0: שורות-שיחה שהפרסר לא תפס, ושגיאות-טיפול —
                    # שני מונים שקודם לא היו קיימים ולכן נפלו בשקט.
@@ -1947,9 +1997,29 @@ def api_gain():
     """נוד-רווח חי (הקשת g/G דרך dsd_pty, בלי לעצור את DSD-FME). יחסי בלבד —
     אין readback אמיתי מ-DSD-FME, ר' _dmr_gain_nudge. דרך _guard (POST)."""
     data = request.get_json(silent=True) or {}
+    # ★ v0.14.0: מצב-רווח מפורש. עד כה היה רק נוד ±1, והוא **הפיל את ה-AGC
+    # לצמיתות** בלי שום דרך חזרה חוץ מ-restart מלא לשירות — וגם בלי שהמשתמש
+    # ידע שזה קרה. עכשיו אפשר לבקש AGC/ידני-מוחלט ישירות.
+    if "agc" in data:
+        ok = dsd_pty.send_gain_command(b"agc:on" if data["agc"] else b"agc:off")
+        if not ok:
+            return jsonify(ok=False, error="שליחת הפקודה נכשלה — dmr-dsdfme רץ?"), 500
+        if data["agc"]:
+            save_state({**load_state(), "gain_nudge": 0})
+        return jsonify(ok=True, agc=bool(data["agc"]))
+    if "index" in data:
+        try:
+            index = int(data["index"])
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="index חייב להיות מספר"), 400
+        if not 0 <= index <= 28:
+            return jsonify(ok=False, error="index חייב להיות בטווח 0–28"), 400
+        if not dsd_pty.send_gain_command(f"gain:{index}".encode()):
+            return jsonify(ok=False, error="שליחת הפקודה נכשלה — dmr-dsdfme רץ?"), 500
+        return jsonify(ok=True, index=index)
     direction = str(data.get("direction", "")).lower()
     if direction not in ("up", "down"):
-        return jsonify(ok=False, error="direction חייב להיות up/down"), 400
+        return jsonify(ok=False, error="נדרש direction (up/down), agc או index"), 400
     ok, val = _dmr_gain_nudge(direction)
     if not ok:
         return jsonify(ok=False, error="שליחת הפקודה נכשלה — dmr-dsdfme רץ?",

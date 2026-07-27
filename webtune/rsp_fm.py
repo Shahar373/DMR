@@ -15,6 +15,7 @@ can run headless on Raspberry Pi OS without GNU Radio or a desktop SDR app.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import queue
 import signal
@@ -44,6 +45,36 @@ def _log(message: str) -> None:
 def rtl_command(command: int, value: int) -> bytes:
     """Return one standard rtl_tcp command packet (1-byte cmd + u32 BE)."""
     return struct.pack(">BI", command & 0xFF, value & 0xFFFFFFFF)
+
+
+def iq_level_dbfs(raw: bytes) -> dict:
+    """MEASURED front-end level of one raw u8 IQ chunk, straight off rsp_tcp.
+
+    This is the number that answers "am I over-gained?" -- unlike the
+    per-channel level (NfmDemodulator._measure_level), which is measured after
+    filtering to one 12.5 kHz channel and therefore says nothing about whether
+    the SDR's ADC is saturating on some strong neighbour.
+
+    Returns {rms_dbfs, peak_dbfs, clip_frac}. 0 dBFS == a unit-amplitude
+    carrier filling the u8 range. `clip_frac` is the fraction of I/Q bytes
+    sitting at 0 or 255 (hard rail) -- the unambiguous over-gain tell: healthy
+    reception is ~0.0, anything above a few 1e-4 means the front end is
+    clipping and the gain must come DOWN. Pure (bytes in, numbers out), so it
+    is unit-testable without an SDR."""
+    values = np.frombuffer(raw, dtype=np.uint8)
+    if values.size < 2:
+        return {"rms_dbfs": None, "peak_dbfs": None, "clip_frac": None}
+    clipped = int(np.count_nonzero((values == 0) | (values == 255)))
+    floats = (values.astype(np.float32) - 127.5) / 128.0
+    i, q = floats[0::2], floats[1::2]
+    n = min(i.size, q.size)
+    power = (i[:n].astype(np.float64) ** 2 + q[:n].astype(np.float64) ** 2)
+    mean_power = float(power.mean()) if n else 0.0
+    peak_power = float(power.max()) if n else 0.0
+    to_db = lambda p: 10.0 * math.log10(p) if p > 1e-20 else -200.0  # noqa: E731
+    return {"rms_dbfs": round(to_db(mean_power), 1),
+            "peak_dbfs": round(to_db(peak_power), 1),
+            "clip_frac": round(clipped / values.size, 6)}
 
 
 def scaled_taps(iq_rate: int, base_taps: int = 121,
@@ -234,6 +265,20 @@ class NfmDemodulator:
         # the same reason `overlap`/DC-blocker state is: a fresh phase=0 every
         # chunk would insert an audible discontinuity at each chunk boundary.
         self._mix_phase = 0.0
+        # ★ Decimation phase, carried across chunks (v0.14.0). `filtered[::D]`
+        # restarting at index 0 every chunk is only correct when the chunk
+        # length is an exact multiple of D. Single-channel satisfies that by
+        # luck (240000/48000=5, chunk 24000 % 5 == 0), but multi does NOT:
+        # at 672 kHz D=14 and 24000 % 14 == 4, so every chunk boundary slipped
+        # the sampling grid by 10 samples (~15us, ~7% of a 4800-baud symbol)
+        # AND emitted 1715 samples per 35.7ms = 48,020 Hz instead of 48,000
+        # (+417 ppm). DSD-FME found sync but every CACH/Burst FEC failed --
+        # exactly the field symptom (27.07.2026). Carrying the phase makes the
+        # output grid continuous and the rate exact for ANY iq_rate.
+        self._decim_phase = 0
+        # Measured signal level (see process()). None until the first chunk.
+        self.level_dbfs: Optional[float] = None
+        self.peak_dbfs: Optional[float] = None
 
     def reset(self) -> None:
         self.overlap.fill(0)
@@ -241,6 +286,9 @@ class NfmDemodulator:
         self._dc_x_prev = 0.0
         self._dc_y_prev = 0.0
         self._mix_phase = 0.0
+        self._decim_phase = 0
+        self.level_dbfs = None
+        self.peak_dbfs = None
 
     def _dc_block(self, fm: np.ndarray) -> np.ndarray:
         """Remove DC/slow drift with a stateful one-pole filter (~8 Hz cutoff
@@ -259,6 +307,26 @@ class NfmDemodulator:
         self._dc_x_prev = x_prev
         self._dc_y_prev = y_prev
         return out
+
+    def _measure_level(self, baseband: np.ndarray) -> None:
+        """Per-channel signal level, MEASURED from the post-filter complex
+        baseband (0 dBFS == unit-amplitude carrier, the full-scale u8 input).
+        This is a real number, not the invented -50.0 the rigctl `l` verb used
+        to return (CLAUDE.md §8: never invent a metric). It says how strong
+        THIS channel is -- the number needed to aim an antenna or judge
+        whether a channel is decodable at all -- and is deliberately separate
+        from the front-end level (iq_level_dbfs), which is what says whether
+        the SDR gain itself is too high."""
+        if baseband.size == 0:
+            return
+        power = float(np.mean((baseband.real.astype(np.float64) ** 2)
+                              + (baseband.imag.astype(np.float64) ** 2)))
+        db = 10.0 * math.log10(power) if power > 1e-20 else -200.0
+        # Exponential smoothing (~0.3s at typical chunk sizes) so the UI value
+        # is readable; peak decays slowly so a short burst stays visible.
+        self.level_dbfs = db if self.level_dbfs is None else (
+            0.7 * self.level_dbfs + 0.3 * db)
+        self.peak_dbfs = db if self.peak_dbfs is None else max(db, self.peak_dbfs - 0.5)
 
     def process(self, raw: bytes) -> bytes:
         values = np.frombuffer(raw, dtype=np.uint8)
@@ -280,7 +348,11 @@ class NfmDemodulator:
         extended = np.concatenate((self.overlap, iq))
         filtered = np.convolve(extended, self.taps, mode="valid")
         self.overlap = extended[-(len(self.taps) - 1):].copy()
-        baseband = filtered[::self.decimation]
+        # Continue the decimation grid where the previous chunk left off
+        # instead of restarting at 0 (see _decim_phase in __init__).
+        baseband = filtered[self._decim_phase::self.decimation]
+        self._decim_phase = (self._decim_phase - filtered.size) % self.decimation
+        self._measure_level(baseband)
         if baseband.size == 0:
             return b""
 
@@ -311,6 +383,12 @@ class RtlTcpClient:
         self._state_lock = threading.Lock()
         self.generation = 0
         self.gain_index = 14
+        # ★ v0.14.0: the gain MODE is now tracked and reportable. It used to be
+        # implicit and one-way: connect() enabled AGC, and the first ever
+        # gain nudge silently switched the SDR to manual forever with no way
+        # back short of restarting the whole service, and no way to see which
+        # mode you were in. Both facts are now visible via gain_state().
+        self.agc = True
 
     def connect(self, timeout: float = 15.0) -> None:
         deadline = time.monotonic() + timeout
@@ -331,6 +409,7 @@ class RtlTcpClient:
                 self.send_command(RTL_CMD_SET_SAMPLE_RATE, self.sample_rate)
                 self.send_command(RTL_CMD_SET_FREQ, self.frequency)
                 self.send_command(RTL_CMD_SET_GAIN_MODE, 0)
+                self.agc = True
                 _log(f"connected to rtl_tcp {self.host}:{self.port}; "
                      f"frequency={self.frequency} Hz, IQ={self.sample_rate} sps")
                 return
@@ -376,7 +455,30 @@ class RtlTcpClient:
         self.gain_index = max(0, min(28, int(index)))
         self.send_command(RTL_CMD_SET_GAIN_MODE, 1)
         self.send_command(RTL_CMD_SET_GAIN_BY_INDEX, self.gain_index)
+        self.agc = False
         _log(f"manual gain index {self.gain_index}/28")
+
+    def set_agc(self, enabled: bool) -> None:
+        """Explicit AGC on/off. Turning it back ON was impossible before
+        v0.14.0 -- the only path out of manual gain was restarting the
+        service."""
+        self.send_command(RTL_CMD_SET_GAIN_MODE, 0 if enabled else 1)
+        if not enabled:
+            self.send_command(RTL_CMD_SET_GAIN_BY_INDEX, self.gain_index)
+        self.agc = bool(enabled)
+        _log(f"gain mode: {'AGC' if enabled else f'manual {self.gain_index}/28'}")
+
+    def gain_state(self) -> dict:
+        """What the gain is actually set to, as far as this bridge knows.
+
+        ⚠ `index` is the value WE last commanded, not a readback: the rtl_tcp
+        protocol rsp_tcp implements is write-only for gain, so there is no way
+        to ask the SDR what it settled on -- and under AGC there is no index at
+        all (the value shown is simply the last manual one, or the 14 default).
+        Reported with `readback: False` so the UI can say so rather than imply
+        a measured dB figure (CLAUDE.md §8)."""
+        return {"agc": self.agc, "index": self.gain_index,
+                "index_max": 28, "readback": False}
 
     def nudge_gain(self, direction: int) -> None:
         self.set_fixed_gain(self.gain_index + direction)
@@ -512,11 +614,16 @@ class AudioSender:
 
 class RigctlServer:
     def __init__(self, host: str, port: int, tuner: RtlTcpClient,
-                 spectrum: "Optional[SpectrumState]" = None) -> None:
+                 spectrum: "Optional[SpectrumState]" = None,
+                 levels=None) -> None:
         self.host = host
         self.port = port
         self.tuner = tuner
         self.spectrum = spectrum
+        # Callable returning the measured level snapshot (front end + per
+        # channel) for the LEVEL verb and the real `l` verb. See run()/
+        # run_multi() for the two implementations.
+        self.levels = levels
         self.listener: Optional[socket.socket] = None
         self.stop_event = threading.Event()
 
@@ -576,12 +683,24 @@ class RigctlServer:
         if verb == "SPECTRUM" and self.spectrum is not None:
             import json
             return json.dumps(self.spectrum.snapshot()) + "\n"
+        # ★ v0.14.0: measured levels + gain state as one JSON line. Same
+        # pull-based pattern as SPECTRUM above, and likewise ignored by
+        # DSD-FME -- app.py's /api/rf is the only client.
+        if verb == "LEVEL":
+            import json
+            snapshot = self.levels() if self.levels else {}
+            return json.dumps({**snapshot, "gain": self.tuner.gain_state()}) + "\n"
         if verb == "M":
             return "RPRT 0\n"
         if verb == "m":
             return "NFM\n12000\n"
         if verb == "l":
-            return "-50.0\n"
+            # Was a hardcoded "-50.0" -- an invented metric (CLAUDE.md §8).
+            # Now the real measured front-end level, or RPRT 1 when nothing
+            # has been measured yet. Never a made-up number.
+            snapshot = self.levels() if self.levels else {}
+            value = (snapshot.get("frontend") or {}).get("rms_dbfs")
+            return f"{value:.1f}\n" if value is not None else "RPRT 1\n"
         if verb == "L":
             return "RPRT 0\n"
         if verb in ("q", "quit"):
@@ -622,10 +741,25 @@ class GainControlServer:
                 continue
             except OSError:
                 return
-            if data in (b"G", b"gain_up"):
-                self.tuner.nudge_gain(+1)
-            elif data in (b"g", b"gain_down"):
-                self.tuner.nudge_gain(-1)
+            try:
+                self._apply(data)
+            except (OSError, RuntimeError, ValueError) as error:
+                _log(f"gain control failed ({data!r}): {error}")
+
+    def _apply(self, data: bytes) -> None:
+        """One control datagram -> one tuner action. `agc:on|off` and `gain:N`
+        are v0.14.0 additions: before them the only commands were the two
+        nudges, which silently forced manual mode with no way back to AGC."""
+        if data in (b"G", b"gain_up"):
+            self.tuner.nudge_gain(+1)
+        elif data in (b"g", b"gain_down"):
+            self.tuner.nudge_gain(-1)
+        elif data == b"agc:on":
+            self.tuner.set_agc(True)
+        elif data == b"agc:off":
+            self.tuner.set_agc(False)
+        elif data.startswith(b"gain:"):
+            self.tuner.set_fixed_gain(int(data[5:]))
 
     def close(self) -> None:
         self.stop_event.set()
@@ -661,11 +795,18 @@ def run(config: BridgeConfig) -> int:
                          config.frequency, config.iq_rate)
     audio = AudioServer(config.audio_host, config.audio_port)
     sender = AudioSender(audio)
-    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, tuner)
-    gain = GainControlServer(config.control_socket, tuner)
     demod = NfmDemodulator(iq_rate=config.iq_rate,
                            audio_rate=config.audio_rate,
                            audio_gain=config.audio_gain)
+    frontend = {"rms_dbfs": None, "peak_dbfs": None, "clip_frac": None}
+    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, tuner,
+                          levels=lambda: {
+                              "frontend": dict(frontend),
+                              "channels": [{"lcn": None,
+                                            "freq_hz": tuner.get_frequency(),
+                                            "dbfs": demod.level_dbfs,
+                                            "peak_dbfs": demod.peak_dbfs}]})
+    gain = GainControlServer(config.control_socket, tuner)
     stop_event = threading.Event()
 
     def stop(_signum=None, _frame=None) -> None:
@@ -696,6 +837,7 @@ def run(config: BridgeConfig) -> int:
                     generation = tuner.generation
                     demod.reset()
                     discard_chunks = 2
+                frontend.update(iq_level_dbfs(chunk))
                 pcm = demod.process(chunk)
                 if discard_chunks:
                     discard_chunks -= 1
@@ -814,6 +956,7 @@ class MultiChannelBridge:
         multi_taps = (scaled_taps(config.iq_rate)
                       if os.environ.get("DSD_MULTI_SCALED_TAPS", "").lower()
                       in ("1", "true", "yes") else 121)
+        self.frontend = {"rms_dbfs": None, "peak_dbfs": None, "clip_frac": None}
         self.channels: "dict[int, dict]" = {}   # lcn -> {"demod":, "audio":, "sender":}
         for i, ch in enumerate(config.channels):
             demod = NfmDemodulator(iq_rate=config.iq_rate, audio_rate=config.audio_rate,
@@ -831,9 +974,23 @@ class MultiChannelBridge:
             ch["sender"].start()
 
     def process_chunk(self, raw: bytes) -> None:
+        self.frontend.update(iq_level_dbfs(raw))
         for ch in self.channels.values():
             pcm = ch["demod"].process(raw)
             ch["sender"].submit(pcm)
+
+    def level_snapshot(self) -> dict:
+        """Measured levels for the LEVEL rigctl verb: one shared front-end
+        reading (the wideband capture all channels come from -- gain/clipping
+        is a property of that, not of any one channel) plus a per-channel
+        level so a weak or dead channel is visible individually."""
+        return {
+            "frontend": dict(self.frontend),
+            "channels": [{"lcn": lcn, "freq_hz": ch["freq_hz"],
+                          "dbfs": ch["demod"].level_dbfs,
+                          "peak_dbfs": ch["demod"].peak_dbfs}
+                         for lcn, ch in sorted(self.channels.items())],
+        }
 
     def reset(self) -> None:
         for ch in self.channels.values():
@@ -851,7 +1008,8 @@ def run_multi(config: MultiChannelConfig) -> int:  # pragma: no cover - hardware
     fanned out to N channel demodulators via MultiChannelBridge. Same
     read/reconnect/generation-discard skeleton as run()/run_sweep()."""
     bridge = MultiChannelBridge(config)
-    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, bridge.tuner)
+    rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, bridge.tuner,
+                          levels=bridge.level_snapshot)
     gain = GainControlServer(config.control_socket, bridge.tuner)
     stop_event = threading.Event()
 

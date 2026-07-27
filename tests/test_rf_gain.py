@@ -96,3 +96,78 @@ def test_gain_nudge_resets_on_dmr_entry(paths, sysctl, no_sleep):
     assert r.status_code == 200
     st = json.loads(app.STATE_PATH.read_text())
     assert st["gain_nudge"] == 0
+
+
+# --- ★ v0.14.0: עוצמה נמדדת + בקרת AGC מפורשת -------------------------------
+
+def test_api_rf_exposes_measured_level(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app, "_bridge_levels", lambda: {
+        "frontend": {"rms_dbfs": -21.4, "peak_dbfs": -6.0, "clip_frac": 0.0},
+        "channels": [{"lcn": 3, "freq_hz": 164_325_000, "dbfs": -44.1,
+                      "peak_dbfs": -41.0}],
+        "gain": {"agc": True, "index": 14, "index_max": 28, "readback": False},
+    })
+    body = _c(app).get("/api/rf").get_json()
+    assert body["level"]["rms_dbfs"] == -21.4
+    assert body["level"]["clip_frac"] == 0.0
+    assert body["level_by_channel"][0]["lcn"] == 3
+    assert body["gain"]["agc"] is True
+    # ⚠ המדד לא מתחזה למדוד-מהחומרה: הדגל חייב להישאר גלוי
+    assert body["gain"]["readback"] is False
+
+
+def test_api_rf_level_is_null_not_invented_when_bridge_is_down(paths, monkeypatch):
+    """CLAUDE.md §8: מוטב None על פני מספר מומצא. זה בדיוק הבאג של הקבוע
+    `-50.0` שהיה ב-rsp_fm.py — כשהגשר לא רץ אין עוצמה, ואומרים את זה."""
+    app = paths
+    monkeypatch.setattr(app, "_bridge_levels", lambda: None)
+    body = _c(app).get("/api/rf").get_json()
+    assert body["ok"] and body["level"] is None
+    assert body["level_by_channel"] == [] and body["gain"] is None
+
+
+def test_api_gain_enables_agc_and_clears_relative_counter(paths, monkeypatch):
+    """★ החזרה ל-AGC לא הייתה אפשרית לפני v0.14.0 (רק restart מלא)."""
+    app = paths
+    sent = []
+    monkeypatch.setattr(app.dsd_pty, "send_gain_nudge", lambda d: True)
+    monkeypatch.setattr(app.dsd_pty, "send_gain_command",
+                        lambda p, **kw: sent.append(p) or True)
+    _c(app).post("/api/gain", json={"direction": "up"})
+    r = _c(app).post("/api/gain", json={"agc": True})
+    assert r.status_code == 200 and r.get_json()["agc"] is True
+    assert sent == [b"agc:on"]
+    st = json.loads(app.STATE_PATH.read_text())
+    assert st["gain_nudge"] == 0        # המונה היחסי כבר לא רלוונטי תחת AGC
+
+
+def test_api_gain_disables_agc(paths, monkeypatch):
+    app = paths
+    sent = []
+    monkeypatch.setattr(app.dsd_pty, "send_gain_command",
+                        lambda p, **kw: sent.append(p) or True)
+    assert _c(app).post("/api/gain", json={"agc": False}).status_code == 200
+    assert sent == [b"agc:off"]
+
+
+def test_api_gain_sets_absolute_index(paths, monkeypatch):
+    app = paths
+    sent = []
+    monkeypatch.setattr(app.dsd_pty, "send_gain_command",
+                        lambda p, **kw: sent.append(p) or True)
+    r = _c(app).post("/api/gain", json={"index": 22})
+    assert r.status_code == 200 and r.get_json()["index"] == 22
+    assert sent == [b"gain:22"]
+
+
+def test_api_gain_rejects_index_out_of_range(paths):
+    assert _c(paths).post("/api/gain", json={"index": 99}).status_code == 400
+    assert _c(paths).post("/api/gain", json={"index": -1}).status_code == 400
+    assert _c(paths).post("/api/gain", json={"index": "loud"}).status_code == 400
+
+
+def test_api_gain_agc_failure_is_reported(paths, monkeypatch):
+    app = paths
+    monkeypatch.setattr(app.dsd_pty, "send_gain_command", lambda p, **kw: False)
+    assert _c(app).post("/api/gain", json={"agc": True}).status_code == 500
