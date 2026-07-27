@@ -143,8 +143,8 @@ button.btn:disabled{ opacity:.5; cursor:default; }
   border:1px solid var(--border); overflow:hidden; margin-top:var(--sp-2); }
 .level-fill{ height:100%; width:0; border-radius:7px 0 0 7px; background:var(--accent);
   transition:width .25s ease, background .25s ease; }
-/* אזור-היעד −35..−15 dBFS על סקאלת −80..0 (RTL: 0 dBFS בקצה הימני). */
-.level-wrap::before{ content:""; position:absolute; top:0; bottom:0; right:56.25%; width:25%;
+/* אזור-היעד −25..−3 dBFS על סקאלת −80..0 (RTL: 0 dBFS בקצה הימני). */
+.level-wrap::before{ content:""; position:absolute; top:0; bottom:0; right:3.75%; width:27.5%;
   background:rgba(127,127,127,.22); pointer-events:none; }
 .abar-row{ display:flex; align-items:center; gap:var(--sp-2); margin-bottom:7px; font-size:13px; }
 .abar-label{ min-width:110px; max-width:150px; color:var(--dim); white-space:nowrap; overflow:hidden;
@@ -307,11 +307,13 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       <div id="levelChannels"></div>
       <div class="muted" style="margin-top:8px;font-size:12px">
         <b>העוצמה נמדדת בפועל</b> מדגימות ה-IQ (0 dBFS = מלוא סקאלת הממיר).
-        כוונו כך שהעוצמה תהיה בערך בין ‎−35‎ ל-‎−15 dBFS <b>בלי</b> חיתוך (clip).
-        חיתוך = רווח גבוה מדי (יפגע בפענוח אפילו כשהאות "חזק"). שגיאות CRC/FEC
-        גבוהות + עוצמה נמוכה = אות חלש/אנטנה — לא רווח.
+        היא אומרת אם <b>כיוון הרווח</b> נכון — מתחת ל-‎−25 dBFS רעש-הכימות
+        מתחיל להרוס סמלים, וחיתוך מעל ~25% הורס אותם מהצד השני.
+        <b>⚠ עוצמה איננה איכות-פענוח.</b> ערוץ חזק ורועש נמדד בדיוק כמו ערוץ
+        חזק ונקי — רק <b>שגיאות ה-CRC/FEC</b> שלמעלה מעידות אם הפענוח באמת
+        עובד. "רמת-כניסה תקינה" + שגיאות גבוהות = אות חלש/אנטנה/הפרעה, לא רווח.
         ⚠ מדד ה-AGC/אינדקס הוא מה ש<b>אנחנו פקדנו</b>, לא קריאה-חוזרת מה-SDR
-        (הפרוטוקול לא מספק כזו).
+        (הפרוטוקול לא מספק כזו). הספים כוילו בסימולציה מול אות DMR סינתטי.
       </div>
     </div>
 
@@ -1028,7 +1030,14 @@ async function pollPower(){
 let lastRF = null;   // נשמר גלובלית — renderChannelsBoard() קורא ממנו בלי fetch נוסף
 // מד-עוצמה: הכל נגזר ממדידה אמיתית (/api/rf → rsp_fm). אין ערך מומצא —
 // כשאין מדידה מציגים "אין מדידה", לא מספר.
-const LEVEL_MIN=-80, LEVEL_TARGET_LO=-35, LEVEL_TARGET_HI=-15;
+// ★ ספים מכוילים בסימולציה (tests/test_rsp_fm.py + dmr_signal.py), לא בניחוש:
+//  · מתחת ל-‎−26 dBFS פר-ערוץ רעש-הכימות של 8 ביט לבדו מתחיל להרוס סמלים
+//    (נמדד: ‎−26 נקי, ‎−31 שוליים, ‎−34 נהרס) ⇒ סף אזהרה ‎−25 עם שוליים.
+//  · חיתוך: FM הוא מעטפת-קבועה ולכן סובלני. clip_frac=0.06 עדיין 0% שגיאות,
+//    0.33 עדיין 0.05%, ורק מ-~0.44 הפענוח מתדרדר (2.7%) ⇒ אזהרה מ-0.05,
+//    אדום מ-0.25. הסף הקודם (0.0005) היה רגיש פי-500 והיה זועק לשווא.
+const LEVEL_MIN=-80, LEVEL_TARGET_LO=-25, LEVEL_TARGET_HI=-3;
+const CLIP_WARN=0.05, CLIP_BAD=0.25;
 function renderLevel(d){
   const lv = d.level, fill=$("levelFill");
   if(!lv || lv.rms_dbfs==null){
@@ -1043,10 +1052,11 @@ function renderLevel(d){
   let verdict, color;
   // ⚠ טוקני-מדידה (--st-good/--st-critical), לא --green/--red של התגיות —
   // ר' ההערה ב-:root. --amber לאזור-הביניים (מחוץ ליעד אך בלי חיתוך).
-  if(clip > 0.0005){ verdict=`⚠ חיתוך (clip ${(clip*100).toFixed(2)}%) — הורידו רווח`; color="var(--st-critical)"; }
-  else if(db > LEVEL_TARGET_HI){ verdict="חזק מדי — שקלו להוריד רווח"; color="var(--amber)"; }
+  if(clip > CLIP_BAD){ verdict=`⚠ חיתוך כבד (${(clip*100).toFixed(1)}%) — הורידו רווח`; color="var(--st-critical)"; }
+  else if(clip > CLIP_WARN){ verdict=`קרוב לחיתוך (${(clip*100).toFixed(1)}%) — כדאי להוריד רווח`; color="var(--amber)"; }
+  else if(db > LEVEL_TARGET_HI){ verdict="חזק מאוד — שקלו להוריד רווח"; color="var(--amber)"; }
   else if(db < LEVEL_TARGET_LO){ verdict="חלש — העלו רווח, או בדקו אנטנה/כיוון"; color="var(--amber)"; }
-  else { verdict="✓ בתחום היעד"; color="var(--st-good)"; }
+  else { verdict="רמת-כניסה תקינה"; color="var(--st-good)"; }
   fill.style.background = color;
   // FSI/PDI (U+2068/U+2069) מבודדים את הריצה ה-LTR: בלעדיהם "‎-0.2 dBFS"
   // מתפרק בדף RTL (המינוס והיחידה נודדים). עובר דרך esc() בלי פגע, בניגוד
