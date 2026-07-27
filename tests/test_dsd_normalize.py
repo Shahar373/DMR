@@ -1,9 +1,13 @@
 """DSD-FME parsing, normalization and SDRplay bridge command tests."""
 import csv
+import os
+import signal
 import socket
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 import dsd_pty
 
@@ -483,6 +487,47 @@ def test_terminate_all_skips_already_dead_processes():
     already_dead._dead = True
     dsd_pty._terminate_all([already_dead, None], term_timeout=0.1, kill_timeout=0.1)
     assert already_dead.terminated is False
+
+
+def _with_restored_signal_handlers(fn):
+    old_term = signal.getsignal(signal.SIGTERM)
+    old_int = signal.getsignal(signal.SIGINT)
+    try:
+        fn()
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+
+
+def test_install_shutdown_handler_raises_on_sigterm():
+    # ★ regression for the "died instantly on `systemctl stop`" bug (27.07.2026,
+    # hardware): dsd_pty had no SIGTERM handler at all, so Python's default
+    # disposition killed the process before its `finally:` cleanup ever ran --
+    # _terminate_all() (however correct) was dead code. The handler must turn
+    # SIGTERM into a Python exception so the main loop actually unwinds.
+    def run():
+        dsd_pty._install_shutdown_handler()
+        with pytest.raises(dsd_pty._ShutdownRequested):
+            os.kill(os.getpid(), signal.SIGTERM)
+    _with_restored_signal_handlers(run)
+
+
+def test_install_shutdown_handler_raises_on_sigint_too():
+    def run():
+        dsd_pty._install_shutdown_handler()
+        with pytest.raises(dsd_pty._ShutdownRequested):
+            os.kill(os.getpid(), signal.SIGINT)
+    _with_restored_signal_handlers(run)
+
+
+def test_shutdown_requested_is_systemexit_not_swallowed_by_run_except_clause():
+    # _run()/_run_multi() wrap their main loop in
+    # `except (OSError, RuntimeError, ValueError)`; _ShutdownRequested must
+    # stay outside that tuple or the SIGTERM handler's exception would be
+    # caught there instead of reaching `finally:` (and returning 1, not
+    # propagating as a clean shutdown).
+    assert issubclass(dsd_pty._ShutdownRequested, SystemExit)
+    assert not issubclass(dsd_pty._ShutdownRequested, (OSError, RuntimeError, ValueError))
 
 
 def test_send_gain_nudge_no_listener_returns_false(tmp_path):

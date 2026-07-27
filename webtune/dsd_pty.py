@@ -553,6 +553,32 @@ def _wait_for_port(host: str, port: int, process, timeout: float = 15.0) -> bool
     return False
 
 
+class _ShutdownRequested(SystemExit):
+    """Raised from the SIGTERM/SIGINT handler installed by
+    _install_shutdown_handler() so the `finally:` cleanup in _run()/
+    _run_multi() actually runs on `systemctl stop`/`restart`. Python's
+    default disposition for SIGTERM (with no handler registered) is to kill
+    the process immediately -- confirmed on hardware (27.07.2026): dsd_pty's
+    Main PID was reported by systemd as `code=killed, signal=TERM` with none
+    of its own cleanup log lines ever printed, while its rsp_tcp child (which
+    *does* install its own C-level SIGTERM handler) printed "Signal caught,
+    ask for exit!" but was still alive 8s later and needed systemd's
+    KillMode=control-group SIGKILL -- `Active: failed (Result: timeout)`.
+    _terminate_all() was correct but dead code: the process receiving the
+    signal died before ever reaching its `finally:` block. Subclassing
+    SystemExit (not Exception) means it isn't swallowed by the `except
+    (OSError, RuntimeError, ValueError)` clauses in _run()/_run_multi(), and
+    propagating out of `__main__`'s `raise SystemExit(_run())` still exits
+    cleanly with no traceback."""
+
+
+def _install_shutdown_handler() -> None:
+    def _handler(_signum, _frame):
+        raise _ShutdownRequested()
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
 def _terminate(process) -> None:
     if process is None or process.poll() is not None:
         return
@@ -627,6 +653,7 @@ def _run():  # pragma: no cover - hardware runtime
     import pty
     import subprocess
 
+    _install_shutdown_handler()
     env = dict(os.environ)
     if env.get("DSD_MULTI", "").lower() in ("1", "true", "yes"):
         return _run_multi(env)
