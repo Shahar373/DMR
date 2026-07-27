@@ -232,26 +232,42 @@ button.btn:disabled{ opacity:.5; cursor:default; }
     <div class="card">
       <h2>מערכת DMR</h2>
       <div class="row">
-        <div style="flex:1;min-width:200px">
+        <div style="flex:1;min-width:180px">
           <label>מערכת פעילה</label>
           <select id="sysSelect"></select>
         </div>
+        <div style="align-self:flex-end;display:flex;gap:var(--sp-2)">
+          <button class="btn ghost" id="sysNew" title="צור מערכת חדשה">+ מערכת</button>
+          <button class="btn ghost" id="sysDelete" title="מחק את המערכת הנבחרת">🗑</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:var(--sp-2)">
+        <div style="flex:1;min-width:180px">
+          <label>שם</label>
+          <input id="sysName" maxlength="48" placeholder="למשל: מוקד עירוני">
+        </div>
         <div style="width:150px">
           <label>תדר בקרה (MHz)</label>
-          <input class="mono" id="sysControl" inputmode="decimal">
+          <input class="mono" id="sysControl" inputmode="decimal" placeholder="164.325">
         </div>
         <div style="width:110px">
           <label>Color Code</label>
-          <input class="mono" id="sysCC" inputmode="numeric">
+          <input class="mono" id="sysCC" inputmode="numeric" placeholder="1">
         </div>
       </div>
+
       <label style="margin-top:var(--sp-3)">מפת ערוצים (LCN → תדר MHz)</label>
       <div id="cmapList"></div>
       <div class="row" style="margin-top:var(--sp-2)">
         <button class="btn ghost" id="cmapAdd">+ ערוץ</button>
+        <button class="btn ghost" id="cmapPaste" title="הדבקת רשימת תדרים">📋 הדבק תדרים</button>
         <button class="btn" id="sysSave">שמור מערכת</button>
         <span class="muted" id="sysMsg"></span>
       </div>
+      <!-- מחוון רוחב-הפס: SDR אחד קולט חלון אחד רציף, ורוחבו נגזר מפריסת
+           הערוצים. ככל שהחלון רחב יותר, כך אות חזק אחד בתוכו "גונב" את ה-AGC
+           ומקטין את הדינמיקה (8 ביט) לערוצים החלשים — לכן הפריסה מוצגת כאן. -->
+      <div class="muted" id="sysSpan" style="margin-top:var(--sp-2);font-size:12px"></div>
     </div>
 
     <div class="card hidden" id="channelsCard">
@@ -587,9 +603,37 @@ function renderSystems(){
 $("sysSelect").onchange = ()=>{ loadSysEditor(); updateMultiBtn(); };
 function loadSysEditor(){
   const s = SYSTEMS.find(x=>x.id===$("sysSelect").value);
-  if(!s){ $("cmapList").innerHTML=""; return; }
+  if(!s){ $("cmapList").innerHTML=""; $("sysName").value=""; $("sysSpan").textContent=""; return; }
+  $("sysName").value = s.name;
   $("sysControl").value = s.control; $("sysCC").value = s.color_code;
   renderCmap(s.channelmap||[]);
+}
+// פריסת התדרים => רוחב חלון הקליטה. SDR אחד = חלון רציף אחד, ולכן הרוחב נקבע
+// ע"י המרחק בין הערוץ הנמוך לגבוה — לא ע"י מספר הערוצים. מוצג כאן כי חלון רחב
+// פוגע בערוצים החלשים (AGC משותף + IQ ב-8 ביט), ר' README/CLAUDE §8.
+function renderSpan(){
+  const rows = readCmapRows();
+  const freqs = rows.map(c=>c.freq).filter(f=>f>0).sort((a,b)=>a-b);
+  const el = $("sysSpan");
+  if(freqs.length < 2){ el.textContent = freqs.length===1
+      ? "ערוץ יחיד — חלון קליטה צר, בלי טראנקינג. מצב פשוט של כוונון ופענוח."
+      : ""; return; }
+  const spanKhz = (freqs[freqs.length-1]-freqs[0])*1000;
+  // אותה נוסחה כמו compute_wideband_plan: פריסה + שוליים, מעוגל כלפי מעלה
+  // לכפולה של 48kHz (קצב האודיו), ולא פחות מ-96kHz.
+  const rate = Math.max(96, Math.ceil((spanKhz+50)/48)*48);
+  const gaps = freqs.slice(1).map((f,i)=>((f-freqs[i])*1000));
+  const widest = Math.max(...gaps);
+  const hint = rate > 400 && widest > 150
+    ? ` · 💡 המרווח הגדול ביותר הוא ${widest.toFixed(0)}kHz — פיצול לשתי מערכות סביבו יצמצם משמעותית את החלון`
+    : "";
+  el.textContent = `פריסה ${spanKhz.toFixed(1)} kHz ⇒ חלון קליטה ~${rate} kHz${hint}`;
+}
+function readCmapRows(){
+  return [...$("cmapList").querySelectorAll(".cmap-row")].map(r=>({
+    lcn: parseInt(r.querySelector('[data-cm=lcn]').value)||0,
+    freq: parseFloat(r.querySelector('[data-cm=freq]').value)||0,
+  })).filter(c=>c.lcn&&c.freq);
 }
 function renderCmap(list){
   $("cmapList").innerHTML = list.map((c,i)=>`
@@ -597,24 +641,77 @@ function renderCmap(list){
       <input class="mono" data-cm="lcn" data-i="${i}" value="${esc(c.lcn)}" inputmode="numeric">
       <input class="mono" data-cm="freq" data-i="${i}" value="${esc(c.freq)}" inputmode="decimal">
       <button class="btn ghost" data-cmdel="${i}">✕</button>
-    </div>`).join("") || `<div class="muted">אין ערוצים.</div>`;
+    </div>`).join("") || `<div class="muted">אין ערוצים. הוסיפו ערוץ אחד לפחות.</div>`;
   $("cmapList").querySelectorAll("[data-cmdel]").forEach(b=>b.onclick=()=>{
     const s=curSys(); s.channelmap.splice(+b.dataset.cmdel,1); renderCmap(s.channelmap);
   });
+  $("cmapList").querySelectorAll("[data-cm=freq]").forEach(i=>i.oninput=renderSpan);
+  renderSpan();
 }
 function curSys(){ return SYSTEMS.find(x=>x.id===$("sysSelect").value); }
-$("cmapAdd").onclick=()=>{ const s=curSys(); if(!s)return; (s.channelmap=s.channelmap||[]).push({lcn:s.channelmap.length+1,freq:0}); renderCmap(s.channelmap); };
+// PUT /api/systems מאמת את **כל** הסט ודוחה הכל אם מערכת אחת פסולה. מערכת
+// חדשה שנוצרה ועדיין לא מולאה היא טיוטה בזיכרון בלבד — מסננים אותה מהשמירה,
+// אחרת טיוטה אחת הייתה מונעת שמירה של כל שאר המערכות.
+function completeSystems(){
+  return SYSTEMS.filter(s => s.name && s.control >= 24 && s.control <= 1300
+                             && (s.channelmap||[]).length);
+}
+$("cmapAdd").onclick=()=>{ const s=curSys(); if(!s)return;
+  (s.channelmap=s.channelmap||[]).push({lcn:s.channelmap.length+1,freq:""}); renderCmap(s.channelmap); };
+
+// הזנת תדרים בכמות: הדבקה חופשית (שורות/פסיקים/רווחים), LCN מוקצה לפי הסדר.
+// הדרך המהירה להקים מערכת מרשימת-תדרים שכבר יש ביד, בלי 12 לחיצות "+ ערוץ".
+$("cmapPaste").onclick=()=>{
+  const s=curSys(); if(!s) return;
+  const raw = prompt("הדביקו תדרים ב-MHz (שורה/פסיק/רווח בין תדר לתדר):");
+  if(!raw) return;
+  const freqs = raw.split(/[\s,;]+/).map(t=>parseFloat(t))
+                   .filter(f=>!isNaN(f) && f>=24 && f<=1300);
+  if(!freqs.length){ $("sysMsg").textContent="לא נמצאו תדרים תקינים (24–1300 MHz)"; return; }
+  s.channelmap = freqs.map((f,i)=>({lcn:i+1, freq:f}));
+  if(!parseFloat($("sysControl").value)) $("sysControl").value = freqs[0];
+  renderCmap(s.channelmap);
+  $("sysMsg").textContent = `נטענו ${freqs.length} ערוצים — בדקו ולחצו "שמור מערכת"`;
+};
+
+$("sysNew").onclick=()=>{
+  const name = (prompt("שם המערכת החדשה:", "מערכת חדשה")||"").trim();
+  if(!name) return;
+  // id יציב ובטוח-לסכימה (^[A-Za-z0-9_-]{1,32}$ ב-_validate_systems): השם
+  // עשוי להיות עברי לגמרי, ולכן ה-id נגזר מחותמת-זמן ולא מהשם.
+  const id = "sys" + Date.now().toString(36);
+  SYSTEMS.push({id, name: name.slice(0,48), control: 0, color_code: 1, channelmap: []});
+  renderSystems();
+  $("sysSelect").value = id; loadSysEditor(); updateMultiBtn();
+  $("sysMsg").textContent = "מלאו תדר בקרה + ערוצים ולחצו \"שמור מערכת\"";
+  $("sysControl").focus();
+};
+
+$("sysDelete").onclick=async()=>{
+  const s=curSys(); if(!s) return;
+  if(SYSTEMS.length<=1){ $("sysMsg").textContent="לא ניתן למחוק את המערכת האחרונה"; return; }
+  if(!confirm(`למחוק את "${s.name}"?`)) return;
+  SYSTEMS = SYSTEMS.filter(x=>x.id!==s.id);
+  const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},
+                                    body:JSON.stringify(completeSystems())});
+  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
+                       $("sysMsg").textContent="נמחק ✓"; setTimeout(()=>$("sysMsg").textContent="",2000); }
+  else $("sysMsg").textContent = "שגיאה: "+(r.body.error||"");
+};
+
 $("sysSave").onclick=async()=>{
   const s=curSys(); if(!s)return;
-  s.control=parseFloat($("sysControl").value)||s.control;
-  s.color_code=parseInt($("sysCC").value)||0;
-  s.channelmap = [...$("cmapList").querySelectorAll(".cmap-row")].map(r=>({
-    lcn: parseInt(r.querySelector('[data-cm=lcn]').value)||0,
-    freq: parseFloat(r.querySelector('[data-cm=freq]').value)||0,
-  })).filter(c=>c.lcn&&c.freq);
-  const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(SYSTEMS)});
+  const name=$("sysName").value.trim(), control=parseFloat($("sysControl").value);
+  if(!name){ $("sysMsg").textContent="חסר שם למערכת"; return; }
+  if(!(control>=24 && control<=1300)){ $("sysMsg").textContent="תדר בקרה חייב להיות 24–1300 MHz"; return; }
+  s.name=name.slice(0,48); s.control=control;
+  s.color_code=parseInt($("sysCC").value)||1;
+  s.channelmap = readCmapRows();
+  if(!s.channelmap.length){ $("sysMsg").textContent="נדרש לפחות ערוץ אחד"; return; }
+  const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(completeSystems())});
   $("sysMsg").textContent = (r.ok&&r.body.ok)?"נשמר ✓":("שגיאה: "+(r.body.error||""));
-  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; setTimeout(()=>$("sysMsg").textContent="",2000); }
+  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
+                       setTimeout(()=>$("sysMsg").textContent="",2000); }
 };
 
 // ---------- scan editor ----------
