@@ -568,3 +568,86 @@ def test_rigctl_l_verb_is_measured_not_the_invented_constant(monkeypatch):
     blank = rsp_fm.RigctlServer("127.0.0.1", 0, tuner,
                                 levels=lambda: {"frontend": {"rms_dbfs": None}})
     assert blank.handle_command("l") == "RPRT 1\n"
+
+
+# --- ★ v0.16.0: פענוח מקצה-לקצה מול אות DMR סינתטי --------------------------
+# ‏`dmr_signal.py` מייצר אות 4FSK תקני (4800 סמלים/ש', ±1944/±648 Hz) ומריץ
+# אותו דרך שרשרת ה-DSP **האמיתית**. זו הבדיקה היחידה שמוכיחה שהדמודולטור
+# באמת מפענח DMR — כל השאר בודקות רכיבים. בלי זה, באג הדצימציה (v0.14.0)
+# עבר את כל 300+ הבדיקות בירוק בזמן שהתחנה לא פענחה כלום בשטח.
+
+import dmr_signal
+
+
+def _decode_ser(iq_rate, symbols, chunk=24_000, demod_kwargs=None,
+                signal_kwargs=None):
+    """מריץ אות סינתטי דרך NfmDemodulator ומחזיר שיעור שגיאות-סמל."""
+    iq = dmr_signal.make_dmr_iq(symbols, iq_rate, **(signal_kwargs or {}))
+    raw = dmr_signal.to_u8(iq)
+    demod = rsp_fm.NfmDemodulator(iq_rate=iq_rate, audio_rate=48_000,
+                                  **(demod_kwargs or {}))
+    pcm = b"".join(demod.process(raw[i:i + chunk * 2])
+                   for i in range(0, len(raw), chunk * 2))
+    dev = dmr_signal.pcm_to_deviation(np.frombuffer(pcm, dtype="<i2"))
+    n = min(len(symbols) - 40, len(dev) // 10 - 20)
+    recovered, _phase, _err, _ = dmr_signal.best_slice(dev[200:], n)
+    # השהיית הפילטר לא ידועה מראש -> מיישרים מול הסדרה ששודרה
+    return min(np.mean(recovered[:min(len(recovered), len(symbols) - lag)]
+                       != symbols[lag:lag + min(len(recovered),
+                                                len(symbols) - lag)])
+               for lag in range(60))
+
+
+def _symbols(n=4000, seed=7):
+    return np.random.default_rng(seed).integers(0, 4, n)
+
+
+def test_end_to_end_decodes_clean_dmr_single_channel():
+    assert _decode_ser(240_000, _symbols()) == 0.0
+
+
+def test_end_to_end_decodes_clean_dmr_at_multi_rate():
+    """★ רגרסיה לבאג הדצימציה: כאן 24000 % 14 == 4, ולפני v0.14.0 שיעור
+    שגיאות-הסמל היה ~53% (האות נהרס לגמרי) בעוד שכל שאר הבדיקות היו ירוקות."""
+    assert _decode_ser(672_000, _symbols()) == 0.0
+
+
+def test_end_to_end_decodes_offset_channel_at_multi_rate():
+    """ערוץ שאינו במרכז החלון — המיקסר של multi חייב לשמור על הפענוח."""
+    syms = _symbols()
+    for offset in (+193_750, -212_500):
+        ser = _decode_ser(672_000, syms,
+                          demod_kwargs={"offset_hz": offset},
+                          signal_kwargs={"offset_hz": offset})
+        assert ser == 0.0, (offset, ser)
+
+
+def test_end_to_end_survives_unaligned_chunk_sizes():
+    """קריאה חלקית מ-TCP נותנת chunk באורך שרירותי. לפני v0.14.0 זה לבדו
+    הרס את הפענוח (SER ~45%) גם בקצב החד-ערוצי."""
+    assert _decode_ser(240_000, _symbols(), chunk=10_007) == 0.0
+
+
+def test_narrow_cutoff_beats_the_old_10khz_under_noise():
+    """★ v0.16.0: תדר-החתך ירד מ-10kHz ל-6kHz. 10kHz העביר רוחב-פס של 20kHz
+    לערוץ של 12.5kHz — עודף שהוא רעש בלבד. הבדיקה מקבעת את השיפור הנמדד."""
+    syms = _symbols(5000, seed=11)
+    noisy = {"amplitude": 0.9, "snr_db": 10, "seed": 5}
+    new = _decode_ser(240_000, syms, demod_kwargs={"cutoff_hz": 6_000},
+                      signal_kwargs=noisy)
+    old = _decode_ser(240_000, syms, demod_kwargs={"cutoff_hz": 10_000},
+                      signal_kwargs=noisy)
+    assert new < old / 10, (new, old)
+    assert new < 0.005
+
+
+def test_default_cutoff_is_the_narrow_one():
+    assert rsp_fm.DEFAULT_CUTOFF_HZ == 6_000.0
+    assert rsp_fm.NfmDemodulator(iq_rate=240_000).taps.size == 121
+
+
+def test_end_to_end_tolerates_realistic_frequency_error():
+    """סחיפת TCXO/משדר. ב-164MHz: 1ppm ≈ 164Hz, ולכן 500Hz הוא כבר תרחיש
+    פסימי. תדר-החתך הצר חייב לעמוד בזה."""
+    ser = _decode_ser(240_000, _symbols(), signal_kwargs={"offset_hz": 500.0})
+    assert ser < 0.005, ser      # נמדד ~0.03% — הרחק בתוך יכולת ה-FEC של DMR

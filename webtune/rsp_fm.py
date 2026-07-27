@@ -35,6 +35,15 @@ RTL_CMD_SET_GAIN_MODE = 0x03
 RTL_CMD_SET_GAIN_BY_INDEX = 0x0D
 DEFAULT_IQ_RATE = 240_000
 DEFAULT_AUDIO_RATE = 48_000
+# ★ v0.16.0: תדר-חתך של הפילטר לפני הדיסקרימינטור. היה 10 kHz — כלומר רוחב-פס
+# של 20 kHz לערוץ DMR של 12.5 kHz, פי-שניים מהנדרש. DMR תופס ~7.7 kHz (99%
+# הספק; סטיית-שיא 1944 Hz, 4800 סמלים/ש'), ומקלטי DMR מסחריים משתמשים ב-±6.25
+# kHz. כל הרץ מעבר לכך מכניס **רק רעש** לדיסקרימינטור, ורעש-FM גדל עם התדר
+# (משולש) ⇒ העודף פוגע פי-כמה ממה שיחס-הרוחב לבדו מרמז. נמדד בסימולציה מול
+# האות הסינתטי (tests/test_rsp_fm.py): ב-SNR=10dB, SER יורד מ-5.79% ל-0.06%
+# ב-240kHz ומ-0.32% ל-0.02% ב-672kHz. 6 kHz (ולא 5) נבחר לשוליים מול
+# שגיאת-תדר: עד ~1 kHz סטייה הביצועים זהים, ומעבר לכך 6k עדיף על 4k/5k.
+DEFAULT_CUTOFF_HZ = 6_000.0
 DEFAULT_CHUNK_SAMPLES = 24_000
 
 
@@ -236,7 +245,7 @@ class NfmDemodulator:
 
     def __init__(self, iq_rate: int = DEFAULT_IQ_RATE,
                  audio_rate: int = DEFAULT_AUDIO_RATE,
-                 cutoff_hz: float = 10_000.0,
+                 cutoff_hz: float = DEFAULT_CUTOFF_HZ,
                  audio_gain: float = 4.0,
                  taps: int = 121,
                  offset_hz: float = 0.0) -> None:
@@ -784,6 +793,7 @@ class BridgeConfig:
     iq_rate: int
     audio_rate: int
     audio_gain: float
+    cutoff_hz: float = DEFAULT_CUTOFF_HZ
     sweep: bool = False
     nfft: int = 2048
     sweep_frames: int = 64
@@ -797,7 +807,8 @@ def run(config: BridgeConfig) -> int:
     sender = AudioSender(audio)
     demod = NfmDemodulator(iq_rate=config.iq_rate,
                            audio_rate=config.audio_rate,
-                           audio_gain=config.audio_gain)
+                           audio_gain=config.audio_gain,
+                           cutoff_hz=config.cutoff_hz)
     frontend = {"rms_dbfs": None, "peak_dbfs": None, "clip_frac": None}
     rigctl = RigctlServer(config.rigctl_host, config.rigctl_port, tuner,
                           levels=lambda: {
@@ -937,6 +948,7 @@ class MultiChannelConfig:
     control_socket: str
     audio_rate: int = DEFAULT_AUDIO_RATE
     audio_gain: float = 4.0
+    cutoff_hz: float = DEFAULT_CUTOFF_HZ
 
 
 class MultiChannelBridge:
@@ -961,6 +973,7 @@ class MultiChannelBridge:
         for i, ch in enumerate(config.channels):
             demod = NfmDemodulator(iq_rate=config.iq_rate, audio_rate=config.audio_rate,
                                    audio_gain=config.audio_gain, taps=multi_taps,
+                                   cutoff_hz=config.cutoff_hz,
                                    offset_hz=ch["freq_hz"] - config.center_hz)
             audio = AudioServer(config.audio_host, config.audio_base_port + i)
             sender = AudioSender(audio)
@@ -1073,6 +1086,8 @@ def main() -> int:
     parser.add_argument("--iq-rate", type=int, default=DEFAULT_IQ_RATE)
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-gain", type=float, default=4.0)
+    parser.add_argument("--cutoff-hz", type=float, default=DEFAULT_CUTOFF_HZ,
+                        help="רוחב-פס לפני הדיסקרימינטור (ר' DEFAULT_CUTOFF_HZ)")
     parser.add_argument("--sweep", action="store_true",
                         help="frequency-discovery sweep mode (FFT power, no demod)")
     parser.add_argument("--nfft", type=int, default=2048)
@@ -1113,6 +1128,7 @@ def main() -> int:
             rigctl_host=rigctl_host, rigctl_port=rigctl_port,
             control_socket=args.control_socket,
             audio_rate=args.audio_rate, audio_gain=args.audio_gain,
+            cutoff_hz=args.cutoff_hz,
         )
         return run_multi(config)
 
@@ -1130,6 +1146,7 @@ def main() -> int:
         iq_rate=args.iq_rate,
         audio_rate=args.audio_rate,
         audio_gain=args.audio_gain,
+        cutoff_hz=args.cutoff_hz,
         sweep=args.sweep,
         nfft=args.nfft,
         sweep_frames=args.sweep_frames,
