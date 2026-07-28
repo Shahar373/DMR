@@ -67,3 +67,43 @@ def best_slice(dev_hz, n_symbols, sps=10):
         if best is None or err < best[2]:
             best = (idx, phase, err, taken)
     return best
+
+
+def mix(*signals, peak=0.8):
+    """מחבר כמה אותות IQ ומנרמל את **הסכום** לשיא נתון.
+
+    כך יחס-העוצמות בין האותות נשמר בדיוק כפי שנקבע ב-`amplitude` של כל אחד,
+    בלי שחיתוך ב-`to_u8` יחתוך את הניסוי — הפרדה מכוונת בין *סלקטיביות*
+    (מה שנמדד כאן) לבין *חיתוך* (שנמדד בנפרד, ר' `peak>1`)."""
+    total = sum(signals)
+    scale = np.max(np.abs(total))
+    return total / scale * peak if scale else total
+
+
+def demodulate(iq, iq_rate, chunk=24_000, **demod_kwargs):
+    """מריץ IQ דרך שרשרת ה-DSP **האמיתית** (`rsp_fm.NfmDemodulator`) ומחזיר
+    `(סטייה ב-Hz, המדמודלטור)`. ה-chunking מכוון: כל באגי-המצב שנתפסו עד
+    היום (overlap/DC/פאזת-מיקסר/פאזת-דצימציה) מתגלים רק בגבולות-chunk."""
+    import rsp_fm                      # מיובא כאן כדי ש-conftest יסדר sys.path
+    raw = to_u8(iq)
+    demod = rsp_fm.NfmDemodulator(iq_rate=iq_rate, audio_rate=48_000,
+                                  **demod_kwargs)
+    pcm = b"".join(demod.process(raw[i:i + chunk * 2])
+                   for i in range(0, len(raw), chunk * 2))
+    return pcm_to_deviation(np.frombuffer(pcm, dtype="<i2")), demod
+
+
+def symbol_error_rate(symbols, dev_hz, max_lag=60):
+    """שיעור שגיאות-סמל מול הסדרה ששודרה. השהיית הפילטר לא ידועה מראש,
+    ולכן נבחר ה-lag הטוב ביותר (כמו סנכרון-סמלים אמיתי בצד הקליטה)."""
+    n = min(len(symbols) - 40, len(dev_hz) // 10 - 20)
+    recovered, _phase, _err, _taken = best_slice(dev_hz[200:], n)
+    return min(
+        float(np.mean(recovered[:min(len(recovered), len(symbols) - lag)]
+                      != symbols[lag:lag + min(len(recovered),
+                                               len(symbols) - lag)]))
+        for lag in range(max_lag))
+
+
+def random_symbols(n=4000, seed=7):
+    return np.random.default_rng(seed).integers(0, 4, n)

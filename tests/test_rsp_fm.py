@@ -583,23 +583,13 @@ def _decode_ser(iq_rate, symbols, chunk=24_000, demod_kwargs=None,
                 signal_kwargs=None):
     """מריץ אות סינתטי דרך NfmDemodulator ומחזיר שיעור שגיאות-סמל."""
     iq = dmr_signal.make_dmr_iq(symbols, iq_rate, **(signal_kwargs or {}))
-    raw = dmr_signal.to_u8(iq)
-    demod = rsp_fm.NfmDemodulator(iq_rate=iq_rate, audio_rate=48_000,
-                                  **(demod_kwargs or {}))
-    pcm = b"".join(demod.process(raw[i:i + chunk * 2])
-                   for i in range(0, len(raw), chunk * 2))
-    dev = dmr_signal.pcm_to_deviation(np.frombuffer(pcm, dtype="<i2"))
-    n = min(len(symbols) - 40, len(dev) // 10 - 20)
-    recovered, _phase, _err, _ = dmr_signal.best_slice(dev[200:], n)
-    # השהיית הפילטר לא ידועה מראש -> מיישרים מול הסדרה ששודרה
-    return min(np.mean(recovered[:min(len(recovered), len(symbols) - lag)]
-                       != symbols[lag:lag + min(len(recovered),
-                                                len(symbols) - lag)])
-               for lag in range(60))
+    dev, _demod = dmr_signal.demodulate(iq, iq_rate, chunk=chunk,
+                                        **(demod_kwargs or {}))
+    return dmr_signal.symbol_error_rate(symbols, dev)
 
 
 def _symbols(n=4000, seed=7):
-    return np.random.default_rng(seed).integers(0, 4, n)
+    return dmr_signal.random_symbols(n, seed)
 
 
 def test_end_to_end_decodes_clean_dmr_single_channel():
