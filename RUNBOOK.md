@@ -209,24 +209,49 @@ sudo bash scripts/spike-dmr-multi multi_164cluster 120 scaled   # 339 taps
 
 ---
 
-## איסוף התוצאות לשליחה
+## איסוף מקיף לשליחה (בכל שלב, אחרי ריצה ארוכה או קצרה)
+
+**בלוק אחד, מריצים אותו כמו-שהוא.** הוא לא עוצר כלום — רץ **על** הריצה
+החיה הנוכחית (dmr/multi/scan), אוסף את כל ה-API + הלוגים + כל מה שנאסף
+בשלבים קודמים (`/tmp/probe_*`, `/tmp/gain_sweep*`, `/tmp/iq_*`) לתיקייה
+אחת, ואורז אותה ל-`tar.gz` יחיד. ⚠ ערוך את `SYSTEMS=` אם בדקת מערכות
+אחרות — `system-intel` נצבר פר-מערכת גם כשהיא לא פעילה כרגע.
 
 ```bash
-# אורז את כל מה שנאסף לקובץ אחד
-{ echo "=== VERSION ==="; cat /opt/dmr/webtune/VERSION
-  echo "=== probe ==="; cat /tmp/probe_*.txt 2>/dev/null
-  echo "=== gain sweep ==="; cat /tmp/gain_sweep.txt 2>/dev/null
-  echo "=== multi rf ==="; cat /tmp/multi_rf.txt 2>/dev/null
-  echo "=== api/rf ==="; curl -s localhost:8080/api/rf
-  echo; echo "=== api/health ==="; curl -s localhost:8080/api/health
-  echo; echo "=== journal ==="; sudo journalctl -u dmr-dsdfme -n 200 --no-pager
-} > /tmp/dmr_field_report.txt 2>&1
-ls -lh /tmp/dmr_field_report.txt /tmp/iq_*.bin
+OUT=/tmp/dmr_report_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$OUT"
+
+cp /opt/dmr/webtune/VERSION "$OUT/version.txt" 2>/dev/null
+
+curl -s localhost:8080/api/state        | python3 -m json.tool > "$OUT/api_state.json"
+curl -s localhost:8080/api/health       | python3 -m json.tool > "$OUT/api_health.json"
+curl -s localhost:8080/api/rf           | python3 -m json.tool > "$OUT/api_rf.json"
+curl -s localhost:8080/api/power        | python3 -m json.tool > "$OUT/api_power.json"
+curl -s "localhost:8080/api/dmr?all=1"  | python3 -m json.tool > "$OUT/api_dmr_all.json"
+curl -s localhost:8080/api/roster       | python3 -m json.tool > "$OUT/api_roster.json"
+
+# system-intel לכל מערכת שנבדקה בסשן — מוסיפים id-ים לפי הצורך
+for SYS in multi_164cluster multi_162cluster multi_165cluster vhf164_3 vhf164_325; do
+  curl -s "localhost:8080/api/system-intel?system=$SYS" \
+       | python3 -m json.tool > "$OUT/system_intel_${SYS}.json" 2>/dev/null
+done
+
+# הלוג הגולמי — מכסה את כל הריצה האחרונה (buffer של שעה מכסה 30 דק' + פינות)
+sudo journalctl -u dmr-dsdfme -u dmr-web --since "60 minutes ago" --no-pager \
+     > "$OUT/journal.log" 2>&1
+systemctl status sdrplay dmr-dsdfme dmr-web --no-pager > "$OUT/systemctl_status.txt" 2>&1
+
+# כל מה שנאסף קודם בשלבים 1-5, אם קיים
+cp /tmp/probe_*.txt /tmp/gain_sweep*.txt /tmp/multi_rf.txt "$OUT/" 2>/dev/null
+
+tar czf "${OUT}.tar.gz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+ls -lh "${OUT}.tar.gz"
+echo "שלח את הקובץ הזה: ${OUT}.tar.gz"
 ```
 
-שלח את `/tmp/dmr_field_report.txt`, ואם משהו נראה חריג — גם את **קובץ ה-IQ**
-(`/tmp/iq_164_3.bin`, ~4MB לשנייה ב-240kHz). זה הנכס היקר ביותר: ממנו אפשר
-לשחזר את הבעיה offline, להוסיף אותה כפיקסצ'ר-רגרסיה, ולתקן בלי גישה לחומרה.
+שלח את קובץ ה-`.tar.gz`. אם עלה תסמין ספציפי (ערוץ שקרס, תדר חשוד) — צרף
+גם את קובץ ה-IQ הרלוונטי (`/tmp/iq_*.bin`, לא נכלל אוטומטית כי יכול להיות
+גדול — זה הנכס היקר ביותר לשחזור offline, אבל שולחים אותו רק כשצריך).
 
 ---
 
