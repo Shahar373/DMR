@@ -58,8 +58,10 @@ python3 /opt/dmr/webtune/rf_probe.py analyse /tmp/iq_164_3.bin | tee /tmp/probe_
 ```bash
 # --- 1.2 עוד שני ערוצים, לוודא שזו לא בעיה של ערוץ בודד ---
 for F in 164.5375 164.725 162.525; do
-  sudo python3 /opt/dmr/webtune/rf_probe.py capture --freq $F --seconds 6 --out /tmp/iq_$F.bin
+  sudo python3 /opt/dmr/webtune/rf_probe.py capture --freq $F --seconds 6 \
+       --gain 22 --out /tmp/iq_$F.bin || { echo "דילוג על $F"; sleep 3; continue; }
   python3 /opt/dmr/webtune/rf_probe.py analyse /tmp/iq_$F.bin | tee -a /tmp/probe_all.txt
+  sleep 3
 done
 ```
 
@@ -83,6 +85,8 @@ done
 והממשק מציג "מה פקדנו", לא מה קרה). זו המדידה היחידה שסוגרת את זה:
 
 ```bash
+# הסריקה מריצה rsp_tcp **אחד** ומחליפה רווח בתוכו, ומודדת גם את ה-AGC
+# באותה סריקה — כך המדידה בת-השוואה (אותה נעילה, אותו רגע-אוויר).
 sudo python3 /opt/dmr/webtune/rf_probe.py gain-sweep --freq 164.3 | tee /tmp/gain_sweep.txt
 ```
 

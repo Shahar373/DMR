@@ -225,48 +225,109 @@ def format_report(report: dict, label: str = "") -> str:
 
 # --- חומרה: קליטה בפועל (pragma: no cover — דורש RSP1B) ---------------------
 
-def _spawn_rsp_tcp(host: str, port: int, iq_rate: int,
-                   freq_hz: int):                      # pragma: no cover
-    import os
-    command = [os.environ.get("RSP_TCP_BIN", "rsp_tcp"), "-a", host,
-               "-p", str(port), "-s", str(iq_rate), "-f", str(freq_hz)]
-    print(f"[rf_probe] מפעיל: {' '.join(command)}", file=sys.stderr)
-    return subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE)
-
-
-def capture(freq_hz: int, iq_rate: int, seconds: float, host: str = "127.0.0.1",
-            port: int = 1234, gain_index: Optional[int] = None,
-            settle: float = 1.5) -> bytes:              # pragma: no cover
-    """מקליט IQ גולמי מ-rsp_tcp (מפעיל אותו בעצמו). SDR אחד בהחלפה —
-    `dmr-dsdfme` חייב להיות עצור."""
-    server = _spawn_rsp_tcp(host, port, iq_rate, freq_hz)
+def _port_is_open(host: str, port: int, timeout: float = 0.3) -> bool:  # pragma: no cover
+    import socket
     try:
-        client = rsp_fm.RtlTcpClient(host, port, freq_hz, iq_rate)
-        client.connect()
-        if gain_index is not None:
-            client.set_fixed_gain(gain_index)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+class RspTcpSession:                                    # pragma: no cover
+    """‏rsp_tcp חי אחד + לקוח מחובר, כ-context manager.
+
+    ⚠ **הסיבה שזה קיים (נתפס בשטח 28.07):** הרצה שנייה של `capture` נכשלה
+    ב-`Connection refused` — `terminate()` חוזר מיד, אבל `rsp_tcp` עוד מחזיק
+    את הפורט **ואת ה-SDR** עוד כמה שניות, וה-`rsp_tcp` הבא נופל בשקט
+    (SDR תפוס) והלקוח מקבל refused. לכן היציאה **מחכה בפועל** לשחרור
+    הפורט, ולכן `gain-sweep` מריץ שרת **אחד** ומחליף רווח בתוכו במקום
+    להקים אחד לכל אינדקס. זה גם מה שהופך את הסריקה למדידה בת-השוואה:
+    אותה נעילה, אותו רגע-אוויר, רק הרווח משתנה."""
+
+    def __init__(self, freq_hz: int, iq_rate: int, host: str = "127.0.0.1",
+                 port: int = 1234, release_timeout: float = 20.0) -> None:
+        self.freq_hz, self.iq_rate = int(freq_hz), int(iq_rate)
+        self.host, self.port = host, port
+        self.release_timeout = release_timeout
+        self.server = self.client = None
+
+    def __enter__(self) -> "RspTcpSession":
+        import os
+        if _port_is_open(self.host, self.port):
+            raise RuntimeError(
+                f"פורט {self.port} כבר תפוס — כנראה dmr-dsdfme או יתום מריצה "
+                "קודמת. הרץ: sudo systemctl stop dmr-dsdfme ; "
+                "sudo pkill -f rsp_tcp ; sudo pkill -f rsp_fm ; sudo pkill -f dsd-fme")
+        command = [os.environ.get("RSP_TCP_BIN", "rsp_tcp"), "-a", self.host,
+                   "-p", str(self.port), "-s", str(self.iq_rate),
+                   "-f", str(self.freq_hz)]
+        print(f"[rf_probe] מפעיל: {' '.join(command)}", file=sys.stderr)
+        self.server = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE)
+        self.client = rsp_fm.RtlTcpClient(self.host, self.port, self.freq_hz,
+                                          self.iq_rate)
+        try:
+            self.client.connect()
+        except Exception:
+            self._shutdown()
+            raise
+        return self
+
+    def read(self, seconds: float, gain_index: Optional[int] = None,
+             settle: float = 2.0) -> bytes:
+        """מדלג על ה-transient ואז מקליט. `gain_index=None` = AGC."""
+        if gain_index is None:
+            self.client.set_agc(True)
         else:
-            client.set_agc(True)
-        deadline = time.monotonic() + settle          # מדלגים על ה-transient
+            self.client.set_fixed_gain(gain_index)
+        deadline = time.monotonic() + settle
         while time.monotonic() < deadline:
-            client.recv(1 << 16)
-        wanted = int(iq_rate * seconds) * 2
+            self.client.recv(1 << 16)
+        wanted = int(self.iq_rate * seconds) * 2
         chunks, got = [], 0
         while got < wanted:
-            data = client.recv(min(1 << 18, wanted - got))
+            data = self.client.recv(min(1 << 18, wanted - got))
             if not data:
                 break
             chunks.append(data)
             got += len(data)
-        client.close()
         return b"".join(chunks)
-    finally:
-        server.terminate()
+
+    def _shutdown(self) -> None:
+        if self.client is not None:
+            try:
+                self.client.close()
+            except OSError:
+                pass
+            self.client = None
+        if self.server is None:
+            return
+        self.server.terminate()
         try:
-            server.wait(timeout=5)
+            self.server.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            server.kill()
+            self.server.kill()
+            self.server.wait(timeout=5)
+        self.server = None
+        # ⚠ החלק הקריטי: לחכות שהפורט **באמת** ישוחרר. בלעדיו הריצה הבאה
+        # מקבלת Connection refused כי ה-rsp_tcp הבא מת על SDR תפוס.
+        deadline = time.monotonic() + self.release_timeout
+        while time.monotonic() < deadline and _port_is_open(self.host, self.port):
+            time.sleep(0.3)
+        time.sleep(1.0)          # שהות נוספת לשחרור ה-USB/SDR עצמו
+
+    def __exit__(self, *_exc) -> None:
+        self._shutdown()
+
+
+def capture(freq_hz: int, iq_rate: int, seconds: float, host: str = "127.0.0.1",
+            port: int = 1234, gain_index: Optional[int] = None,
+            settle: float = 2.0) -> bytes:              # pragma: no cover
+    """מקליט IQ גולמי מ-rsp_tcp (מפעיל אותו בעצמו). SDR אחד בהחלפה —
+    `dmr-dsdfme` חייב להיות עצור."""
+    with RspTcpSession(freq_hz, iq_rate, host, port) as session:
+        return session.read(seconds, gain_index=gain_index, settle=settle)
 
 
 def _cmd_capture(args) -> int:                          # pragma: no cover
@@ -282,16 +343,23 @@ def _cmd_capture(args) -> int:                          # pragma: no cover
 def _cmd_gain_sweep(args) -> int:                       # pragma: no cover
     """★ עונה על שאלה שאי-אפשר לענות עליה מה-UI: האם הרווח בכלל משפיע,
     ובאיזה אינדקס העוצמה מפסיקה לעלות. `readback` לא קיים בפרוטוקול
-    rtl_tcp, ולכן המדידה הזו היא הראיה היחידה."""
-    print(f"{'gain':>5} {'front dBFS':>11} {'clip':>9} {'ערוץ dBFS':>10} {'eye Hz':>8}")
-    for index in [int(x) for x in args.indices.split(",")]:
-        raw = capture(int(args.freq * 1e6), args.iq_rate, args.seconds,
-                      gain_index=index)
-        report = analyse_iq(raw, args.iq_rate)
-        print(f"{index:>5} {report['front']['rms_dbfs']!s:>11} "
-              f"{report['front']['clip_frac']!s:>9} "
-              f"{report['channel_dbfs']!s:>10} {report['eye']['eye_rms_hz']!s:>8}")
-        time.sleep(0.5)
+    rtl_tcp, ולכן המדידה הזו היא הראיה היחידה.
+
+    ★ שורת ה-AGC נמדדת **באותה סריקה** במכוון — היא התשובה לשאלה "מה
+    ה-AGC בעצם עושה", ובלעדיה אי-אפשר לדעת אם המצב שהשירות רץ בו הוא
+    טוב או גרוע מהידני."""
+    print(f"{'gain':>5} {'front dBFS':>11} {'clip':>9} {'ערוץ dBFS':>10} "
+          f"{'eye Hz':>8}  הכרעה")
+    indices = [None] + [int(x) for x in args.indices.split(",")]
+    with RspTcpSession(int(args.freq * 1e6), args.iq_rate) as session:
+        for index in indices:
+            raw = session.read(args.seconds, gain_index=index)
+            report = analyse_iq(raw, args.iq_rate)
+            print(f"{'AGC' if index is None else index:>5} "
+                  f"{report['front']['rms_dbfs']!s:>11} "
+                  f"{report['front']['clip_frac']!s:>9} "
+                  f"{report['channel_dbfs']!s:>10} "
+                  f"{report['eye']['eye_rms_hz']!s:>8}  {report['verdict']}")
     return 0
 
 

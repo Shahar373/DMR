@@ -191,3 +191,20 @@ def test_a_uniformly_weak_band_still_points_at_the_antenna():
                                                 240_000, amplitude=0.012)),
         240_000)
     assert "רצפת-הכימות" in report["verdict"] and "אנטנה" in report["action"]
+
+
+def test_session_refuses_to_start_when_the_sdr_port_is_taken():
+    """★ נתפס בשטח (28.07): ריצה שנייה נכשלה ב-`Connection refused` כי
+    ה-`rsp_tcp` הקודם עוד החזיק את הפורט ואת ה-SDR. עכשיו התפיסה מזוהה
+    **לפני** ההרצה, עם ההנחיה המדויקת — במקום stack trace על connect."""
+    import socket
+
+    import pytest
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        session = rf_probe.RspTcpSession(164_300_000, 240_000, port=port)
+        with pytest.raises(RuntimeError, match="כבר תפוס"):
+            session.__enter__()
