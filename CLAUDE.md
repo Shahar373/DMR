@@ -84,7 +84,7 @@ ip_mapping/bank_call/preamble_csbk — עדכוני מצב פנימי של הט�
 
 ```
 install.sh                  # מתקין-על יחיד. אידמפוטנטי (build-signature פר-רכיב).
-VERSION · CHANGELOG.md · README.md · CLAUDE.md
+VERSION · CHANGELOG.md · README.md · CLAUDE.md · RUNBOOK.md (סשן שטח מודרך)
 
 webtune/
   app.py                    # ★ הליבה: Flask. מצבים (dmr/off/scan), listener, נרמול,
@@ -93,6 +93,10 @@ webtune/
                             #   parse_dsd_line → UDP JSON. הרצה ידנית: --selftest
   rsp_fm.py                 # ★ הגשר: IQ (מ-rsp_tcp) → דמודולציית NFM ל-PCM 48kHz + שרת
                             #   rigctl לכיוונון טראנקינג. NumPy. ר' §2/§8.
+  rf_probe.py               # ★ כלי-אבחון שטח (CLI, לא שירות): capture/gain-sweep/
+                            #   analyse. מודד **פקיחת-עין** מול 4 סטיות DMR
+                            #   התקניות + שיא-ספקטרום ⇒ מפריד "אין אות" מ"אות
+                            #   מעוות" מ"ערוץ ריק". ר' RUNBOOK.md ו-§7.
   aliases.py                # שמות TG/RID: ייבוא CSV (RadioID.net) + עריכות ידניות (join).
   watchlist.py              # מעקב RID/TG: match() טהורה, נצרך ע"י _normalize_dsd.
                             #   התראה מקומית בלבד ב-UI (Notification API, לא Web Push — ר' §8).
@@ -127,7 +131,7 @@ systemd/
 
 scripts/dmr-wait-sdrplay    # שער מוכנות (ExecStartPre): מחכה שה-API יענה, מרים sdrplay אם תקוע.
 udev/99-dmr.rules           # חיבור RSP1B (Vendor 1df7) → restart אוטומטי ל-sdrplay.
-tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 360 בדיקות. ראה §7.
+tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 374 בדיקות. ראה §7.
   fixtures/capplus_slco_sample.csv  # 68 צורות אמיתיות (מקליטת Cap+/SLCO) ל-replay-test.
   fixtures/dsdfme_source_shapes.csv # ★ 16 צורות שנגזרו מקוד-המקור של DSD-FME
                             #   (מצבים שהרשת לא שידרה), כל שורה עם provenance.
@@ -348,7 +352,7 @@ tests/                      # pytest (SDR/systemd/rsp_fm ממוקפים). 360 ב
 
 ## 7. בדיקות (ללא חומרה)
 
-`python -m pytest tests/ -v` (360 בדיקות, ~19ש'). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
+`python -m pytest tests/ -v` (374 בדיקות, ~20ש'). SDR/systemd/rsp_fm ממוקפים דרך fixtures ב-`conftest.py`:
 `paths` (מפנה נתיבי-מודול ל-`tmp_path`), `sysctl` (Recorder ל-`_sysctl` + מוקי
 `_is_active`/`_sdr_present`), `no_sleep`. פונקציות טהורות (`parse_dsd_line`, `_normalize_dsd`,
 `render_dmr_env`, `_validate_*`, `_encryption_stats`, `_traffic_stats`, `_rid_tg_graph`,
@@ -401,6 +405,15 @@ SER↔SNR (חייבת להיות מונוטונית — עקומה קופצני�
 `CLIP_BAD`) ומוודאות שהם עדיין מכוילים למדידה — שינוי סף בלי מדידה יפיל
 אותן. הקובץ מכוון להיות **הכבד ביותר** (~6ש'); אל תוסיפו לו מקרים בלי
 לבדוק זמן-ריצה.
+
+**★ `tests/test_rf_probe.py` (v0.18.0) — כיול כלי-השטח.** `webtune/rf_probe.py`
+נועד להיאמר עליו בשטח "תתקן אנטנה" או "אל תיגע ב-RF", ולכן כל סף שלו מכויל
+מול תרחיש-אוויר ידוע: אות נקי, רועש, מתחת-לרצפה, רעש-בלבד, נשא לא-מאופנן,
+חיתוך, ושכן חזק. שתי בדיקות תופסות את מחלקת-הטעויות המסוכנת של כלי-אבחון —
+**הנחיה נכונה-לכאורה שמובילה לפעולה הלא-נכונה**: ערוץ ריק בתוך פס פעיל
+**אסור** שידווח "תקנו אנטנה" (בניתוח multi רוב הערוצים שקטים רוב הזמן),
+ואות חלש-אך-מפוענח אסור שידווח כתקלה. ⚠ הספים סינתטיים — DMR אמיתי משתמש
+בעיצוב-פולס שונה מעט, ולכן הם מפרידים **סדרי-גודל**, לא ציון-איכות מדויק.
 
 **הוסף בדיקה לכל שינוי backend.** CI: pytest (Python 3.11, כולל NumPy) + `bash -n`.
 
