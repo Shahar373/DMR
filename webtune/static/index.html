@@ -229,7 +229,7 @@ button.btn:disabled{ opacity:.5; cursor:default; }
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" id="sysCard">
       <h2>מערכת DMR</h2>
       <div class="row">
         <div style="flex:1;min-width:180px">
@@ -514,6 +514,11 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtT = t => t ? new Date(t*1000).toLocaleTimeString("he-IL",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "";
 let STATE={}, SYSTEMS=[], scanLegs=[], appView="home", archiveDay=null, lastId=0, feedMsgs=[], detailId=null;
+// ⚠ מערכת חדשה/עריכה לא-שמורה חייבת לשרוד את ה-poll התקופתי (refreshState,
+// כל 12ש') — אחרת הוא דורס את SYSTEMS מהשרת באמצע ההקלדה, וטיוטה שנוצרה
+// (או שדה שהוקלד) נעלמת מהרשימה לפני שהספיקו ללחוץ "שמור מערכת". נצפה בשטח
+// (28.07.2026): "+ מערכת" ואז הרשימה מתרעננת והמערכת החדשה נעלמת.
+let systemsDraftDirty = false;
 
 // ---------- view switching ----------
 function showView(v){
@@ -560,9 +565,12 @@ $("goScan").onclick = ()=>{
 async function refreshState(){
   const r = await api("/api/state");
   if(!r.ok) return;
-  STATE=r.body; SYSTEMS=r.body.systems||[];
+  STATE=r.body;
+  // בזמן טיוטה לא-שמורה במערכות: לא נוגעים ב-SYSTEMS/בעורך, כדי לא לדרוס
+  // הקלדה באמצע (ר' systemsDraftDirty למעלה). שאר הדף ממשיך להתעדכן כרגיל.
+  if(!systemsDraftDirty){ SYSTEMS=r.body.systems||[]; renderSystems(); }
   $("ver").textContent = "v"+(r.body.version||"");
-  renderHome(); renderSystems(); renderScanEditor();
+  renderHome(); renderScanEditor();
 }
 function modeLabel(m){ return {dmr:"📻 DMR פעיל", multi:"📡 רב-ערוצי פעיל", off:"⏻ כבוי (standby)", scan:"🔁 סריקה", discover:"🔎 גילוי רשתות"}[m]||m; }
 function sysChanCount(s){ return s&&s.channelmap ? s.channelmap.length : 0; }
@@ -602,7 +610,11 @@ function renderSystems(){
   if(cur) sel.value=cur;
   loadSysEditor();
 }
-$("sysSelect").onchange = ()=>{ loadSysEditor(); updateMultiBtn(); };
+$("sysSelect").onchange = ()=>{ systemsDraftDirty=false; loadSysEditor(); updateMultiBtn(); };
+// האזנה ממוקדת (delegation) לכל שדה בכרטיס המערכת — כולל שורות cmap
+// שנוצרות דינמית ב-renderCmap — כדי שהקלדה חופשית (שם/תדר-בקרה/CC/ערוץ)
+// תסמן dirty בלי לרשום מאזין לכל שדה בנפרד.
+$("sysCard").addEventListener("input", ()=>{ systemsDraftDirty=true; });
 function loadSysEditor(){
   const s = SYSTEMS.find(x=>x.id===$("sysSelect").value);
   if(!s){ $("cmapList").innerHTML=""; $("sysName").value=""; $("sysSpan").textContent=""; return; }
@@ -645,7 +657,7 @@ function renderCmap(list){
       <button class="btn ghost" data-cmdel="${i}">✕</button>
     </div>`).join("") || `<div class="muted">אין ערוצים. הוסיפו ערוץ אחד לפחות.</div>`;
   $("cmapList").querySelectorAll("[data-cmdel]").forEach(b=>b.onclick=()=>{
-    const s=curSys(); s.channelmap.splice(+b.dataset.cmdel,1); renderCmap(s.channelmap);
+    const s=curSys(); s.channelmap.splice(+b.dataset.cmdel,1); systemsDraftDirty=true; renderCmap(s.channelmap);
   });
   $("cmapList").querySelectorAll("[data-cm=freq]").forEach(i=>i.oninput=renderSpan);
   renderSpan();
@@ -659,7 +671,8 @@ function completeSystems(){
                              && (s.channelmap||[]).length);
 }
 $("cmapAdd").onclick=()=>{ const s=curSys(); if(!s)return;
-  (s.channelmap=s.channelmap||[]).push({lcn:s.channelmap.length+1,freq:""}); renderCmap(s.channelmap); };
+  (s.channelmap=s.channelmap||[]).push({lcn:s.channelmap.length+1,freq:""});
+  systemsDraftDirty=true; renderCmap(s.channelmap); };
 
 // הזנת תדרים בכמות: הדבקה חופשית (שורות/פסיקים/רווחים), LCN מוקצה לפי הסדר.
 // הדרך המהירה להקים מערכת מרשימת-תדרים שכבר יש ביד, בלי 12 לחיצות "+ ערוץ".
@@ -672,7 +685,7 @@ $("cmapPaste").onclick=()=>{
   if(!freqs.length){ $("sysMsg").textContent="לא נמצאו תדרים תקינים (24–1300 MHz)"; return; }
   s.channelmap = freqs.map((f,i)=>({lcn:i+1, freq:f}));
   if(!parseFloat($("sysControl").value)) $("sysControl").value = freqs[0];
-  renderCmap(s.channelmap);
+  systemsDraftDirty=true; renderCmap(s.channelmap);
   $("sysMsg").textContent = `נטענו ${freqs.length} ערוצים — בדקו ולחצו "שמור מערכת"`;
 };
 
@@ -683,6 +696,7 @@ $("sysNew").onclick=()=>{
   // עשוי להיות עברי לגמרי, ולכן ה-id נגזר מחותמת-זמן ולא מהשם.
   const id = "sys" + Date.now().toString(36);
   SYSTEMS.push({id, name: name.slice(0,48), control: 0, color_code: 1, channelmap: []});
+  systemsDraftDirty=true;   // ⚠ בלי זה ה-poll התקופתי (12ש') מוחק את הטיוטה
   renderSystems();
   $("sysSelect").value = id; loadSysEditor(); updateMultiBtn();
   $("sysMsg").textContent = "מלאו תדר בקרה + ערוצים ולחצו \"שמור מערכת\"";
@@ -696,7 +710,7 @@ $("sysDelete").onclick=async()=>{
   SYSTEMS = SYSTEMS.filter(x=>x.id!==s.id);
   const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},
                                     body:JSON.stringify(completeSystems())});
-  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
+  if(r.ok&&r.body.ok){ systemsDraftDirty=false; SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
                        $("sysMsg").textContent="נמחק ✓"; setTimeout(()=>$("sysMsg").textContent="",2000); }
   else $("sysMsg").textContent = "שגיאה: "+(r.body.error||"");
 };
@@ -712,7 +726,7 @@ $("sysSave").onclick=async()=>{
   if(!s.channelmap.length){ $("sysMsg").textContent="נדרש לפחות ערוץ אחד"; return; }
   const r=await api("/api/systems",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(completeSystems())});
   $("sysMsg").textContent = (r.ok&&r.body.ok)?"נשמר ✓":("שגיאה: "+(r.body.error||""));
-  if(r.ok&&r.body.ok){ SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
+  if(r.ok&&r.body.ok){ systemsDraftDirty=false; SYSTEMS=r.body.systems; renderSystems(); updateMultiBtn();
                        setTimeout(()=>$("sysMsg").textContent="",2000); }
 };
 
