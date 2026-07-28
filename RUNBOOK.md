@@ -211,15 +211,26 @@ sudo bash scripts/spike-dmr-multi multi_164cluster 120 scaled   # 339 taps
 
 ## איסוף מקיף לשליחה (בכל שלב, אחרי ריצה ארוכה או קצרה)
 
-**בלוק אחד, מריצים אותו כמו-שהוא.** הוא לא עוצר כלום — רץ **על** הריצה
-החיה הנוכחית (dmr/multi/scan), אוסף את כל ה-API + הלוגים + כל מה שנאסף
-בשלבים קודמים (`/tmp/probe_*`, `/tmp/gain_sweep*`, `/tmp/iq_*`) לתיקייה
-אחת, ואורז אותה ל-`tar.gz` יחיד. ⚠ ערוך את `SYSTEMS=` אם בדקת מערכות
-אחרות — `system-intel` נצבר פר-מערכת גם כשהיא לא פעילה כרגע.
+**כתוב את זה לקובץ-סקריפט ואז הרץ אותו** — לא בלוק ישיר בטרמינל. הסיבה:
+בלוק שמגדיר `$OUT` בשורה הראשונה ומשתמש בו בשורות הבאות **חייב** לרוץ
+כתהליך-shell אחד רציף; אם ה-paste מתפצל לפקודות נפרדות (או שזה טרמינל/סשן
+חדש), `$OUT` מתאפס לריק וכל השאר נכתב ל-`/` (⚠ בדיוק מה שקרה — `Permission
+denied` על `/journal.log`). קובץ-סקריפט חסין לזה **לגמרי**: כל השורות
+משתפות אותו תהליך תמיד, בלי קשר לאיך הדבקת.
+
+הוא לא עוצר כלום — רץ **על** הריצה החיה הנוכחית (dmr/multi/scan), אוסף את
+כל ה-API + הלוגים + כל מה שנאסף בשלבים קודמים (`/tmp/probe_*`,
+`/tmp/gain_sweep*`) לתיקייה אחת, ואורז אותה ל-`tar.gz` יחיד. ⚠ ערוך את
+רשימת המערכות ברשימת ה-`for SYS in ...` אם בדקת מערכות אחרות —
+`system-intel` נצבר פר-מערכת גם כשהיא לא פעילה כרגע.
 
 ```bash
-OUT=/tmp/dmr_report_$(date +%Y%m%d_%H%M%S)
+cat > /tmp/dmr_collect.sh <<'SCRIPT'
+#!/bin/bash
+set -uo pipefail
+OUT="/tmp/dmr_report_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT"
+echo "אוסף ל-$OUT ..."
 
 cp /opt/dmr/webtune/VERSION "$OUT/version.txt" 2>/dev/null
 
@@ -230,28 +241,28 @@ curl -s localhost:8080/api/power        | python3 -m json.tool > "$OUT/api_power
 curl -s "localhost:8080/api/dmr?all=1"  | python3 -m json.tool > "$OUT/api_dmr_all.json"
 curl -s localhost:8080/api/roster       | python3 -m json.tool > "$OUT/api_roster.json"
 
-# system-intel לכל מערכת שנבדקה בסשן — מוסיפים id-ים לפי הצורך
 for SYS in multi_164cluster multi_162cluster multi_165cluster vhf164_3 vhf164_325; do
   curl -s "localhost:8080/api/system-intel?system=$SYS" \
        | python3 -m json.tool > "$OUT/system_intel_${SYS}.json" 2>/dev/null
 done
 
-# הלוג הגולמי — מכסה את כל הריצה האחרונה (buffer של שעה מכסה 30 דק' + פינות)
 sudo journalctl -u dmr-dsdfme -u dmr-web --since "60 minutes ago" --no-pager \
      > "$OUT/journal.log" 2>&1
 systemctl status sdrplay dmr-dsdfme dmr-web --no-pager > "$OUT/systemctl_status.txt" 2>&1
 
-# כל מה שנאסף קודם בשלבים 1-5, אם קיים
 cp /tmp/probe_*.txt /tmp/gain_sweep*.txt /tmp/multi_rf.txt "$OUT/" 2>/dev/null
 
 tar czf "${OUT}.tar.gz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
 ls -lh "${OUT}.tar.gz"
 echo "שלח את הקובץ הזה: ${OUT}.tar.gz"
+SCRIPT
+bash /tmp/dmr_collect.sh
 ```
 
-שלח את קובץ ה-`.tar.gz`. אם עלה תסמין ספציפי (ערוץ שקרס, תדר חשוד) — צרף
-גם את קובץ ה-IQ הרלוונטי (`/tmp/iq_*.bin`, לא נכלל אוטומטית כי יכול להיות
-גדול — זה הנכס היקר ביותר לשחזור offline, אבל שולחים אותו רק כשצריך).
+שלח את קובץ ה-`.tar.gz` שהודפס בסוף. אם עלה תסמין ספציפי (ערוץ שקרס, תדר
+חשוד) — צרף גם את קובץ ה-IQ הרלוונטי (`/tmp/iq_*.bin`, לא נכלל אוטומטית כי
+יכול להיות גדול — זה הנכס היקר ביותר לשחזור offline, אבל שולחים אותו רק
+כשצריך).
 
 ---
 
