@@ -177,6 +177,13 @@ for c in d.get('by_channel',[]):       print(' איכות', c)" | tee /tmp/multi
 רווח (ב-multi ה-ADC חותך את סכום הערוצים, והאינטרמודולציה פוגעת הרבה לפני
 שהיא פוגעת בערוץ בודד). `restarting` שחוזר על אותו ערוץ = בעיה אמיתית שם.
 
+⚠ **אם מתכננים להריץ multi לאורך זמן (דקות-שעות) ולאסוף בסוף** — הרץ את
+"איסוף מקיף לשליחה" **עכשיו, לפני 4.3**, כשה-service עדיין חי. ה-`journal`
+של `dmr-dsdfme` נמדד מרגע-האיסוף אחורה — אם עוצרים את השירות ורק אחר-כך
+אוספים (בפרט אם עובר זמן על עדכון-קוד/`install.sh` בין לבין), ה-journal
+עלול לצאת ריק לגמרי מהריצה שרק הסתיימה. `system-intel`/`api/dmr` לא
+נפגעים (מצב-נצבר, לא לוג).
+
 ```bash
 # --- 4.3 ניתוח offline של כל 6 הערוצים מהקלטה רחבת-פס אחת ---
 curl -s -X POST localhost:8080/api/mode -H 'Content-Type: application/json' -d '{"mode":"off"}'
@@ -224,6 +231,15 @@ denied` על `/journal.log`). קובץ-סקריפט חסין לזה **לגמרי
 רשימת המערכות ברשימת ה-`for SYS in ...` אם בדקת מערכות אחרות —
 `system-intel` נצבר פר-מערכת גם כשהיא לא פעילה כרגע.
 
+⚠⚠ **הרץ את זה מיד אחרי הריצה, לפני `stop`/`git pull`/`install.sh`.**
+`journalctl --since` נמדד **מרגע-האיסוף אחורה**, לא מרגע-הריצה — אם
+עוברות יותר מ-3 שעות בין סוף-הריצה לאיסוף (למשל: עוצרים, מעדכנים קוד,
+מריצים `install.sh` שמפעיל-מחדש את `dmr-web`/`sdrplay`, ורק אז אוספים),
+`journal.log` יצא **ריק מ-`dmr-dsdfme`** לגמרי — בדיוק מה שקרה בפועל
+בסבב-שדה אחד (v0.18.5): `dmr-dsdfme` היה `inactive` והחלון פספס את כל
+הריצה. `api/state`/`system-intel`/`api/dmr` לא נפגעים (הם מצב-נצבר, לא
+לוג) — רק ה-journal רגיש לזמן-האיסוף.
+
 ```bash
 cat > /tmp/dmr_collect.sh <<'SCRIPT'
 #!/bin/bash
@@ -246,7 +262,7 @@ for SYS in multi_164cluster multi_162cluster multi_165cluster vhf164_3 vhf164_32
        | python3 -m json.tool > "$OUT/system_intel_${SYS}.json" 2>/dev/null
 done
 
-sudo journalctl -u dmr-dsdfme -u dmr-web --since "60 minutes ago" --no-pager \
+sudo journalctl -u dmr-dsdfme -u dmr-web --since "3 hours ago" --no-pager \
      > "$OUT/journal.log" 2>&1
 systemctl status sdrplay dmr-dsdfme dmr-web --no-pager > "$OUT/systemctl_status.txt" 2>&1
 
